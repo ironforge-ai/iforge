@@ -23,7 +23,7 @@ dependencies = [
     "psycopg2-binary>=2.9.13",
     "pgvector>=0.2.5",
     "openai>=3.19.2",
-    "fastembed>=0.8.1",
+    "fastembed>=0.9.1",
     "sentry-sdk[fastapi]==2.70.0",
     # https://pypi.org/pypi/websockets/17.0.1/json
     "websockets==17.1",
