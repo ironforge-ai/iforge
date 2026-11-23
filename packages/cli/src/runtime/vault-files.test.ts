@@ -1,0 +1,398 @@
+import { afterEach, describe, expect, test } from "bun:test";
+import { execFileSync } from "node:child_process";
+import { createHash, randomUUID } from "node:crypto";
+import {
+	chmodSync,
+	linkSync,
+	lstatSync,
+	mkdirSync,
+	mkdtempSync,
+	readdirSync,
+	readFileSync,
+	realpathSync,
+	renameSync,
+	rmSync,
+	symlinkSync,
+	unlinkSync,
+	writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { getRuntimePaths } from "./paths";
+import {
+	clearConnectedVaultFiles,
+	type RuntimeVaultFilesConfig,
+	syncRuntimeVaultFiles,
+} from "./vault-files";
+
+const roots: string[] = [];
+const originalEnv = { ...process.env };
+afterEach(() => {
+	process.env = { ...originalEnv };
+	for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
+});
+function fixture(connected: boolean) {
+	const root = realpathSync(mkdtempSync(join(tmpdir(), "runtime-vault-")));
+	roots.push(root);
+	const home = join(root, "home");
+	mkdirSync(home);
+	process.env.CLAWDI_SERVICE_STATE_DIR = join(root, "platform");
+	mkdirSync(process.env.CLAWDI_SERVICE_STATE_DIR, { mode: 0o700 });
+	const paths = getRuntimePaths({ mode: connected ? "local" : "hosted" });
+	const agentId = randomUUID(),
+		vaultId = randomUUID();
+	const data = {
+		schema_version: 1,
+		complete: true,
+		agent_id: agentId,
+		user_id: randomUUID(),
+		vaults: [
+			{
+				id: vaultId,
+				name: "Vault",
+				slug: "vault",
+				revision: "1",
+				content_version: 1,
+				project_ids: [randomUUID()],
+				fields: [
+					{
+						id: randomUUID(),
+						section: "a",
+						name: "TOKEN",
+						references: ["iforge://project/test/vault/vault/TOKEN"],
+						value: "first",
+					},
+					{
+						id: randomUUID(),
+						section: "b",
+						name: "TOKEN",
+						references: ["iforge://project/test/vault/vault/TOKEN"],
+						value: "other",
+					},
+				],
+			},
+		],
+	};
+	const base = {
+		apiUrl: "",
+		agentId,
+		home,
+		workspace: home,
+		receiptPath: join(paths.serviceStateRoot, "vault-files.json"),
+	};
+	const config: RuntimeVaultFilesConfig = connected
+		? {
+				...base,
+				connected: {
+					userId: data.user_id,
+					machineId: "fixture-machine",
+					stateRoot: paths.serviceStateRoot,
+					assertCurrent() {},
+					async request(url, init) {
+						const headers = new Headers(init.headers);
+						headers.set("Authorization", "Bearer fixture-only");
+						return fetch(url, { ...init, headers });
+					},
+				},
+			}
+		: { ...base, paths, apiKey: "fixture-only" };
+	return { root, home, config, data };
+}
+
+for (const connected of [true, false]) {
+	describe.skipIf(!connected && process.platform !== "linux")(
+		connected ? "connected native filesystem" : "Hosted Linux filesystem",
+		() => {
+			test("incomplete owned metadata refreshes without rewriting secrets; delivery requires current material", async () => {
+				const { config, home, data } = fixture(connected);
+				let invalidCounter: "missing" | "null" | undefined;
+				let materialStatus = 200;
+				const server = Bun.serve({
+					hostname: "127.0.0.1",
+					port: 0,
+					async fetch(request) {
+						const vault = data.vaults[0];
+						const material = request.method === "POST";
+						if (material && materialStatus !== 200)
+							return new Response(null, { status: materialStatus });
+						if (!invalidCounter && request.headers.get("if-none-match") === vault.revision)
+							return new Response(null, { status: 304 });
+						const body = material ? await request.json() : undefined;
+						return Response.json(
+							{
+								...data,
+								vaults: [
+									{
+										...vault,
+										content_version:
+											invalidCounter === "missing"
+												? undefined
+												: invalidCounter === "null"
+													? null
+													: vault.content_version,
+										fields:
+											material && body?.revisions[vault.id] !== vault.revision
+												? vault.fields
+												: null,
+									},
+								],
+							},
+							{ headers: { etag: vault.revision } },
+						);
+					},
+				});
+				config.apiUrl = server.url.origin;
+				const dir = join(home, ".iforge/vaults");
+				const index = () => JSON.parse(readFileSync(join(dir, "index.json"), "utf8")).vaults[0];
+				try {
+					await syncRuntimeVaultFiles(config);
+					const cached = JSON.parse(readFileSync(config.receiptPath, "utf8"));
+					const cachedIndex = JSON.parse(readFileSync(join(dir, "index.json"), "utf8"));
+					delete cached.inventory[0].content_version;
+					delete cachedIndex.vaults[0].content_version;
+					const cachedBytes = JSON.stringify(cachedIndex);
+					writeFileSync(join(dir, "index.json"), cachedBytes);
+					cached.digests["index.json"] = createHash("sha256").update(cachedBytes).digest("hex");
+					writeFileSync(config.receiptPath, JSON.stringify(cached));
+					const names = index().sections.map((section: { file: string }) => section.file);
+					const mtimes = names.map(
+						(file: string) => lstatSync(join(dir, file), { bigint: true }).mtimeNs,
+					);
+					// Refresh owned cache metadata using fields=null; secret section files stay intact.
+					expect(await syncRuntimeVaultFiles(config)).toBe("synced");
+					expect(index().content_version).toBe(1);
+					expect(
+						names.map((file: string) => lstatSync(join(dir, file), { bigint: true }).mtimeNs),
+					).toEqual(mtimes);
+					expect(await syncRuntimeVaultFiles(config)).toBe("unchanged");
+					const requestedContentVersion = 2;
+					data.vaults[0].content_version = requestedContentVersion;
+					data.vaults[0].revision = "2";
+					data.vaults[0].fields[0].value = "replacement";
+					materialStatus = 503;
+					await expect(syncRuntimeVaultFiles(config)).rejects.toThrow("Runtime Vault files");
+					// Matching names already exist, but metadata alone cannot publish delivery.
+					expect(index().sections[0].fields[0].name).toBe("TOKEN");
+					expect(index().content_version).toBeLessThan(requestedContentVersion);
+					materialStatus = 200;
+					await syncRuntimeVaultFiles(config);
+					expect(index().content_version).toBe(requestedContentVersion);
+					expect(
+						JSON.parse(readFileSync(config.receiptPath, "utf8")).inventory[0].content_version,
+					).toBe(requestedContentVersion);
+					for (const malformed of ["missing", "null"] as const) {
+						invalidCounter = malformed;
+						await expect(syncRuntimeVaultFiles(config)).rejects.toThrow("Runtime Vault files");
+						expect(index().content_version).toBe(requestedContentVersion);
+						expect(names.every((file: string) => lstatSync(join(dir, file)).isFile())).toBe(true);
+					}
+				} finally {
+					server.stop(true);
+				}
+			});
+
+			test("HTTP snapshots: stable sections, 304 no IO rewrite, rotation, additions/removal, offline and revocation", async () => {
+				const { config, home, data } = fixture(connected);
+				let revision = "1",
+					status = 200,
+					materialStatus = 200,
+					requests = 0;
+				const server = Bun.serve({
+					hostname: "127.0.0.1",
+					port: 0,
+					fetch(request) {
+						requests++;
+						expect(request.headers.get("authorization")).toBe("Bearer fixture-only");
+						if (new URL(request.url).pathname.endsWith("/material") && materialStatus !== 200)
+							return new Response("unavailable", { status: materialStatus });
+						if (status !== 200) return new Response("unavailable", { status });
+						if (request.headers.get("if-none-match") === revision)
+							return new Response(null, { status: 304 });
+						return Response.json(data, { headers: { etag: revision } });
+					},
+				});
+				config.apiUrl = server.url.origin;
+				try {
+					expect(await syncRuntimeVaultFiles(config)).toBe("synced");
+					const dir = join(home, ".iforge", "vaults");
+					const parent = join(home, ".iforge");
+					chmodSync(parent, 0o755);
+					writeFileSync(join(parent, "config.json"), "unrelated");
+					const files = readdirSync(dir).filter(
+						(name) => name !== "index.json" && name.endsWith(".json"),
+					);
+					expect(files).toHaveLength(2);
+					expect(lstatSync(dir).mode & 0o777).toBe(0o700);
+					for (const file of readdirSync(dir))
+						expect(lstatSync(join(dir, file)).mode & 0o777).toBe(0o600);
+					const mtimes = files.map((file) => lstatSync(join(dir, file), { bigint: true }).mtimeNs);
+					const receipt = JSON.parse(readFileSync(config.receiptPath, "utf8"));
+					receipt.device = 1;
+					writeFileSync(config.receiptPath, JSON.stringify(receipt));
+					expect(await syncRuntimeVaultFiles(config)).toBe("unchanged");
+					expect(files.map((file) => lstatSync(join(dir, file), { bigint: true }).mtimeNs)).toEqual(
+						mtimes,
+					);
+					expect(readFileSync(join(dir, "index.json"), "utf8")).not.toContain('"first"');
+					expect(readFileSync(config.receiptPath, "utf8")).not.toContain('"first"');
+					const edited = join(dir, files[0]);
+					const original = readFileSync(edited, "utf8");
+					writeFileSync(edited, "tampered", { mode: 0o600 });
+					expect(await syncRuntimeVaultFiles(config)).toBe("synced");
+					expect(readFileSync(edited, "utf8")).toBe(original);
+					const unchanged = lstatSync(edited, { bigint: true }).mtimeNs;
+					expect(await syncRuntimeVaultFiles({ ...config })).toBe("unchanged");
+					expect(lstatSync(edited, { bigint: true }).mtimeNs).toBe(unchanged);
+
+					data.vaults[0].fields[0].value = "rotated";
+					revision = "2";
+					data.vaults[0].revision = revision;
+					expect(await syncRuntimeVaultFiles(config)).toBe("synced");
+					expect(
+						files.map((file) => JSON.parse(readFileSync(join(dir, file), "utf8")).TOKEN).sort(),
+					).toEqual(["other", "rotated"]);
+					status = 503;
+					await expect(syncRuntimeVaultFiles(config)).rejects.toThrow("Runtime Vault files");
+					expect(readdirSync(dir)).toHaveLength(4);
+					status = 200;
+					revision = "3";
+					data.vaults[0].revision = revision;
+					data.vaults[0].fields.splice(0, 1);
+					await syncRuntimeVaultFiles(config);
+					expect(readdirSync(dir)).toHaveLength(3);
+					data.complete = false;
+					revision = "4";
+					await expect(syncRuntimeVaultFiles(config)).rejects.toThrow("Runtime Vault files");
+					expect(readdirSync(dir)).toHaveLength(3);
+					data.complete = true;
+					data.vaults.splice(0);
+					revision = "5";
+					materialStatus = 503;
+					await expect(syncRuntimeVaultFiles(config)).rejects.toThrow("Runtime Vault files");
+					expect(readdirSync(dir).sort()).toEqual([".gitignore", "index.json"]);
+					expect(JSON.parse(readFileSync(join(dir, "index.json"), "utf8")).vaults).toEqual([]);
+					status = 403;
+					expect(await syncRuntimeVaultFiles(config)).toBe("revoked");
+					expect(readdirSync(dir)).toHaveLength(0);
+					expect(requests).toBe(15);
+					expect(lstatSync(parent).mode & 0o777).toBe(0o755);
+					expect(readFileSync(join(parent, "config.json"), "utf8")).toBe("unrelated");
+				} finally {
+					server.stop(true);
+				}
+			});
+
+			test("unowned directories, symlink ancestors, hardlinks and tracked targets fail without altering user files", async () => {
+				const { config, home, root, data } = fixture(connected);
+				const server = Bun.serve({
+					hostname: "127.0.0.1",
+					port: 0,
+					fetch: () => Response.json(data, { headers: { etag: "one" } }),
+				});
+				config.apiUrl = server.url.origin;
+				const target = join(home, ".iforge", "vaults");
+				const parent = join(home, ".iforge");
+				mkdirSync(parent, { mode: 0o755 });
+				writeFileSync(join(parent, "config.json"), "unrelated");
+				try {
+					mkdirSync(target);
+					await expect(syncRuntimeVaultFiles(config)).rejects.toThrow();
+					writeFileSync(join(target, "user.txt"), "user");
+					await expect(syncRuntimeVaultFiles(config)).rejects.toThrow();
+					expect(readFileSync(join(target, "user.txt"), "utf8")).toBe("user");
+					rmSync(target, { recursive: true });
+					const outside = join(root, "outside");
+					mkdirSync(outside);
+					symlinkSync(outside, target);
+					await expect(syncRuntimeVaultFiles(config)).rejects.toThrow();
+					expect(readdirSync(outside)).toEqual([]);
+					unlinkSync(target);
+					execFileSync("git", ["init", home], { stdio: "ignore" });
+					execFileSync("git", ["-C", home, "add", ".iforge/config.json"]);
+					mkdirSync(target);
+					writeFileSync(join(target, "tracked"), "tracked");
+					execFileSync("git", ["-C", home, "add", ".iforge/vaults/tracked"]);
+					rmSync(target, { recursive: true });
+					await expect(syncRuntimeVaultFiles(config)).rejects.toThrow();
+					execFileSync("git", ["-C", home, "rm", "--cached", ".iforge/vaults/tracked"], {
+						stdio: "ignore",
+					});
+					await syncRuntimeVaultFiles(config);
+					expect(lstatSync(parent).mode & 0o777).toBe(0o755);
+					expect(readFileSync(join(parent, "config.json"), "utf8")).toBe("unrelated");
+					const name = readdirSync(target).find(
+						(name) => name !== "index.json" && name.endsWith(".json"),
+					);
+					if (!name) throw new Error("missing fixture file");
+					const file = join(target, name);
+					const copy = join(outside, "hardlink");
+					linkSync(file, copy);
+					const original = readFileSync(copy, "utf8");
+					await expect(syncRuntimeVaultFiles(config)).rejects.toThrow();
+					expect(readFileSync(copy, "utf8")).toBe(original);
+					unlinkSync(copy);
+					unlinkSync(file);
+					symlinkSync(join(parent, "config.json"), file);
+					await expect(syncRuntimeVaultFiles(config)).rejects.toThrow();
+					expect(readFileSync(join(parent, "config.json"), "utf8")).toBe("unrelated");
+					unlinkSync(file);
+					writeFileSync(file, original, { mode: 0o600 });
+					const replaced = join(parent, "previous-vaults");
+					renameSync(target, replaced);
+					mkdirSync(target, { mode: 0o700 });
+					writeFileSync(join(target, "user.json"), "unrelated");
+					await expect(syncRuntimeVaultFiles(config)).rejects.toThrow();
+					expect(readFileSync(join(target, "user.json"), "utf8")).toBe("unrelated");
+					rmSync(target, { recursive: true });
+					renameSync(replaced, target);
+					linkSync(config.receiptPath, copy);
+					await expect(syncRuntimeVaultFiles(config)).rejects.toThrow();
+					unlinkSync(copy);
+					const receipt = readFileSync(config.receiptPath);
+					unlinkSync(config.receiptPath);
+					symlinkSync(file, config.receiptPath);
+					await expect(syncRuntimeVaultFiles(config)).rejects.toThrow();
+					expect(readFileSync(file, "utf8")).toBe(original);
+					unlinkSync(config.receiptPath);
+					symlinkSync(join(outside, "absent-receipt"), config.receiptPath);
+					if (config.connected) {
+						const stateRoot = config.connected.stateRoot;
+						expect(() =>
+							clearConnectedVaultFiles(config.receiptPath, stateRoot, config.home),
+						).toThrow();
+					}
+					unlinkSync(config.receiptPath);
+					writeFileSync(config.receiptPath, receipt, { mode: 0o600 });
+				} finally {
+					server.stop(true);
+				}
+			});
+
+			test("symlink and writable .iforge parents are refused without touching their contents", async () => {
+				const { config, home, root, data } = fixture(connected);
+				const server = Bun.serve({
+					hostname: "127.0.0.1",
+					port: 0,
+					fetch: () => Response.json(data, { headers: { etag: "one" } }),
+				});
+				config.apiUrl = server.url.origin;
+				const outside = join(root, "outside");
+				mkdirSync(outside);
+				const parent = join(home, ".iforge");
+				symlinkSync(outside, parent);
+				try {
+					await expect(syncRuntimeVaultFiles(config)).rejects.toThrow();
+					expect(readdirSync(outside)).toEqual([]);
+					unlinkSync(parent);
+					mkdirSync(parent);
+					chmodSync(parent, 0o777);
+					await expect(syncRuntimeVaultFiles(config)).rejects.toThrow();
+					expect(lstatSync(parent).mode & 0o777).toBe(0o777);
+					expect(readdirSync(parent)).toEqual([]);
+				} finally {
+					server.stop(true);
+				}
+			});
+		},
+	);
+}

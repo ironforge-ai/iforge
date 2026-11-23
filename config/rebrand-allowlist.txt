@@ -1,0 +1,1228 @@
+# Rebrand do-not-rename allowlist -- phase 03.1 (clawdi -> iforge).
+#
+# This file is the durable authority for where the rebrand boundary sits. Both
+# scripts/check_rebrand_carveouts.py and scripts/check_rebrand_residual.py read it, and
+# scripts/test.sh runs both on the host before the Docker build, so a corrupted sweep fails in
+# seconds rather than after a 10-15 minute suite.
+#
+# It lives in config/ rather than under .planning/ deliberately: /gsd-cleanup archives
+# .planning/phases/ when a milestone completes, and a `bun run test` that breaks on planning
+# maintenance is not a guard. config/postgres-image.txt is the same idiom -- a plain text file
+# that is the single authority a committed checker validates against.
+#
+# GRAMMAR, one entry per line:
+#   empty line, or first non-space character is `#`   -> skipped
+#   path:<fnmatch glob>   -> allowed if the hit's repository-relative PATH matches the glob
+#   re:<python regex>     -> allowed if re.search matches `<path>:<line>:<text>`
+#   anything else         -> fixed substring, matched against `<path>:<line>:<text>`
+#
+# An entry is removed only by a plan that also proves the corresponding surface is clean.
+# Through phase 03.1 this file also carried a staging section at its foot naming the plan that
+# removed each of its entries; plan 08 emptied it. Every entry sits in a section whose comments
+# cite the carve-out id (C-n), deferral id (X-n) or project-rule id (P-n) that keeps it -- an
+# exemption with no citation is indistinguishable from a bug, and
+# backend/tests/test_rebrand_guards.py asserts the citation.
+#
+# CLASSIFICATION, one declaration per scope, added by plan 11 and machine-checked. A scope
+# declares either that its fence is PERMANENT -- a carve-out never expected to move -- or that
+# it is DEFERRED, followed by an arrow and the phase that will move it. The exact spelling of
+# both declarations is `_CLASSIFICATION_MARKERS` in scripts/check_rebrand_residual.py, and any
+# section below shows the real form; it is deliberately NOT written out here, because the
+# declarations are meant to be greppable and a worked example in a header would answer that
+# grep with a line that fences nothing. `test_every_declaration_in_the_real_allowlist_governs_
+# at_least_one_entry` holds that property.
+#
+# A citation answers "which decision keeps this entry". It could not answer the question phase
+# 03.1 verification found unanswered: whether a fence holds a carve-out or an unfixed defect.
+# Three entries here were MEASURED to be fencing defects -- documented commands that no longer
+# resolve, and a wire-key regex that incidentally covers rendered support text -- and nothing
+# in the grammar could tell them from the carve-outs beside them. So the earlier claim that
+# this file "holds permanent carve-outs only" was false, and the declarations now say which is
+# which: 43 permanent, 5 deferred, of the 48 scopes that hold entries (132 entries). Plan 11
+# measured 29 / 16 of 45; plan 03.3-14 re-declared the whole 03.3 deferral set and split one
+# scope; plan 03.3-24 retired one scope and re-declared two, which is where the difference comes
+# from. Do not hand-count these -- derive them, as
+# `test_every_declaration_in_the_real_allowlist_governs_at_least_one_entry` does.
+#
+# A declaration governs the entries beneath it until the next blank-line-separated comment run
+# or the next section banner, whichever comes first. That is the granularity this file already
+# writes in -- its two largest sections are umbrellas over sub-blocks that each carry their own
+# citation and each belong to a different class. `unclassified_sections` in
+# scripts/check_rebrand_residual.py reports any scope that fences without declaring, and any
+# deferral with nothing after its arrow: a deferral that names nobody reads as a decision while
+# committing nobody to carry it out, which is exactly how a fence over a defect survives.
+#
+# Fencing an unfixed defect is LEGAL here. Fencing one silently is not. And a fence is never
+# retracted before the fix it was hiding lands (D-10) -- the three `DEFERRED -> 03.1-13`
+# scopes below stay exactly as they are until plan 13 fixes the lines and retracts them in the
+# same wave, because removing a fence without fixing the line underneath only turns the guard
+# red. `TBD-brand-migration` is a PLACEHOLDER with a scheduled substitution, not a blank: plan
+# 03.1-15 creates the receiving phase and replaces the token here and at
+# packages/cli/tests/cli-help-brand-contract.test.ts:139 in one pass. Do not invent a phase
+# number.
+#
+# WHY SOME DEFERRALS NOW NAME A LEDGER ENTRY RATHER THAN A PHASE, recorded by plan 03.3-14 so
+# the next reader inherits the reasoning instead of re-deriving it. That plan was written to
+# RETIRE the fifteen scopes deferred to phase 03.3, on the premise that once the phase's other
+# thirteen plans landed those entries would cover nothing. Measured on 2026-09-10 against the
+# finished tree, the premise was wrong: the fifteen scopes held 65 entries covering 304 hits, of
+# which 225 were fenced by nothing else. Retiring them would have failed the residual scanner
+# with 225 real findings -- "removing a fence without fixing the line underneath", four
+# paragraphs up, exactly.
+#
+# So the entries stayed and the DECLARATIONS moved, which is the only half that had actually
+# expired. Eight scopes became permanent, because P33-21, P33-06, D-07 and the A-P1 host-path
+# ruling had by then decided the identity stays: it lives on a provisioned server or on the
+# wire, outside the coexistence rationale that motivates every other move in this set. Seven
+# still fence measured, unfixed defects, and those may not be re-declared permanent -- a
+# permanent declaration over a known defect is the silent fence this whole classification rule
+# exists to catch, reintroduced one level up. They needed an owner, and no phase existed to
+# name. The broken-windows ledger is that owner: `/gsd-ship` blocks while an entry is open, so
+# a ledger id commits more than a phase number does, and naming one invents nothing. Each such
+# scope's prose enumerates by file and line what it now holds. A future phase that adopts one of
+# these classes should replace the ledger reference with its own number, in the same change that
+# fixes the lines -- and then retire the scope, which is what this plan could not do.
+#
+# WHAT PLAN 03.3-24 DID WITH THE EIGHT SCOPES 03.3-14 LEFT, measured 2026-09-11 against the tree
+# after the nine gap-closure plans of waves 1-3 merged. Each scope's coverage was counted, and its
+# SOLE-FENCE count taken by deleting its entries from a scratch copy of this file and running
+# scripts/check_rebrand_residual.py against that copy -- never by reading a regex, because reading
+# one cannot tell a hit fenced twice from a hit fenced once.
+#   ONE RETIRED. The published-package-identity scope (package/clawdi, npm/v/clawdi,
+#     npm i -g clawdi, bun add -g clawdi) covered 2 hits when 03.3-14 measured it and covers 0
+#     now: plan 03.3-19 moved README.md:8 and :18 onto https://www.npmjs.com/package/@iforge/cli.
+#     Both halves of the retirement test held -- nothing else was fencing those lines, and the
+#     lines are right -- so entries and prose went together in one commit (D-10). What now holds
+#     the property is backend/tests/test_readme_identity_contract.py, which fails with the line
+#     number if README ever names a published package other than this fork's own.
+#   TWO RE-DECLARED PERMANENT. Both X-2 scopes -- the concrete hosted unit names, and the
+#     `clawdi-*` naming rule as documentation states it. The authority arrived after 03.3-14:
+#     P33-21 was amended on 2026-09-10 and REQUIREMENTS.md MIGR-01 now names
+#     clawdi-runtime-watch, clawdi-daemon and clawdi-runtime-sidecar as hosted identities only an
+#     operator procedure moves, in the same breath as the hosted roots and the runtime OS user
+#     that 03.3-14 had already made permanent here.
+#   FIVE STILL DEFERRED, each because a line underneath it is still wrong. Two of those five --
+#     the clawdi.ai domains and the .env.clawdi example filename -- have a sole-fence count of
+#     ZERO and are kept anyway. That is the trap this file has now caught twice: the narrowed C-4
+#     wire-key regex independently covers both, so retiring either measures clean while filing
+#     real documentation defects under a PERMANENT declaration that calls them protocol
+#     identifiers. A sole-fence of 0 is necessary for retirement and has never been sufficient.
+#
+# AND ONE CORRECTION A READER NEEDS BEFORE TRUSTING ANY DEFERRAL BELOW. Every ledger id 03.3-14
+# wrote into this file named an entry ONE LOWER than the one it meant, and plan 03.3-24 corrected
+# all four by matching each entry's text to the defect the scope describes: the state root moved
+# #109 -> #110, the clawdi.ai domains #110 -> #111, and both the example dotenv filename and the
+# backticked identifier #111 -> #112. (#109 is 03.3-14's own measurement record, which is why the
+# chain shifted.) The X-2 and X-3 scopes name #102 and #94 and were already right. A deferral
+# pointing at the wrong entry passes every gate in this repository -- `unclassified_sections`
+# checks only that SOMETHING follows the arrow -- and reads as a decision while committing
+# nobody, which is the failure that check exists to prevent, one level in.
+#
+# Do not reintroduce a staging section: `load_allowlist` in scripts/check_rebrand_residual.py
+# now refuses to parse an entry whose section carries the marker that section used, so a
+# temporary exemption cannot outlive the plan that added it. Read that function's docstring
+# before adding one. Growing this file to silence a finding is the failure mode T-03.1-05
+# names -- if a hit belongs to no carve-out class and no later plan, it is a real finding and
+# belongs in a plan summary, not here.
+
+# ---------------------------------------------------------------------------
+# C-1 / C-2 -- the pinned upstream PostgreSQL image, and the regex that enforces it.
+# ---------------------------------------------------------------------------
+# `clawdi-ai` alone is NOT a safe discriminator: config/deploy.yml:14 carries
+# `clawdi-ai/clawdi-backend` with no ghcr.io/ prefix (Kamal resolves it against
+# `registry.server: ghcr.io`), so an org-only entry would allowlist the very image names
+# plan 02 must rename. Match the image-name segment instead.
+# CLASS: PERMANENT
+clawdi-ai/postgres-
+
+# ---------------------------------------------------------------------------
+# C-3 -- upstream GitHub URLs under the Clawdi-AI org.
+# ---------------------------------------------------------------------------
+# These are real addresses of a repository this fork does not control; they are citations, not
+# self-references. The exceptions -- packages/cli/package.json repository/bugs/homepage, the
+# install.sh release base, llms.txt and apps/web/public/llms.txt -- ARE this fork's own
+# self-references. Plan 04 moved them to github.com/ironforge-ai/iforge behind the D-08 gate
+# and retired the five temporary `path:` entries that fenced them, so what remains under this
+# heading is upstream citation only.
+# CLASS: PERMANENT
+github.com/Clawdi-AI/
+Clawdi-AI/clawdi
+# The URL-encoded form, as star-history.com requires it in README.md's chart links.
+Clawdi-AI%2Fclawdi
+
+# ---------------------------------------------------------------------------
+# C-4 -- wire-protocol schema identifiers, `clawdi.<name>.vN` (55 distinct).
+# ---------------------------------------------------------------------------
+# pydantic Literal[...] discriminators persisted in Postgres JSONB and in on-disk runtime
+# state. clawdi.nativeRelease.v1 is the single exception plan 04 moves, because nothing has
+# ever consumed it; this entry stays afterwards because plan 04 is not the last consumer of
+# the shape. scripts/check_rebrand_carveouts.py asserts the other 54 still resolve.
+# CLASS: PERMANENT
+re:clawdi\.[A-Za-z][A-Za-z0-9]*\.v[0-9]+
+
+# ---------------------------------------------------------------------------
+# C-5 -- X-Clawdi-* HTTP headers (10 distinct).
+# ---------------------------------------------------------------------------
+# Wire contract. backend/app/core/sentry.py additionally scrubs the literal `x-clawdi-token`,
+# so a header rename without a matching scrubber change would start leaking the auth token
+# into Sentry (T-03.1-02). Case-insensitive: the constants are title-cased, the scrub list and
+# the generated client are lower-cased.
+# CLASS: PERMANENT
+re:(?i)x-clawdi-[a-z-]+
+
+# ---------------------------------------------------------------------------
+# C-6 / C-8 / C-9 -- data-at-rest markers sharing the `clawdi_<snake>` shape.
+# ---------------------------------------------------------------------------
+# API_KEY_PREFIX "clawdi_" (every issued key), clawdi_system (JSONB dedup marker),
+# clawdi_discord_gateway (JWT sub/aud in issued tokens), plus clawdi_egress_addon,
+# clawdi_dev, clawdi_test, clawdi_access_ed25519 and clawdi_cli.
+# `*` not `+`: API_KEY_PREFIX is the bare literal "clawdi_", so a one-or-more quantifier
+# would not cover the very C-6 constant this entry names.
+# CLASS: PERMANENT
+re:clawdi_[a-z_]*
+
+# ---------------------------------------------------------------------------
+# C-7 -- the persisted managed AI provider id.
+# ---------------------------------------------------------------------------
+# CLASS: PERMANENT
+CLAWDI_MANAGED_PROVIDER_ID
+
+# ---------------------------------------------------------------------------
+# C-7 (at a site the pathspec only started reading in plan 11) -- the workload issuer VALUE.
+# ---------------------------------------------------------------------------
+# backend/.env.example:72 reads `PLATFORM_WORKLOAD_ISSUER=clawdi-cloud-platform`. Same class as
+# the entries above and as `clawdi-cloud-api` further down: a persisted identifier that travels
+# as a VALUE rather than as a variable name. It is the authorization-server issuer and the
+# exact client-assertion audience, so it is compared byte-for-byte by the party validating the
+# assertion -- renaming it in an example file that operators copy into `.env` would make every
+# copied deployment fail its own token exchange, and renaming it for real is a coordinated
+# change with the cloud-api that issues against it, not a sweep.
+#
+# This entry exists because plan 11 widened SCAN_PATHSPEC to `*.env.example`, which WINDOWS #40
+# identified as membership source 1 of config/rebrand-env-contract.txt -- the guard was
+# policing a contract derived from files it did not read. Measured after widening: 14 hits
+# across the three env-example files, 12 already covered, 2 uncovered. This is one; the other
+# was a genuine prose defect at backend/.env.example:21 and was FIXED rather than fenced.
+# CLASS: PERMANENT
+PLATFORM_WORKLOAD_ISSUER=clawdi
+
+# ---------------------------------------------------------------------------
+# C-10 -- Alembic revision filenames, and the two documentation lines that cite their paths.
+# ---------------------------------------------------------------------------
+# Alembic resolves by revision id, so a rename buys nothing and guarantees a permanent
+# upstream merge conflict (R-3). The bare filename entry covers
+# docs/designs/whatsapp-native-baileys-cleanup-audit.md:47,135, which cite the path as prose.
+# CLASS: PERMANENT
+path:backend/alembic/*
+2d4c8e1b7a90_clawdi_native_channels.py
+c1d99ac4f9e6_clawdi_serve_v1_schema.py
+
+# ---------------------------------------------------------------------------
+# C-11 -- the generated API client.
+# ---------------------------------------------------------------------------
+# AGENTS.md:211-212 forbids hand-editing it; regenerate with the backend workflow. Since the
+# headers it carries are carved out by C-5, it should not change at all this phase.
+# CLASS: PERMANENT
+path:packages/shared/src/api/api.generated.ts
+
+# ---------------------------------------------------------------------------
+# C-12 -- the lockfile.
+# ---------------------------------------------------------------------------
+# Regenerated by `bun install` as a consequence of the workspace package rename in plan 04.
+# CLASS: PERMANENT
+path:bun.lock
+
+# ---------------------------------------------------------------------------
+# The public environment contract file itself.
+# ---------------------------------------------------------------------------
+# C-13 (specification, not carrier). config/rebrand-env-contract.txt is the frozen authority
+# for the IFORGE_* <- CLAWDI_* mapping (plan 06). It is a SPECIFICATION of the rename, not a
+# carrier of it: every line necessarily names both spellings, and its header prose necessarily
+# discusses `clawdi`. The same reason scripts/check_rebrand_residual.py excludes
+# config/rebrand-allowlist.txt from its own pathspec applies one file over. Durable, not
+# staged: the file is frozen and never stops naming both sides, so no later plan removes this
+# entry.
+# CLASS: PERMANENT
+path:config/rebrand-env-contract.txt
+
+# ---------------------------------------------------------------------------
+# C-13 (at sites inside the scanner's surface) -- internal env plumbing, plan 06.
+# ---------------------------------------------------------------------------
+# Plan 06 cut the PUBLIC environment contract -- the 44 names in
+# config/rebrand-env-contract.txt, derived mechanically from D-05a's seven membership sources.
+# The three names below are internal process-to-process plumbing: each is absent from all
+# seven sources, no user ever sets one, and each is read only by the repository's own build and
+# test machinery. They belong to the C-13 class, but unlike the rest of it they sit at sites
+# INSIDE this scanner's public-surface pathspec, so they need explicit entries.
+#   CLAWDI_TEST_RUNNER_SKIP_BUILD -- read by scripts/test.sh:63, set by clean-test-runner-ci.yml
+#   CLAWDI_NATIVE_BINARY          -- native e2e lifecycle runner, packages/cli/package.json:38
+#                                    and .github/workflows/cli-publish.yml:87
+# CLASS: PERMANENT
+CLAWDI_TEST_RUNNER_SKIP_BUILD
+CLAWDI_NATIVE_BINARY
+
+# ---------------------------------------------------------------------------
+# C-13 (same class, upstream sync step 2, 06.1-05) -- the bearer-token register in the hosted drop-in.
+# ---------------------------------------------------------------------------
+# docs/managed-runtime.md quotes the generated official-service drop-in verbatim. Its
+# `UnsetEnvironment=` line names BOTH spellings of the Cloud bearer token because a native
+# service that spawns `iforge` (its MCP server) would re-derive the internal register from the
+# public name (T-03.1G-01); runtime-systemd-reconciliation.ts RUNTIME_AUTH_TOKEN_ENV_NAMES is the
+# writer. Not an alias: IFORGE_AUTH_TOKEN is the only public spelling, and the line removes both.
+# CLASS: PERMANENT
+UnsetEnvironment=CLAWDI_AUTH_TOKEN IFORGE_AUTH_TOKEN
+
+# ---------------------------------------------------------------------------
+# C-13 (same class, exposed by plan 03.3-06) -- the two bundler define names.
+# ---------------------------------------------------------------------------
+# packages/cli/package.json:27 carries the two `--define` flags that bake this fork's
+# production origins into every non-native build. Both names are internal plumbing of exactly
+# the C-13 kind above: absent from all seven D-05a membership sources, never set by a user, and
+# read only by packages/cli/src, which D-01 keeps upstream-aligned for identifiers.
+#
+# They needed no entry until now only because the LINE they sit on also carried
+# `cloud-api.clawdi.ai`, so the X-6 `clawdi.ai` fence hid them. Plan 03.3-06 moved both origins
+# to iforge.dev (P33-13, P33-24), which removed that fence and exposed the identifiers
+# underneath it. This is a fence being ADDED for a newly visible internal identifier, not a
+# retirement -- plan 03.3-14 still owns retiring the `clawdi.ai` entry itself.
+#   CLAWDI_DEFAULT_API_URL        -- default cloud API origin, packages/cli/package.json:27
+#   CLAWDI_DEFAULT_DEPLOY_API_URL -- default deploy API origin, packages/cli/package.json:27
+# CLASS: PERMANENT
+CLAWDI_DEFAULT_API_URL
+CLAWDI_DEFAULT_DEPLOY_API_URL
+
+# ---------------------------------------------------------------------------
+# A-P1 -- the WhatsApp egress iptables chain name, plan 06.
+# ---------------------------------------------------------------------------
+# config/deploy.yml:168 reads `chain=CLAWDI_WA_EGRESS`. Measured, not assumed: this is the NAME
+# OF AN IPTABLES CHAIN created in the host's OUTPUT table, asserted by
+# scripts/deploy-whatsapp-sidecar.sh:196-198 with `iptables -C`. It is not an environment
+# variable, so no alias reaches it and renaming it would orphan a live chain on a deployed
+# host -- the same migration-not-sweep class as X-2 and X-3. It entered plan 06's candidate
+# union only because the `config/*.yml` membership source is a file-level grep; the contract
+# file records the exclusion.
+#
+# RE-DECLARED by plan 03.3-14 from a deferral to this phase into a permanent carve-out, and the
+# re-declaration is the decision rather than bookkeeping. Plan 11 deferred it because this
+# section's own prose put the chain in the same migration-not-sweep class as X-2 and X-3, and
+# that class had no destination. It has one now, and the answer P33-21 gave the class is that an
+# identity living on a PROVISIONED SERVER rather than on a user's machine does not move: it sits
+# outside the P33-01 coexistence rationale, because no upstream install exists on that host to
+# collide with. An iptables chain in a deployed host's OUTPUT table is the purest case -- the
+# name is invisible to every user of this product, and renaming it orphans a live chain.
+# Measured 2026-09-10: covers 3 hits, sole fence for 1 (config/deploy.yml:168).
+# CLASS: PERMANENT
+# migration-not-sweep class as X-2 and X-3, and D-07 sends that class to a follow-up
+# phase. A live iptables chain is renamed by a migration or not at all.
+CLAWDI_WA_EGRESS
+
+# ---------------------------------------------------------------------------
+# C-13 / D-01 / D-02 -- internal source and test symbols stay upstream-aligned.
+# ---------------------------------------------------------------------------
+# Roughly 8,900 occurrences. They are outside this scanner's pathspec entirely (it scans the
+# public brand surface only), so no entry is needed here -- the pathspec in
+# scripts/check_rebrand_residual.py IS the D-02 boundary record. This heading exists so a
+# reader looking for C-13 finds the answer instead of assuming an omission.
+
+# ---------------------------------------------------------------------------
+# D-07 / X-1 -- the on-disk state root `~/.clawdi` and its env override.
+# ---------------------------------------------------------------------------
+# Renaming it orphans every existing installation's credentials and runtime state. A migration,
+# not a sweep.
+#
+# THE MIGRATION LANDED AND THE DOCUMENTATION SWEEP LANDED TOO; the fence still cannot come
+# down, but for a much smaller reason than it could in wave 1. Plan 03.3-02 collapsed five
+# independent resolvers onto packages/cli/src/lib/state-root.ts and resolved the root
+# unconditionally to the new directory, so the CODE moved. Plan 03.3-14 then measured that the
+# DOCUMENTATION had not: 52 hits covered, 46 fenced by nothing else, 44 of them documents telling
+# a reader their state lives at the old root. Those 44 have since been swept -- README.md:162 and
+# :276 by plan 03.3-19, and 39 of the 40 docs/ sites by plan 03.3-20, whose one deliberate
+# survivor (docs/runbooks/iforge-env-migration.md:186) was rewritten by 06.1-04 when `iforge
+# migrate` was removed with every other Clawdi-name alias (user directive 2026-09-30).
+# Re-measured 2026-09-11 by plan 03.3-24 against the tree waves 1-3 left: 10 hits covered, 5
+# fenced by nothing else. FOUR of the five are correct lines rather than residue, and naming them
+# is the point of this paragraph:
+#   README.md:373, docs/designs/channel-runtime-manifest.md:67 and
+#     docs/plans/cli-node-test-runner-inventory.md:229 name the `CLAWDI_HOME` env override, which
+#     is a LIVE variable the CLI still reads (packages/cli/tests/config.test.ts:210,
+#     credential-origin-binding.test.ts:61-78, project-folders.test.ts:23-46) and which
+#     config/rebrand-env-contract.txt:34 records as a durable X-1 entry beside CLAWDI_RUNTIME_USER.
+#   apps/web/src/hosted/problem-code-contract.test.ts:87 is an incidental catch, not a state root:
+#     the line carries the ESCAPED regex literal `api\.clawdi\.ai`, so the `clawdi.ai` substring
+#     entry cannot see it and the `\.clawdi` regex here is what covers it.
+# The FIFTH is residue and is why this scope stays deferred:
+#   docs/scenarios/scenario-6-skills-portable-instructions.md:139 documents
+#     `.clawdi/skills.json in project root`. No per-project `.clawdi` directory exists --
+#     state-root.ts:39 sets STATE_DIR_NAME = ".iforge" and packages/cli/src implements no
+#     project-root skills.json at all. Plan 03.3-20 swept nine `~/.clawdi` sites in this same
+#     file, so the document now says `~/.iforge/skills/` in one place and `.clawdi/` in another.
+#     It survived that sweep because 03.3-20's allow-list gate is anchored on `~/\.clawdi`, with
+#     the tilde, and this site has no tilde. One line, in a document banner-marked HISTORICAL.
+# Retiring this scope today would fail the residual scanner with that one finding, which is still
+# removing a fence without fixing the line underneath (D-10). Whoever fixes it retires this scope
+# in the same change -- and should consider splitting `CLAWDI_HOME` out first, since that entry is
+# durable by the env contract and only the `\.clawdi` regex is holding residue.
+# The receiving owner is the broken-windows ledger rather than a phase, because no phase exists
+# to name and the head of this file forbids inventing one. That is not the weaker choice:
+# /gsd-ship blocks while a ledger entry is open, which is more than a phase number commits.
+# THE LEDGER ID BELOW WAS CORRECTED by plan 03.3-24 from #109 to #110. Every deferral 03.3-14
+# wrote into this file named an id one lower than the entry it meant: #109 is 03.3-14's own
+# measurement record, while #110 is the entry that enumerates the state-root documentation sites
+# this scope fences ("roughly 44 DOCUMENTATION sites ... apps/web/public/skill.md:142,263 were in
+# the same set and ARE fixed by 03.3-14"). A deferral that names the wrong entry reads as a
+# decision while committing nobody, which is the exact failure `unclassified_sections` exists for.
+# CLASS: DEFERRED -> WINDOWS #110
+re:(^|[^A-Za-z0-9])\.clawdi(/|\b)
+CLAWDI_HOME
+
+# ---------------------------------------------------------------------------
+# D-07 / X-2 -- systemd unit names and the launchd label.
+# ---------------------------------------------------------------------------
+# Written into /etc/systemd/system and ~/Library/LaunchAgents on live hosts. Renaming them
+# leaves orphaned units running the old binary.
+#
+# RE-DECLARED PERMANENT by plan 03.3-24, on an authority that did not exist when 03.3-14 left
+# this scope deferred. P33-21 was AMENDED on 2026-09-10 and the amendment is written into the
+# requirement itself: REQUIREMENTS.md MIGR-01 now reads that P33-21 "carved out the hosted
+# identities a provisioned host owns and only an operator procedure moves: the hosted runtime OS
+# user, the file-browser service user, the hosted CLI state root, and the three hosted
+# system-scope units `clawdi-runtime-watch`, `clawdi-daemon` and `clawdi-runtime-sidecar`". The
+# three units are therefore a stated carve-out with a reason, in the same class as the hosted
+# platform roots and CLAWDI_RUNTIME_USER that 03.3-14 already made permanent here -- not an
+# identity awaiting a repository edit. WINDOWS #102 stays open as the record of the OPERATOR
+# obligation it describes (whoever ever does move them must move all three together and add the
+# legacy names to the managedSystem stale-unit set, or a provisioned host's old units are
+# orphaned rather than collected); that obligation is conditional on a decision nobody has taken,
+# not a defect in this tree.
+#
+# WHAT THIS SCOPE FENCES, all nine hits re-measured 2026-09-11 and every one of them a line that
+# is TRUE of what is deployed:
+#   the three hosted system-scope units -- docs/managed-runtime.md:213, :214, :1135. The system
+#     unit root resolves to /run/systemd/system only when the runtime mode is hosted AND the
+#     process is root, so no upstream install exists on that host to collide with. Plan 03.3-20
+#     added the paragraph at :210-219 that states the split in the document itself, citing P33-21.
+#   the Files service ACCOUNT and its hosted state directory -- docs/managed-runtime.md:349,
+#     :359, :361, :1075. THIS FILE PREVIOUSLY SAID THE OPPOSITE, and the correction is the
+#     substance of this re-declaration: the retired text claimed all four docs/managed-runtime.md
+#     `clawdi-files` sites were stale prose for a name that moved, and ledger entry #112 inherited
+#     that error. Only the two `.service` mentions were residue and plan 03.3-20 swept both
+#     (`clawdi-files.service` now reads `iforge-files.service` at two sites, measured 0 and 2).
+#     The service USER, the service GROUP and the hosted STATE directory did NOT move and are
+#     pinned present by the code: FILE_BROWSER_SERVICE_USER = "clawdi-files"
+#     (packages/cli/src/runtime/file-browser-isolation.ts:14, pinned by
+#     scripts/check_rebrand_carveouts.py:132), SYSTEMD_FILE_BROWSER_STATE_DIRECTORY = "clawdi-files"
+#     (packages/cli/src/runtime/paths.ts:8) and DEFAULT_FILE_BROWSER_STATE_ROOT =
+#     "/var/lib/clawdi-files" (paths.ts:14). packages/cli/src/runtime/systemd-user.ts:130-138
+#     states the rule outright: the unit NAME moves with the rest of the systemd identity
+#     (P33-20), the service user, group and hosted state directory do not.
+#   the Hermes compatibility unit -- docs/managed-runtime.md:1199. A compatibility unit exists to
+#     be recognised by an install that predates the rename; renaming it is the one edit that
+#     would defeat its purpose.
+#   the serve e2e log directory -- docs/iforge-daemon-test-guide.md:45. Accepted rather than
+#     carved out by P33-21: the line accurately describes scripts/serve-e2e.sh:31
+#     (LOG_DIR=/tmp/clawdi-serve-e2e-last), the script sits outside this scanner's pathspec, and
+#     no plan moves it. A /tmp path in a developer script, named here so this declaration is not
+#     silent about the one hit it holds that is not a hosted identity.
+# Measured 2026-09-11: 9 hits covered, 7 fenced by nothing else. TWO entries -- clawdi-openclaw
+# and ai.clawdi.serve -- cover zero hits today and are NOT retired: nothing this gap-closure set
+# changed made them dead, and retiring a fence is a decision about the surface it watches, the
+# precedent this file set for npm i -g clawdi. clawdi-runtime-sidecar covered zero when 03.3-14
+# measured it and covers ONE now: plan 03.3-20's carve-out paragraph names the unit explicitly,
+# which is the fence doing its job rather than a new defect.
+# CLASS: PERMANENT
+clawdi-runtime-sidecar
+clawdi-runtime-watch
+clawdi-daemon
+clawdi-files
+clawdi-serve
+clawdi-hermes-dashboard
+clawdi-openclaw
+ai.clawdi.serve
+
+# ---------------------------------------------------------------------------
+# D-07 / X-3 -- compose project name and Postgres database/user identity.
+# ---------------------------------------------------------------------------
+# The database name and role exist inside running clusters and in every backup stanza.
+#
+# THE DEFAULTS FLIPPED; THE LIVE IDENTITIES DID NOT, which is what P33-06 decided rather than a
+# shortfall. Plan 03.3-08 moved 28 occurrences across 9 files and shipped
+# docs/runbooks/iforge-compose-postgres-migration.md for the operator half. The code
+# deliberately does not rename a live role or database: that is a destructive data-layer
+# operation, driven from a repository whose CI never executes against this origin.
+# What this scope is still the sole fence over splits three ways, each already on the ledger:
+#   the LIVE stack sites -- config/deploy.yml:28's psql alias and deploy/preview's compose
+#     project name -- WINDOWS #92 and #93; both move when an operator runs the runbook.
+#     (Upstream sync step 4, 06.1-11: deploy/preview was deleted upstream, #1560, and the
+#     deletion accepted, so only the psql alias remains.)
+#   the LOCAL DEV database identity -- docker-compose.yml:1,27,28 and its siblings -- WINDOWS
+#     #94; no plan in this phase declares it, and moving it orphans every contributor's volume.
+#   the clean test runner's image name, fake HOME and USER, recorded by 03.3-08 as sibling
+#     identities inside files it edited and deliberately left alone.
+# Measured 2026-09-10: 20 hits covered, 17 fenced by nothing else. RE-MEASURED 2026-09-11 by plan
+# 03.3-24 against the tree waves 1-3 left: 20 and 17, unchanged to the hit. Nothing in this
+# gap-closure set declares any of these files, so nothing was expected to move and nothing did.
+# NOT re-declared permanent, and the distinction is the reason rather than caution. The hosted
+# identities that became permanent in this pass are ones no procedure is scheduled to move; these
+# are the opposite shape. WINDOWS #92 records config/deploy.yml:31 as resolving "when an operator
+# runs docs/runbooks/iforge-compose-postgres-migration.md", and #93 the same for the preview
+# stack's compose project name -- a move this repository shipped a runbook FOR, waiting on an
+# actor rather than on a decision. A permanent declaration would say these never move, which the
+# existence of that runbook contradicts. The ledger entry named below still describes the local
+# dev half accurately; #92 and #93 still describe the live stack half accurately.
+# CLASS: DEFERRED -> WINDOWS #94
+clawdi-dev
+clawdi-test
+clawdi-preview
+POSTGRES_DB: clawdi
+POSTGRES_USER: clawdi
+STANZA: clawdi
+PGBACKREST_STANZA: clawdi
+FILE_STORE_S3_BUCKET: clawdi
+clawdi-test-runner
+COMPOSE_PROJECT_NAME
+# The same X-3 identity as it is actually written across the deploy stacks. Research
+# enumerated the identity but not every site: `-U clawdi` covers both the psql invocation and
+# the preview stack's pg_isready healthcheck, the `:-clawdi` forms cover the shell-default
+# spellings (including the INFRA_-prefixed variants, which contain the unprefixed entry), and
+# the two DSN prefixes cover the literal connection strings.
+-U clawdi
+POSTGRES_DB=clawdi
+POSTGRES_USER=clawdi
+POSTGRES_DB:-clawdi
+POSTGRES_USER:-clawdi
+postgresql://clawdi:
+postgresql+asyncpg://clawdi:
+# The clean test runner's fake HOME inside the container. Bound to the X-1 state root: the
+# runner exists so `~/.clawdi` resolves somewhere disposable.
+/tmp/clawdi-home
+
+# ---------------------------------------------------------------------------
+# D-07 / X-4 -- the runtime OS user.
+# ---------------------------------------------------------------------------
+# RE-DECLARED by plan 03.3-14 from a deferral to this phase into a permanent carve-out, on the
+# strength of P33-21: the hosted platform roots and the runtime OS user do NOT move, each
+# recorded with its reason. They live on provisioned servers rather than on user machines, so
+# they sit outside the P33-01 coexistence rationale that motivates every other identity move in
+# MIGR-01, and MIGR-02's own requirement text admits a destination "recorded as a deliberate
+# carve-out with its reason". RESEARCH assumption A5 could not confirm the provisioning image is
+# even built from this repository; if it is, moving the user is an image change with its own
+# plan, not a string sweep. scripts/check_rebrand_coexistence.py carries the same decision as
+# _HOSTED_USER_REASON, so the two authorities agree rather than merely coexisting.
+# Measured 2026-09-10: covers 2 hits, sole fence for 1 (docs/managed-runtime.md:231).
+# CLASS: PERMANENT
+CLAWDI_RUNTIME_USER
+
+# ---------------------------------------------------------------------------
+# D-07 / X-5 -- the MCP server name and the bundled skill ids.
+# ---------------------------------------------------------------------------
+# These names are written into third-party agent config files on user machines, and
+# install.sh:190-195 validates the exact skill member paths inside the release tarball.
+# Planner deviation 2: 03.1-RESEARCH.md's Wave-2 row lists the MCP server name
+# (packages/cli/src/mcp/server.ts:96) among the published-identity renames. D-07 was decided
+# after that research, is a locked user decision, and supersedes it.
+#
+# The two member-path entries that stood here -- `skills/clawdi/SKILL.md` and
+# `skills/hosted-versions/1/clawdi/SKILL.md` -- were removed by plan 03.3-10, which moved both
+# skill directories and both halves of the tarball member contract. Those lines no longer carry
+# the literal, so the entries matched nothing; an allowlist entry that guards an absent hit is a
+# record of what the tree once was, not a decision about what it is.
+#
+# `path:packages/cli/skills/*` was RETIRED by plan 03.3-14, and this is the one fence in the
+# D-07 set that the phase's work genuinely earned the right to take down. It was kept on the
+# grounds that both `SKILL.md` documents still carry `clawdi://` secret-reference examples --
+# which is true, and is exactly why the glob was redundant: `clawdi://` is its own permanent
+# entry three headings below, and it covers every one of those lines by itself. Measured
+# 2026-09-10 before removing it: the glob covered 8 hits and was the sole fence for 0.
+# (06.1-11 later retired that entry too: the scheme moved to `iforge://`.)
+#
+# Retiring it is strictly STRONGER than keeping it, which is the only reason to do it. A `path:`
+# glob fences whole FILES, so while it stood, any future `clawdi` string added to either
+# document -- a brand token, not a URI -- would have been absorbed silently. The scanner now
+# reads both `SKILL.md` documents for real, and a hit in them that is not the URI scheme fails
+# the build. That is the same argument plan 07 made when it retired the two `apps/web` globs.
+
+# The frozen bytes of a bundled Skill tree that a published PRE-LEDGER release actually wrote to
+# user machines. Its SHA-256 is pinned in LEGACY_LOCAL_SETUP_SKILL_DIGESTS
+# (packages/cli/src/runtime/managed-skill-reservation.ts) and is the whole point of the fixture:
+# the adoption cases prove the CLI recognises its own old directory instead of uploading it as
+# user content. Rewriting a single byte here changes the digest and silently turns those cases
+# into no-ops. This is a historical artifact, not a document -- it must NEVER be swept.
+# Upstream sync step 4 (06.1-10): upstream added the same fixture as `legacy-local-clawdi`
+# (released CLI 0.14.28, byte-identical to what the fork's `pre-ledger-bundled-skill` held since
+# step 2), so the fork's copy is retired and this entry follows upstream's path.
+# CLASS: PERMANENT
+path:packages/cli/tests/fixtures/legacy-local-clawdi/*
+
+# ---------------------------------------------------------------------------
+# C-3 / C-13 / D-01 -- the upstream Agent Plugin Store contract (upstream sync step 1, 06.1-03).
+# ---------------------------------------------------------------------------
+# Upstream #1004 and its neighbours bring Agent Plugins, installed from the public Store at
+# `Clawdi-AI/store` (a repository under the upstream org, the C-3 class). The first-party package
+# fixture is the byte-exact Store package the backend and CLI tests hash to a pinned
+# `sha256-tree-v1` digest (`CLAWDI_AGENT_PLUGIN_DIGEST` in backend/tests/test_runtime_source.py),
+# so rewriting one byte of it silently breaks the digest cases, the same reason as the
+# pre-ledger fixture above. The `ai.clawdi` manifest extension namespace, the Store path
+# `v2/plugins/clawdi` and the package's `secret://clawdi/auth-token` reference are names the
+# Store and every package manifest carry; the runtime reads them byte for byte, and the CLI rule
+# set keeps the same names as KEEP:upstream-contract. Upstream contract, not copy.
+# CLASS: PERMANENT
+path:packages/cli/tests/fixtures/agent-plugins/clawdi/*
+re:^docs/architecture\.md:\d+:.*(`Clawdi-AI/store`|`ai\.clawdi`)
+re:^docs/managed-runtime\.md:\d+:.*(`ai\.clawdi`|`v2/plugins/clawdi`|`secret://clawdi/auth-token`)
+
+# ---------------------------------------------------------------------------
+# D-07 / X-6 -- the clawdi.ai domains baked into the production build.
+# ---------------------------------------------------------------------------
+# Covers cloud-api.clawdi.ai, api.clawdi.ai, cloud.clawdi.ai, www.clawdi.ai and the RFC-9457
+# problem-type URIs. A domain move is a DNS and certificate migration, not a sweep.
+#
+# STILL NOT RETIRED, and plan 03.3-24 re-measured the reason rather than banking the fix that
+# was supposed to make retirement safe. Retiring this entry measures CLEAN -- all 44 hits it
+# covers are also covered by the narrowed C-4 wire-key regex at the foot of this file, which
+# matches the domain in every position except after an at-sign. That is the trap, and a sole-fence
+# of 0 has never been sufficient here: RETIRE needs the covered lines to be RIGHT as well.
+# The two defects 03.3-14 named ARE fixed. Plan 03.3-19 moved README.md:15 to
+# https://iforge.dev (DESTINATIONS.webOrigin) and README.md:349 to https://cloud.iforge.dev
+# (DESTINATIONS.dashboardOrigin), which is exactly the 46 -> 44 in the measurement below.
+# 03.3-14's enumeration was INCOMPLETE, which is the finding that keeps this scope deferred. It
+# recorded "two of those 46 are real defects" and stopped at this fork's front page. Seven more
+# sit under this fence and send a reader to a host this fork does not own, none of them a wire
+# key and none of them fixed by anything in this gap-closure set:
+#   docs/plans/project-agent-bindings.md:337 and
+#     docs/scenarios/project-sharing-agent-bindings-demo.md:108, :139 -- three copy-pasteable
+#     command lines reading `iforge inbox accept https://clawdi.ai/share/<token>`. The binary is
+#     already spelled `iforge` on the same line; only the host is upstream's.
+#   docs/scenarios/scenario-1-connectors-claude-code.md:27 (`> Visit: https://clawdi.ai/activate`
+#     in a rendered device-flow transcript), :59 ("One-time setup at `clawdi.ai`"), :218 and :220
+#     (`mcp.clawdi.ai` as the remote MCP endpoint). Plan 03.3-20 swept eight `~/.clawdi` sites in
+#     that same document, so it now shows a login saving its token to `~/.iforge/config` while
+#     the line above sends the user to upstream's apex.
+# The other 37 are carve-outs that belong where they are: RFC-9457 problem-type URIs and hosted
+# node hostnames in apps/web tests (the C-4 wire class), the deliberate retired-destination
+# constants in web-destinations-contract.test.ts:89 and legacy-hosted-dashboard.test.ts:16,
+# docs/adr/0005-* (P-8, mirrored byte-for-byte and not correctable from this checkout) and the
+# digest-pinned pre-ledger skill fixture. Retiring here would move the seven under the C-4
+# PERMANENT regex -- a declaration that says "namespaced wire key" -- with no record of what it
+# had taken on. That is the silent fence this file's classification rule exists to catch,
+# produced by following the rule's own letter, and it is the same shape whether the count is two
+# or seven.
+# The rendered support contact this scope inherited from plan 03.1-13 is GONE: no
+# support@clawdi.ai remains anywhere in the scanned surface, because destinations.ts now carries
+# supportEmail = support@iforge.dev and plan 03.3-07 moved every render site onto it. That held
+# until the 06.1 upstream sync to clawdi 1593 reintroduced one rendered site, the contact_support
+# CTA in apps/web/src/hosted/agents/hosted-agent-detail.tsx: the 06.1-11 sweep missed it,
+# 06.1-UI-REVIEW found it, and quick task 261002-dx9 moved it onto DESTINATIONS.supportEmail.
+# The property is now pinned by a test rather than by this prose: the describe block
+# "06.1 UI review: retired upstream support address" in
+# apps/web/src/lib/web-destinations-contract.test.ts walks every non-test file under
+# apps/web/src and fails on any address at this domain. That block's needle
+# (web-destinations-contract.test.ts:372) is itself an at-sign occurrence C-4 refuses, so this
+# entry is its SOLE fence (measured 2026-10-02: 1 at-sign hit, fenced, sole fence). The
+# 2026-09-11 "sole fence for 0" below predates that needle. The entry is additionally pinned
+# present by test_the_deferred_support_contact_is_still_fenced_by_the_hosted_domain_entry in
+# backend/tests/test_rebrand_guards.py; plan 03.3-24 corrected that test's docstring in the same
+# change as this paragraph (and quick 261002-dx9 corrected it again), so the assertion now
+# states the property it actually holds -- that C-4's `(?<!@)` lookbehind leaves this entry the
+# only possible fence for an at-sign position -- rather than a premise about addresses that are
+# no longer in the tree. Whoever eventually retires this entry retires that assertion in the
+# same change, and in that same change re-fences or deletes the needle at
+# web-destinations-contract.test.ts:372, or the residual guard fails on it.
+# Measured 2026-09-11: covers 44 hits, sole fence for 0. Receiving owner: ledger entry #111,
+# which enumerates the README destinations by line; the seven documentation destinations above
+# are NOT in it and were reported by plan 03.3-24 for appending. The id was corrected from #110
+# by plan 03.3-24 -- see the X-1 scope above for why every id 03.3-14 wrote here was one low.
+# CLASS: DEFERRED -> WINDOWS #111
+#
+# WIDENED IN MEANING by plan 03.1-13 -- the entry text is unchanged, but after plan 13
+# narrowed the C-4 wire-key regex with a `(?<!@)` lookbehind this entry became the SOLE
+# fence over eight RENDERED `support@clawdi.ai` contact sites, which are not domains baked
+# into a build and were not what this scope was written for. Naming them here is not
+# bookkeeping: an entry whose prose does not say what it fences is the silent fence this
+# file's classification rule exists to catch.
+#   apps/web/src/components/app-sidebar.tsx:1378 (mailto href + aria-label), :1380 (label)
+#   apps/web/src/hosted/billing/components/compute-dunning-banner.tsx:131, :161
+#   apps/web/src/pages/gate/access-unavailable-page.tsx:66
+#   apps/web/src/pages/gate/deactivated-page.tsx:23
+#   apps/web/src/pages/gate/access-unavailable-page.test.tsx:89, :99 (pinned test constant)
+# DEFERRED, with a stated reason rather than an oversight: the user ruled on 2026-09-08 that
+# the eventual support address belongs to a NEW COMPANY IDENTITY that does not exist yet, so
+# there is no correct string to write today and inventing one would render a promise the
+# fork cannot keep. Owner: the receiving phase plan 03.1-15 creates.
+# The two highest-stakes sites are the billing dunning banner and the deactivated-account
+# page: a user whose payment has failed or whose account is deactivated currently has
+# UPSTREAM as their only offered contact route, at the moment they most need support.
+#
+# This entry is a bare substring and therefore fenced EVERY line carrying the domain,
+# including `curl -sSL https://clawdi.ai/install.sh | sh` (CR-02). Narrowing it here would not
+# have closed that hole: the C-4 wire-key regex at the foot of this file independently covers
+# `clawdi.ai` in a URL, so the pipeline stayed allowlisted with this entry narrowed. The
+# refusal therefore lives in the scanner, where it applies to all 137 entries at once and to
+# every entry added later -- `_UNFENCEABLE` in scripts/check_rebrand_residual.py. Read that
+# constant before widening anything here.
+clawdi.ai
+
+# ---------------------------------------------------------------------------
+# P-8 -- ADR-0005, mirrored byte-for-byte into the sibling hermes-deploy repository.
+# ---------------------------------------------------------------------------
+# AGENTS.md:148-159. The mirror assertion compares bytes, so this file cannot be corrected
+# from this checkout alone.
+# CLASS: PERMANENT
+path:docs/adr/0005-*
+
+# ---------------------------------------------------------------------------
+# Kamal host paths and container service identity -- deferred (planner assumption A-P1).
+# ---------------------------------------------------------------------------
+# Host filesystem paths and container/service names in config/deploy.yml and the self-host
+# compose files. Research did not classify these; they are the same class of migration-not-sweep
+# as X-2 and X-3 -- renaming them orphans bind-mounted volumes on live servers.
+# RE-DECLARED by plan 03.3-14 into a permanent carve-out. Plan 11 deferred this scope by analogy
+# to X-2 and X-3, both of which had a destination pending; the destination arrived and answered
+# the analogy the other way. Every identity here is a bind-mounted host path, a container service
+# name or a snapshot directory on a PROVISIONED SERVER -- /home/phala/clawdi-whatsapp/state,
+# /run/clawdi-whatsapp/sidecar.sock, /var/clawdi-snapshots and the Kamal service name itself.
+# P33-21 is the governing decision: these sit outside the P33-01 coexistence rationale because no
+# upstream install exists on that host to collide with, and renaming any of them detaches a live
+# volume or breaks a socket path an operator's running stack depends on. None is user-visible.
+# Measured 2026-09-10: covers 60 hits, sole fence for 56 -- config/deploy.yml, deploy/preview,
+# deploy/snapshot, docs/runbooks/whatsapp-baileys-sidecars.md and one CI image tag.
+# CLASS: PERMANENT
+# names: bind-mounted host paths and container service identity on live servers.
+clawdi-whatsapp
+clawdi-egress-guard
+io.clawdi.
+service: clawdi
+# The preview stack's snapshot directory and tarball name. /var/clawdi-snapshots is a host
+# directory an operator scp's into and a compose bind-mount reads from, and the tarball name is
+# what already sits in it -- the same migration-not-sweep class, at sites research did not
+# enumerate. Covers /var/clawdi-snapshots, clawdi-snapshot-*.tar.gz and /tmp/clawdi-snapshot-*.
+clawdi-snapshot
+
+# ---------------------------------------------------------------------------
+# Markdown token carve-outs -- what survives the plan-03 documentation sweep.
+# ---------------------------------------------------------------------------
+# These entries replace the blanket `path:*.md` staging entry that plan 01 installed as a
+# fence while the prose still carried the old name. That glob covered whole FILES, so it
+# would have hidden a missed rename anywhere in 64 documents (T-03.1-13). Every entry below
+# is a TOKEN, so the scanner now reads markdown prose for real: an unexplained markdown hit
+# fails the build instead of being absorbed by a glob.
+#
+# Each entry names the carve-out class it belongs to. None of them is a new decision -- they
+# are the same classes as the sections above, at sites that only exist in documentation.
+
+# P-8 -- ADR-0005's filename as it is CITED from other documents. `path:docs/adr/0005-*`
+# above covers the file itself; docs/hetzner-terms-position.md:10 and
+# docs/infrastructure-layout.md:12,178 link to it and must keep resolving.
+# CLASS: PERMANENT
+0005-clawdi-owns-tenancy-billing-and-vault-the-provisioner-owns-compute
+
+# The vault URI scheme `clawdi://` stood here as a PERMANENT entry (03.1-04: "the URI scheme is a
+# persisted reference format") until upstream sync step 4. 06.1-11 found the fork's backend writes
+# every reference and only the fork's CLI and backend read them, with no outside party and no
+# production data, so under the iforge-only rule the scheme is `iforge://`. The entry is retired
+# so a `clawdi://` arriving in docs or web copy fails the scan instead of passing it.
+#
+# The one place the old scheme stays is the release history: CHANGELOG.md records what shipped,
+# under the scheme it shipped with, and the changelog is kept as the fork's bytes (D-11).
+# Scoped to that file so no other document can lean on it.
+# CLASS: PERMANENT
+re:^CHANGELOG\.md:\d+:.*clawdi://
+
+# X-1 -- the documented example dotenv filename that pairs with the state root. The X-1
+# regex above requires a non-alphanumeric before the dot, so `.env.clawdi` needs its own
+# entry. 03.1-04-PLAN.md leaves it alone for the same reason as `~/.clawdi`.
+# THE PRINTED FORM MOVED, AND THE FRONT PAGE HAS NOW CAUGHT UP; a design document has not.
+# Plan 03.3-11's scripted sweep rewrote all six PRINTED occurrences of this example filename
+# (REPLACE:example-filename) and removed the matching carve-out from
+# packages/cli/tests/cli-help-brand-contract.test.ts in the same change, so the CLI's own help
+# prints .env.iforge. Plan 03.3-19 then moved README.md:118,119,120,122,123,128 to match, and
+# verified the two forms agree byte-for-byte against `--help` output.
+# What is left is the SECOND INSTANCE OF THE SAME TRAP the X-6 scope above is the named case of,
+# and it is why this scope is not retired even though its sole-fence count is 0. Both surviving
+# hits are `.env.clawdi.channels` in docs/designs/channel-runtime-manifest.md -- :118 as the
+# `outputs.dotenv` value in a worked manifest, :409 as `--env-file .env.clawdi.channels` in an
+# Open Question. Neither is a wire key, and the only other entry covering them is the C-4
+# PERMANENT `(?<!@)clawdi\.[a-z][A-Za-z0-9-]*` regex, which reads them as one because a dotted
+# lowercase token is a dotted lowercase token. Retiring here measures clean and files two stale
+# examples under a declaration that says they are protocol identifiers.
+# No plan in this gap-closure set declares docs/designs/channel-runtime-manifest.md, so the two
+# lines were never going to move in wave 4 either. Whoever rewrites them to .env.iforge.channels
+# retires this scope in the same change (D-10).
+# Measured 2026-09-11: covers 2 hits, sole fence for 0, both docs/designs/channel-runtime-manifest.md.
+# The id below was corrected from #111 to #112 by plan 03.3-24: #112 is the entry that carries
+# the example-dotenv-filename defect, #111 carries the README destinations. See the X-1 scope
+# above for why every id 03.3-14 wrote into this file was one low.
+# CLASS: DEFERRED -> WINDOWS #112
+.env.clawdi
+
+# X-4 -- the runtime OS user's home, in unit files and in prose. CLAWDI_RUNTIME_USER above
+# covers the variable NAME; these cover the path and the value.
+# RE-DECLARED by plan 03.3-14 into a permanent carve-out, with the same P33-21 reasoning as the
+# CLAWDI_RUNTIME_USER entry above: the runtime OS user does not move, so neither does its home.
+# Measured 2026-09-10: covers 7 hits, sole fence for 7 -- five in docs/managed-runtime.md
+# describing the hosted unit contract, and two CHANGELOG lines that are immutable historical
+# fact and could not be rewritten even if the identity did move.
+# CLASS: PERMANENT
+/home/clawdi
+HOME/clawdi
+CLAWDI_RUNTIME_USER=clawdi
+
+# A-P1 / X-1 -- host filesystem roots the managed runtime owns, and the systemd drop-in
+# filename it writes. Same migration-not-sweep class as X-2 and X-3: renaming them orphans
+# state on live hosts.
+# RE-DECLARED by plan 03.3-14 into a permanent carve-out. P33-21 names /etc/clawdi,
+# /var/lib/clawdi and /run/clawdi explicitly as a stated carve-out with its reason, and
+# /var/cache/clawdi is the fourth root of the same systemd-owned bootstrap boundary.
+# scripts/check_rebrand_coexistence.py records the identical decision as _HOSTED_ROOT_REASON
+# against the constants that construct these paths, so the ledger and this file agree.
+# Two entries under this heading are NOT hosted roots and are kept for their own reasons:
+# 10-clawdi-hosted.conf is the pre-rename drop-in filename that plan 03.3-05 gave a DUAL-READ
+# reader -- the writer emits only the current spelling, and this is the name the reader must
+# still recognise on an already-installed host -- and ~/clawdi-ui-screenshots is a local
+# screenshot directory named once in docs/v2-ui-ux-final-sweep.md, which no install depends on.
+# Measured 2026-09-10: covers 63 hits, sole fence for 59.
+# CLASS: PERMANENT
+/etc/clawdi
+/var/lib/clawdi
+/var/cache/clawdi
+/run/clawdi
+/usr/local/share/clawdi
+local/share/clawdi
+maintained/clawdi
+~/clawdi-ui-screenshots
+10-clawdi-hosted.conf
+
+# C-3 -- the sibling private control-plane repository, cited by path and by URL.
+# CLASS: PERMANENT
+clawdi-hosted
+
+# C-4 (widened) -- namespaced wire keys and media types of the shape `clawdi.<lowercase>`:
+# clawdi.hosted-runtime.manifest.v1, application/vnd.clawdi.runtime-bundle.v2+json,
+# clawdi.managedWhatsAppSocket, clawdi.runtime.yaml and bin/clawdi.mjs. The C-4 entry above
+# only matches the `.vN`-suffixed shape.
+# CLASS: PERMANENT
+#
+# NARROWED by plan 03.1-13 with a `(?<!@)` lookbehind, and RE-DECLARED from
+# `DEFERRED -> 03.1-13` to PERMANENT in the same change. Plan 11 declared it DEFERRED only
+# because it was fencing a defect: phase 03.1 verification measured it incidentally covering
+# `support@clawdi.ai` -- RENDERED contact text, not a wire key. A hostname has the same
+# shape as a namespaced wire key, which is the whole of the confusion.
+#
+# The lookbehind is the axis that separates them. Every shape this entry exists for is
+# preceded by a path separator, a dot, a quote or a space -- `type.googleapis.com/clawdi.v2`,
+# `application/vnd.clawdi.runtime-bundle.v2+json`, `additionalData["clawdi.managedWhatsAppSocket"]`,
+# `bin/clawdi.mjs`, `-f clawdi.runtime.yaml`. An email address is preceded by an at-sign and
+# nothing else here is. Proven in BOTH directions by test_the_narrowed_wire_key_regex_* in
+# backend/tests/test_rebrand_guards.py; the guard alone cannot prove the negative direction,
+# because the addresses it must stop covering are still in the tree under another fence.
+#
+# What this entry no longer covers, and what holds those lines instead:
+#   `support@clawdi.ai` (8 sites) -> the X-6 `clawdi.ai` entry above, DEFERRED. Plan 13 did
+#     NOT rename the address: the user ruled that the eventual support contact belongs to a
+#     company identity that does not exist yet, so there is no correct string to write today.
+#   `dev@clawdi.local` -> nothing, because plan 13 RENAMED it to `dev@iforge.local` at all
+#     five coupled sites. A local dev fixture domain resolves to nothing external, so the
+#     rename was safe and removes the need to fence it at all.
+re:(?<!@)clawdi\.[a-z][A-Za-z0-9-]*
+
+# Hosted runtime manifest field names -- persisted JSON keys in the private manifest.
+# CLASS: PERMANENT
+clawdiCli
+
+# Wire -- the aggregate backend MCP route and the terminal WebSocket subprotocol.
+# CLASS: PERMANENT
+/v1/mcp/clawdi
+clawdi-terminal
+
+# D-07 / X-5 -- the registered MCP server name as agents and tooling print it.
+#
+# SPLIT by plan 03.3-14, because this scope provably mixed two classes and a single declaration
+# had to make one claim about both. That is the ambiguity the classification rule exists to
+# remove, and it was sitting inside the largest deferral in the file.
+#
+# THIS half is PERMANENT and always was. D-07 is a locked user decision, taken after
+# 03.1-RESEARCH.md listed the MCP server name among the published-identity renames, and it
+# supersedes that research: the name is written into third-party agent config files on user
+# machines, so this product cannot rename it without orphaning entries in files it does not own.
+# Plan 03.3-10 moved the REGISTRATION KEY the CLI writes and left the server's advertised name
+# alone, which is the same decision expressed in code.
+# `list clawdi` covers zero hits today and is deliberately NOT retired: nothing plan 03.3-14
+# changed made it dead, and retiring a fence is a decision about the surface it watches -- the
+# precedent this file already set for `npm i -g clawdi` and `bun add -g clawdi`.
+# The `filter=clawdi` entry that used to sit here was RETIRED by plan 08: it fenced a turbo
+# selector that stopped matching anything when plan 04 renamed the CLI package to @iforge/cli,
+# so the fence was hiding a broken build rather than a carve-out (WINDOWS #21).
+# `name: clawdi-onboarding` was RETIRED by plan 03.3-14 in the same change that made it dead:
+# apps/web/public/skill.md:2 now declares `name: iforge-onboarding`, so the entry covered
+# nothing. Same order as every other retirement here -- the fix and the retraction in one commit.
+# Measured 2026-09-10: these four entries cover 5 hits, sole fence for 5.
+# CLASS: PERMANENT
+clawdi MCP server
+add-json clawdi
+list clawdi
+clawdi-mcp
+
+# D-07 / X-5 (the other half of the split) -- the bare backticked identifier, wherever a
+# document names the CLI, the npm package, the repository or the bundled skill in code voice
+# rather than as prose. Deliberately exact: `clawdi daemon` and every other invocation was
+# swept by plan 03.3-11, because only the bare identifier matches this entry.
+#
+# NOT PERMANENT, and that is why the split was necessary. THE SECOND GROUP HAS NOW BEEN SWEPT --
+# the condition this scope's own retirement plan named -- and the scope still does not retire,
+# because the retirement plan was to replace it with narrower entries rather than to remove a
+# fence. Re-measured by plan 03.3-24 against the tree waves 1-3 left: 16 hits covered, 13 fenced
+# by nothing else, down from 21 and 18. The five that left are the bundled-skill group:
+# README.md:61 (plan 03.3-19) and docs/architecture.md:221, docs/cli-development.md:428,
+# docs/managed-runtime.md:675 (plan 03.3-20), each now naming `iforge`, the value
+# adapters/registry.ts:99 resolves. CHANGELOG.md:731 stays by the rule immediately below.
+# The 13 that remain are still three classes, and only the first two are carve-outs:
+#   CHANGELOG.md:381, :552, :705, :731 -- immutable historical fact. Those releases were
+#     published under that name and cannot be renamed retroactively (the Release protocol
+#     heading below states the same rule for tags and package specs).
+#   apps/web/src/lib/cli-copy-contract.test.ts:200, docs/architecture.md:294,
+#     docs/managed-runtime.md:139 and :742 -- the deliberate mention of the OTHER product beside
+#     this fork, the private MCP aggregate surface, and the root-only bootstrap path. These
+#     belong to the permanent half above and sit here only because the identifier is bare.
+#   docs/iforge-daemon-test-guide.md:13 (`the `clawdi` DB` on localhost:5433) is the X-3 local
+#     dev database identity seen through this entry -- accurate today, and it moves with
+#     WINDOWS #94 rather than with this scope.
+#   docs/plans/managed-runtime-cli.md:18 ("Keep `clawdi` as the single user-facing command") and
+#     docs/designs/native-channels-product-model.md:557, :558, :563 ("`clawdi` repo", "`clawdi`
+#     native channel APIs") are the residue. The single user-facing command is `iforge`, and the
+#     repo those rows name is THIS one, whose own opening sentence calls the product iforge. No
+#     plan in this gap-closure set declares either file.
+# Splitting this entry into the narrower ones its retirement plan describes was considered and
+# deliberately not done here: with a defect group still live, a split would trade one deferral
+# for two and fix nothing. It retires when the last group above is swept.
+# Measured 2026-09-11: covers 16 hits, sole fence for 13.
+# The id below was corrected from #111 to #112 by plan 03.3-24 -- #112 is the entry that carries
+# the bundled-skill prose, #111 carries the README destinations. See the X-1 scope above.
+# CLASS: DEFERRED -> WINDOWS #112
+`clawdi`
+
+# C-7 (widened) -- persisted identifiers that carry the old name as a VALUE rather than as
+# a variable name: the JWT audience, the managed provider id, the egress placeholder token,
+# the reserved provider credential-profile namespace and the managed_by discriminator. Also
+# upstream #973's reserved placeholder env NAME the runtime writes into an agent's own config
+# (manifest `runtimeEnvName`); it is not user-set, so no `IFORGE_*` alias names it (06.1-04,
+# user directive 2026-09-30).
+# CLASS: PERMANENT
+CLAWDI_AI_API_KEY
+clawdi-cloud-api
+clawdi-managed-v2
+clawdi-egress-placeholder
+clawdi-<provider-hash>
+clawdi:<provider-hash>
+`clawdi:default`
+managed_by === "clawdi"
+
+# A-P1 -- the Kamal container-name filter in docs/runbooks/kamal-service-logs.md, and the
+# host journald drop-in the same runbook tells an operator to create.
+# RE-DECLARED by plan 03.3-14 into a permanent carve-out. Both entries name things that exist on
+# a PROVISIONED HOST rather than in this repository: the container-name filter matches the Kamal
+# containers the deploy stack actually runs (whose service identity is itself a permanent
+# carve-out under the Kamal heading above), and 60-clawdi-kamal.conf is a journald drop-in the
+# runbook tells an operator to create under that name on the host. Renaming either desynchronises
+# a runbook from a live machine while renaming nothing a user can see. P33-21 class.
+# Measured 2026-09-10: covers 3 hits, sole fence for 3.
+# CLASS: PERMANENT
+re:\^clawdi-
+clawdi-kamal
+
+# Release protocol -- the calendar and semver GitHub release tag shapes and the published
+# package specs. The CHANGELOG entries naming them are immutable historical facts: those
+# releases WERE published under those exact tags and specs and cannot be renamed
+# retroactively. Plans 04 and 05 move the forward-looking sites; the historical ones stay.
+# CLASS: PERMANENT
+clawdi-YYYY-MM-DD
+clawdi-v...
+clawdi-cli-
+clawdi@
+npm:clawdi
+`clawdi-`
+
+# X-2 (widened) -- the systemd unit-name GLOB as documentation writes the naming rule,
+# `clawdi-*`. The X-2 section above enumerates the eight concrete unit names; the
+# managed-runtime docs additionally state the naming rule itself, which names no single
+# unit. Re-measured 2026-09-11: the same 9 sites, at the line numbers plan 03.3-20's inserted
+# carve-out paragraph left them -- docs/managed-runtime.md:168, 202, 208, 266, 321, 414, 1243,
+# docs/plans/managed-runtime-cli.md:113 and docs/plans/runtime-projection-boundary.md:152.
+#
+# RE-DECLARED PERMANENT by plan 03.3-24, and it moves for the same reason as the concrete unit
+# names in the X-2 scope above: P33-21 was amended on 2026-09-10 and REQUIREMENTS.md MIGR-01 now
+# carves out `clawdi-runtime-watch`, `clawdi-daemon` and `clawdi-runtime-sidecar` by name as
+# hosted identities only an operator procedure moves. The prefix those units carry is therefore
+# permanent, and so is documentation stating it. Retiring this fence would fail nine lines for
+# accurately describing what is deployed -- and it would do so PERMANENTLY now, not until some
+# later sweep, which is what the declaration change records.
+# WHAT THIS FENCE HOLDS, stated so the permanent declaration is not silent. Seven of the nine are
+# unambiguous: :168 is the diagram node for the system unit root, :208, :266, :321 and :1243 state
+# the COMPATIBILITY-unit rule -- an auxiliary unit with no official service installer takes a
+# `clawdi-*` name, which is exactly right and has nothing to do with the three hosted units --
+# and :414 and docs/plans/runtime-projection-boundary.md:152 say support and compatibility units
+# keep the prefix. docs/plans/managed-runtime-cli.md:113 reads the same way and is qualified by
+# its own paragraph, which opens "Hosted daemon startup uses systemd directly" -- hosted is the
+# scope in which the sentence is true. The ONE remaining site, docs/managed-runtime.md:202
+# ("iforge support processes use `clawdi-*` service names"), states the rule UNQUALIFIED, and
+# since plan 03.3-05 moved five of the eight units that is now three-eighths of the picture.
+# Plan 03.3-20 measured that and could not rewrite it -- the phase's gates pin the
+# occurrence count at 9 -- so it added the paragraph at docs/managed-runtime.md:210-219 instead,
+# which names the three units, cites P33-21 and closes with "User-scope units and the system-scope
+# names that did move carry the `iforge-` prefix instead; the two spellings coexisting is the
+# carve-out, not a gap." The main document therefore answers its own unqualified sentence two
+# paragraphs later, and :202 is left imprecise rather than wrong. Naming it here is the record,
+# since a permanent declaration may hold an imperfect line but never a hidden one.
+# WINDOWS #102 stays open for the operator obligation it describes, not as this scope's owner.
+# Measured 2026-09-11: covers 9 hits, sole fence for 9.
+# CLASS: PERMANENT
+#
+# NARROWED by plan 03.1-13, in the same change as the fix it had been hiding. The entry
+# was the bare substring `clawdi-*`, which is the same eight characters whether they spell
+# a unit-name glob or a tarball glob -- so it also covered six docs/cli-development.md
+# lines that told a developer to `tar -tzf clawdi-*.tgz`, `bun install -g ./clawdi-*.tgz`
+# and `rm clawdi-*.tgz`. Measured with the packer rather than argued: `bun pm pack
+# --dry-run` and `npm pack --dry-run` both emit `iforge-cli-0.13.47.tgz`, so the fence was
+# holding wrong instructions in place. Plan 13 rewrote those lines to the measured name
+# and narrowed this entry in the same commit (D-10).
+#
+# The regex is anchored to the unit-name shape: `clawdi-*` optionally followed by
+# `.service`, and NOT followed by a further extension or word character. It therefore
+# still covers `systemd/system/clawdi-*.service` and every backticked `clawdi-*` naming
+# rule, and no longer covers `clawdi-*.tgz` or any other `clawdi-*.<ext>` artifact. Proven
+# in both directions by test_the_narrowed_unit_name_glob_* in
+# backend/tests/test_rebrand_guards.py rather than by reading it.
+re:clawdi-\*(?:\.service)?(?![\w.-])
+
+# Workspace package scope -- `@clawdi/shared` and `@clawdi/whatsapp-baileys-sidecar`, the
+# two internal workspace packages, imported across apps/web/src and named in the CI turbo
+# filters. 03.1-04-PLAN.md keeps them: they are internal module identifiers on D-01's
+# upstream-aligned side, never published under this name and never read by a user.
+# CLASS: PERMANENT
+#
+# RE-DECLARED by plan 03.1-13. Plan 11 declared the whole `Published package identity`
+# scope above at the conservative end (DEFERRED) because it MIXED a genuine permanent
+# carve-out with two entries that were fencing defects. With those two retracted, the
+# mixing is gone, and this entry is split out so its class is stated for what it is rather
+# than inherited from the entries it used to sit beside. Measured at the split: 56 hits, 55
+# of them covered by nothing else.
+@clawdi/
+
+# ---------------------------------------------------------------------------
+# W-1 .. W-10 -- the web app surface, plan 07.
+# ---------------------------------------------------------------------------
+# apps/web/src and apps/web/public are INSIDE this scanner's pathspec, so unlike
+# packages/cli/src (which the pathspec excludes entirely under C-13/D-01) every surviving
+# `clawdi` there needs an explicit entry. Plan 07 retired the three blanket staging entries
+# that used to fence this directory -- `path:apps/web/src/*`, `path:apps/web/public/*` and
+# `re:VITE_CLAWDI_[A-Z0-9_]+` -- and classified all 419 hits they were hiding: 218 were UI
+# copy, CLI invocations and env keys and were RENAMED; the 216 below are carve-outs. Every
+# entry is a TOKEN, never a path glob, so the scanner still reads this directory for real.
+# None of these is a new decision -- each names one of the classes already established above.
+
+# W-1 (C-7 class) -- the agent-source discriminator. It is a VALUE, not a name: it travels in
+# `?source=on-clawdi` search params users bookmark and share, and it is the `tile.source`
+# literal the router, the breadcrumb and the agent cards all branch on. 90 sites.
+# CLASS: PERMANENT
+on-clawdi
+
+# W-2 (C-13 / D-01 class) -- internal source symbols that happen to sit inside the scanned
+# directory. `canDeployOnClawdi` alone is 42 sites across 6 files plus its assertions.
+# CLASS: PERMANENT
+OnClawdi
+onClawdi
+clawdiBots
+clawdiIndex
+isClawdiManagedProviderId
+bySource.clawdi
+
+# ---------------------------------------------------------------------------
+# Upstream sync step 3 (06.1-08) -- three non-copy names that arrive with ffffaa02 (#1334).
+# ---------------------------------------------------------------------------
+# C-13 / D-01 class -- the desktop shell bridge symbols. Upstream #1289's preload exposes
+# `window.clawdiDesktop`, typed by `ClawdiDesktopShellBridge` in packages/shared/src/desktop.ts;
+# apps/web/src/lib/desktop.ts and pages/auth/sign-in.tsx read it. Source symbols on both sides
+# of a preload bridge, never printed. 06.1-14 rebrands the desktop app's identity (D-23,
+# ledger (g)) and leaves internal symbols alone, as it does `@clawdi/desktop`.
+# CLASS: PERMANENT
+clawdiDesktop
+ClawdiDesktopShellBridge
+
+# C-4 class -- the account-suspended RFC 9457 problem type. The backend emits it
+# (backend/app/schemas/problem.py `ACCOUNT_SUSPENDED_PROBLEM_TYPE`) and
+# apps/web/src/lib/account-suspension.ts matches it byte for byte: a wire identifier.
+# CLASS: PERMANENT
+urn:clawdi:problem:account-suspended
+
+# C-7 class -- the legacy OpenClaw provider-metadata plugin id. `clawdi-managed-provider` is
+# the plugin id the managed provider plugin was installed under
+# (packages/cli/src/runtime/openclaw-legacy-provider-plugin.ts
+# `LEGACY_CLAWDI_MANAGED_PROVIDER_PLUGIN_ID`); convergence finds and removes the installed plugin
+# by that id, so the docs that describe the removal name the persisted value.
+# CLASS: PERMANENT
+clawdi-managed-provider
+
+# W-3 -- the sidebar rail's CSS custom property. Declared in app-sidebar.tsx and
+# dashboard/layout.tsx and read by seven Tailwind arbitrary values; it is an internal token
+# name with no user-visible surface.
+# CLASS: PERMANENT
+--clawdi-rail-width
+
+# W-4 (X-1 class) -- keys of records already written into users' browsers. Renaming them
+# silently resets a saved theme, logs an operator out of the admin console, and orphans
+# in-flight wallet idempotency records. Same migration-not-sweep reasoning as `~/.clawdi`.
+# CLASS: PERMANENT
+clawdi-theme
+clawdi-admin-key
+clawdi:idempotency-attempts
+
+# W-5 -- third-party Telegram accounts. These are real handles registered with Telegram, not
+# strings this repository owns; renaming them points users at accounts that do not exist.
+# CLASS: PERMANENT
+ClawdiBot
+clawdiofficial
+
+# W-6 (C-7 class) -- persisted AI-provider identifiers and the constants that name them.
+# `clawdi-codex-oauth` is a BroadcastChannel name shared with an OAuth callback tab, and
+# CLAWDI_MANAGED_V1_PROVIDER_ID is re-exported from @clawdi/shared, which never moves.
+# CLASS: PERMANENT
+CLAWDI_CODEX_OAUTH_PROVIDER_ID
+CLAWDI_MANAGED_V1_PROVIDER_ID
+clawdi-codex-oauth
+
+# W-7 (D-01 class) -- fixture values inside `*.test.ts`, the upstream-aligned side.
+# CLASS: PERMANENT
+clawdi-v2-deployment-10
+clawdi-oss-hosted-boundary
+# Upstream sync step 4 (06.1-11): the per-agent managed id fixture in
+# apps/web/src/hosted/v2/ai-providers/provider-conflicts.test.ts (#1437 provider conflicts).
+clawdi-v2-deployment-42
+
+# W-8 (C-7 class) -- the bare word `clawdi` used as an enum VALUE: the icon-source attribute
+# rendered into the DOM, the managed-bot kind, the managed AI provider id, and the bundled
+# skill's repo path. Each entry is quoted with its key so the bare word alone never matches.
+# CLASS: PERMANENT
+iconSource: "clawdi"
+data-icon-source="clawdi"
+ironhermes: "clawdi"
+{ clawdi: []
+kind="clawdi"
+kind: "clawdi"
+# NOTE the leading `, ` -- an entry starting with `path:` would be parsed as a PATH GLOB by
+# this file's own grammar, not as the substring it looks like.
+, path: "clawdi"
+provider_ids: ["clawdi"]
+provider_id: "clawdi"
+"custom-managed-id", "clawdi"
+# Upstream sync step 4 (06.1-11): the managed provider id in provider-conflicts.test.ts.
+boundProvider("clawdi", "managed")
+toBe("clawdi");
+# Upstream sync step 4 (06.1-11): docs/ai-providers.md quotes the manifest's managed_by VALUE.
+`managed_by: clawdi`
+
+# W-9 -- a code comment illustrating the app-prefixed vault key shape.
+# CLASS: PERMANENT
+clawdi-backend/DATABASE_URL
+
+# W-10 (D-01 class) -- the internal codename inside code comments, and one mocked server
+# message in a test fixture. The real string lives in the private control-plane repository.
+# CLASS: PERMANENT
+bundled clawdi Skill
+matches clawdi ConnectorToolsList
+review case for clawdi
+
+# ---------------------------------------------------------------------------
+# D-23 (06.1-14) -- the desktop app's kept internal names, now that apps/desktop is scanned.
+# ---------------------------------------------------------------------------
+# 06.1-14 rebranded everything a desktop user sees or sets: appId, product name, publisher,
+# hosts, the installed `iforge` command, dialogs, tray, the connect wizard, the Windows
+# installer, the README and the six IFORGE_* release names (ledger (g)). What stays is internal
+# and upstream-aligned under 03.1 D-01 / C-13, one class per block, each a ledger (d) bullet.
+#
+# electron-builder extraMetadata keys. release-contract.ts writes them into the packaged
+# package.json and main.ts reads them back through readPackageMetadataField; no user sees them.
+# `clawdiUpdateChannel` stays "disabled" by default (T-06.1-36).
+# CLASS: PERMANENT
+clawdiUpdateChannel
+clawdiWindowsPublisher
+
+# Connect-wizard preload bridge symbols, the same class as `clawdiDesktop` above:
+# `ClawdiDesktopConnectBridge` is typed in packages/shared/src/desktop.ts, connect-preload.ts
+# exposes `window.clawdiConnect`, connect-renderer.tsx reads it. Never printed.
+# CLASS: PERMANENT
+ClawdiDesktopConnectBridge
+clawdiConnect
+
+# IPC channel names between the main process and its own preloads (src/ipc.ts), matched
+# line-exact so the fence reaches nothing outside that one table.
+# CLASS: PERMANENT
+re:^apps/desktop/src/ipc\.ts:\d+:\t[A-Za-z]+: "clawdi:[a-z-]+",$
+
+# The internal register upstream's release reader reads. A user sets only the IFORGE_* names;
+# apps/desktop/src/iforge-brand-env.ts copies them in, refuses a bare register spelling, and
+# package-release.ts rewrites the reader's errors to the public spelling. release-contract.ts
+# keeps these reads upstream-verbatim.
+# CLASS: PERMANENT
+re:^apps/desktop/src/release-contract\.ts:\d+:.*\bCLAWDI_(DESKTOP_(ARCH|VERSION|UPDATE_CHANNEL|UPDATE_FEED_URL)|WINDOWS_PUBLISHER)\b
+
+# The desktop boundary itself: a specification of the rename, not a carrier of it, for the
+# same reason config/rebrand-env-contract.txt is fenced above. Every pair names both spellings.
+# CLASS: PERMANENT
+path:apps/desktop/src/iforge-brand-env.ts
+
+# Internal dev, runtime, build and test plumbing, absent from all seven D-05a membership
+# sources and never set by a user:
+#   CLAWDI_DESKTOP_CLI                  -- unpackaged dev override for the CLI path (native-cli.ts)
+#   CLAWDI_DESKTOP_RUNTIME              -- AppImage runtime root handed to the CLI, read by
+#                                          packages/cli/src/serve/installer.ts under its own name
+#   CLAWDI_DESKTOP_SMOKE_LOG_FILE,
+#   CLAWDI_DESKTOP_SMOKE_SURFACE,
+#   CLAWDI_DESKTOP_SMOKE_LOCAL_APP_DATA -- the packaged smoke harness and its fake CLI
+#   CLAWDI_NATIVE_TARGET                -- target handed to packages/cli/scripts/build-native.mjs
+#   CLAWDI_VERIFY_FILE,
+#   CLAWDI_VERIFY_PUBLISHER             -- package-release.ts's own PowerShell child
+#   clawdiHome                          -- the smoke harness's local holding CLAWDI_HOME (X-1)
+#   ClawdiEnvironmentBroadcast          -- the Add-Type class inside windows-cli-path.ps1
+# CLASS: PERMANENT
+CLAWDI_DESKTOP_CLI
+CLAWDI_DESKTOP_RUNTIME
+CLAWDI_DESKTOP_SMOKE_LOG_FILE
+CLAWDI_DESKTOP_SMOKE_SURFACE
+CLAWDI_DESKTOP_SMOKE_LOCAL_APP_DATA
+CLAWDI_NATIVE_TARGET
+CLAWDI_VERIFY_FILE
+CLAWDI_VERIFY_PUBLISHER
+clawdiHome
+ClawdiEnvironmentBroadcast
+
+# Upstream desktop test fixtures (D-01 class, as W-7 is for apps/web). The copy and the
+# identity those tests assert live in apps/desktop/src and scripts, which are scanned.
+# CLASS: PERMANENT
+path:apps/desktop/src/*.test.ts
+
+# ===========================================================================
+# RETIREMENT RECORD -- closed by plan 08. This section holds no entries and
+# must never hold one again; see the note at the head of this file.
+# ===========================================================================
+#
+# The staging section that used to sit here fenced surfaces while their owning plan was still
+# mid-rename. Every entry it carried was retired by the plan named against it, and each
+# retirement is a surface this scanner then proved clean:
+#
+#   Plan 04 -- the five `path:` entries fencing this fork's own GitHub self-references.
+#   RETIRED: packages/cli/package.json's repository/bugs/homepage, the install.sh release base
+#   and both llms.txt now name github.com/ironforge-ai/iforge, so only upstream citation is
+#   left under C-3.
+#
+#   Plan 06 -- the blanket `re:CLAWDI_[A-Z0-9_]+` entry over the environment surface.
+#   RETIRED: the 44 public names in config/rebrand-env-contract.txt are IFORGE_*, and the
+#   scanner passes without the fence.
+#
+#   Plan 07 -- the blanket `re:VITE_CLAWDI_[A-Z0-9_]+` entry over the Vite build-time keys.
+#   RETIRED: all four are VITE_IFORGE_* at every declaration, supplier and read site.
+#
+#   Plan 07 -- the `path:apps/web/src/*` and `path:apps/web/public/*` globs. RETIRED: both are
+#   gone and the 419 hits they hid were classified -- 218 renamed, 216 kept as the W-1..W-10
+#   TOKEN entries above -- so the scanner reads apps/web for real rather than skipping two
+#   whole directories.
+#
+#   Plan 08 -- the last of them, and the loader rule that stops another one surviving its
+#   phase. What remains above is permanent, cited carve-outs only.

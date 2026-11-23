@@ -1,0 +1,132 @@
+{
+  "description": "Shared WR-05 parity set for the billing-exemption reason (06.3-21). The backend schema AdminBillingExemptionUpdate is the authority: a reason is valid when it equals its strip(), Python str.isprintable() accepts it (no Unicode Other or Separator character except the ASCII space), and its length in code points is 1..191. The admin page's isValidExemptionReason must agree on every case. Cases avoid recently assigned code points so different Unicode database versions cannot disagree. A case carries either a literal reason or a repeat of text times N.",
+  "cases": [
+    {
+      "id": "plain_ascii",
+      "valid": true,
+      "reason": "design partner"
+    },
+    {
+      "id": "latin_accent",
+      "valid": true,
+      "reason": "caf\u00e9 partner"
+    },
+    {
+      "id": "japanese_phrase",
+      "valid": true,
+      "reason": "\u8a2d\u8a08\u30d1\u30fc\u30c8\u30ca\u30fc"
+    },
+    {
+      "id": "astral_emoji",
+      "valid": true,
+      "reason": "\ud83d\ude42 partner"
+    },
+    {
+      "id": "ascii_at_max_191",
+      "valid": true,
+      "repeat": {
+        "text": "x",
+        "times": 191
+      }
+    },
+    {
+      "id": "emoji_at_max_191_code_points",
+      "valid": true,
+      "repeat": {
+        "text": "\ud83d\ude42",
+        "times": 191
+      }
+    },
+    {
+      "id": "empty",
+      "valid": false,
+      "reason": ""
+    },
+    {
+      "id": "leading_space",
+      "valid": false,
+      "reason": " padded"
+    },
+    {
+      "id": "trailing_space",
+      "valid": false,
+      "reason": "padded "
+    },
+    {
+      "id": "newline_cc",
+      "valid": false,
+      "reason": "line\nbreak"
+    },
+    {
+      "id": "tab_cc",
+      "valid": false,
+      "reason": "tab\there"
+    },
+    {
+      "id": "del_cc",
+      "valid": false,
+      "reason": "\u007f"
+    },
+    {
+      "id": "nbsp_zs",
+      "valid": false,
+      "reason": "design\u00a0partner"
+    },
+    {
+      "id": "ideographic_space_zs",
+      "valid": false,
+      "reason": "ideographic\u3000space"
+    },
+    {
+      "id": "zwj_cf",
+      "valid": false,
+      "reason": "ok \u200d x"
+    },
+    {
+      "id": "soft_hyphen_cf",
+      "valid": false,
+      "reason": "soft\u00adhyphen"
+    },
+    {
+      "id": "bom_cf",
+      "valid": false,
+      "reason": "bom\ufeffhere"
+    },
+    {
+      "id": "nel_cc",
+      "valid": false,
+      "reason": "x\u0085y"
+    },
+    {
+      "id": "line_separator_zl",
+      "valid": false,
+      "reason": "a\u2028b"
+    },
+    {
+      "id": "paragraph_separator_zp",
+      "valid": false,
+      "reason": "a\u2029b"
+    },
+    {
+      "id": "private_use_co",
+      "valid": false,
+      "reason": "private\ue000use"
+    },
+    {
+      "id": "ascii_over_max_192",
+      "valid": false,
+      "repeat": {
+        "text": "x",
+        "times": 192
+      }
+    },
+    {
+      "id": "emoji_over_max_192_code_points",
+      "valid": false,
+      "repeat": {
+        "text": "\ud83d\ude42",
+        "times": 192
+      }
+    }
+  ]
+}

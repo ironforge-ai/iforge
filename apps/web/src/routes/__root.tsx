@@ -1,0 +1,86 @@
+/// <reference types="vite/client" />
+
+import { createRootRoute, HeadContent, Outlet, Scripts, useRouter } from "@tanstack/react-router";
+import type { ReactNode } from "react";
+import { AppNotFound } from "@/components/app-not-found";
+import { AuthProvider } from "@/components/auth-provider";
+import { Providers } from "@/components/providers";
+import RootError from "@/components/root-error";
+import { APP_TITLE } from "@/lib/document-title";
+import { env } from "@/lib/env";
+import "@/styles/globals.css";
+
+const DESCRIPTION =
+	"Cloud control plane for AI agents - manage sessions, skills, memories, and secrets across the machines you connect.";
+
+export const Route = createRootRoute({
+	head: () => ({
+		meta: [
+			{ charSet: "utf-8" },
+			{ name: "viewport", content: "width=device-width, initial-scale=1" },
+			{ title: APP_TITLE },
+			{ name: "description", content: DESCRIPTION },
+			{ name: "robots", content: "noindex,nofollow" },
+			{ property: "og:type", content: "website" },
+			{ property: "og:site_name", content: APP_TITLE },
+			{ property: "og:title", content: APP_TITLE },
+			{ property: "og:description", content: DESCRIPTION },
+			{ name: "twitter:card", content: "summary" },
+			{ name: "twitter:title", content: APP_TITLE },
+			{ name: "twitter:description", content: DESCRIPTION },
+		],
+		links: [
+			{ rel: "manifest", href: "/site.webmanifest" },
+			{ rel: "icon", href: "/iforge.svg", type: "image/svg+xml" },
+			{ rel: "icon", href: "/favicon.ico" },
+			{ rel: "apple-touch-icon", href: "/apple-touch-icon.png" },
+		],
+	}),
+	errorComponent: ({ error, reset }) => (
+		<RootDocument>
+			<RootError error={error} reset={reset} />
+		</RootDocument>
+	),
+	notFoundComponent: AppNotFound,
+	component: RootComponent,
+});
+
+function RootComponent() {
+	return (
+		<RootDocument>
+			<AuthProvider>
+				<Providers>
+					<Outlet />
+				</Providers>
+			</AuthProvider>
+		</RootDocument>
+	);
+}
+
+function RootDocument({ children }: Readonly<{ children: ReactNode }>) {
+	const nonce = useRouter().options.ssr?.nonce;
+	return (
+		<html
+			lang="en"
+			className="h-full"
+			data-iforge-desktop={env.VITE_IFORGE_DESKTOP_BUILD ? "true" : undefined}
+			suppressHydrationWarning
+		>
+			<head>
+				{nonce ? <meta name="csp-nonce" content={nonce} /> : null}
+				<script
+					nonce={nonce}
+					dangerouslySetInnerHTML={{
+						__html:
+							'if(window.clawdiDesktop){document.documentElement.dataset.clawdiDesktop="true"}try{var t=localStorage.getItem("clawdi-theme")||"system";var d=t==="dark"||(t==="system"&&matchMedia("(prefers-color-scheme: dark)").matches);document.documentElement.classList.toggle("dark",d)}catch(e){}',
+					}}
+				/>
+				<HeadContent />
+			</head>
+			<body className="flex min-h-full flex-col antialiased">
+				{children}
+				<Scripts />
+			</body>
+		</html>
+	);
+}

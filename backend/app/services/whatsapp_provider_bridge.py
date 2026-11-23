@@ -1,0 +1,1196 @@
+from __future__ import annotations
+
+import asyncio
+import base64
+import hashlib
+import json
+import secrets
+import time
+from collections.abc import Awaitable, Callable, Mapping, Sequence
+from dataclasses import dataclass
+from typing import Literal, Protocol, TypeGuard
+from uuid import UUID
+
+from fastapi import HTTPException, status
+from pydantic import JsonValue, TypeAdapter, ValidationError
+from sqlalchemy import func, select
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+from app.models.channel import (
+    CHANNEL_PROVIDER_WHATSAPP,
+    CHANNEL_STATUS_ACTIVE,
+    CHANNEL_VISIBILITY_PRIVATE,
+    MESSAGE_DIRECTION_OUTBOUND,
+    PROVIDER_EVENT_SCOPE_ACCOUNT,
+    ChannelAccount,
+    ChannelBinding,
+    ChannelBindingAlias,
+    ChannelDelivery,
+    ChannelMessage,
+)
+from app.services import whatsapp_delivery_transport
+from app.services.channel_debug_events import record_channel_debug_event
+from app.services.channels import (
+    channel_control_command_event_was_handled,
+    enqueue_channel_outbound_message,
+    find_binding,
+    find_existing_inbound_provider_event,
+    lock_active_binding_authority,
+    lock_active_link_authority,
+    parse_channel_control_command,
+    record_inbound_messages_for_bindings,
+    require_channel_tenant_user_id,
+    resolve_inbound_binding,
+    send_control_command_reply,
+)
+from app.services.whatsapp_baileys import (
+    BinaryNode,
+    choose_whatsapp_route_jid,
+    decide_whatsapp_relay,
+    forward_iq_over,
+    parse_whatsapp_jid,
+    parse_whatsapp_usync_device_targets,
+    relay_outbound_extra_attrs,
+    remember_whatsapp_binding_aliases,
+    resolve_whatsapp_binding_by_jids,
+    strip_whatsapp_device,
+    validate_relay_outbound_additional_nodes,
+    whatsapp_text_from_message_proto,
+    whatsapp_text_message_proto,
+    whatsapp_usync_device_result,
+)
+from app.services.whatsapp_native_transport import (
+    WhatsAppProviderMessageEvent,
+)
+from app.services.whatsapp_runtime_types import WhatsAppOutboundMessage
+
+WHATSAPP_PROVIDER_PAYLOAD_SCHEMA = "clawdi.whatsappBaileysProviderMessage.v1"
+_PROVIDER_PAYLOAD_ADAPTER: TypeAdapter[dict[str, JsonValue]] = TypeAdapter(dict[str, JsonValue])
+
+
+@dataclass(frozen=True)
+class WhatsAppProviderRelayResult:
+    outcome: Literal["queued", "relayed", "unsupported", "failed"]
+    external_chat_id: str
+    provider_message_id: str
+    channel_message_id: UUID | None = None
+    delivery_id: UUID | None = None
+    reason: str | None = None
+
+
+@dataclass(frozen=True)
+class WhatsAppProviderNodeRelayResult:
+    outcome: Literal["relayed", "dropped", "unsupported", "failed"]
+    tag: str
+    external_chat_id: str | None = None
+    reason: str | None = None
+
+
+@dataclass(frozen=True)
+class WhatsAppProviderTransportStatus:
+    available: bool
+    reconnecting: bool
+    mode: Literal["sidecar", "none"]
+    reason: str | None
+    supports_outbound_messages: bool
+
+    def as_dict(self) -> dict[str, JsonValue]:
+        return {
+            "available": self.available,
+            "reconnecting": self.reconnecting,
+            "mode": self.mode,
+            "reason": self.reason,
+            "supportsOutboundMessages": self.supports_outbound_messages,
+        }
+
+
+class WhatsAppProviderTransport(Protocol):
+    async def relay_outbound_message(self, message: WhatsAppOutboundMessage) -> str | None: ...
+
+    async def relay_raw_node(self, node: BinaryNode) -> None: ...
+
+    async def query_iq(
+        self,
+        node: BinaryNode,
+        timeout_ms: int,
+    ) -> BinaryNode | None: ...
+
+
+_PROVIDER_TRANSPORTS: dict[UUID, WhatsAppProviderTransport] = {}
+_PROVIDER_TRANSPORT_UNAVAILABLE_SINCE: dict[UUID, float] = {}
+_PROVIDER_TRANSPORTS_STARTED_AT = time.monotonic()
+_PROVIDER_TRANSPORT_RECONNECT_GRACE_SECONDS = 5 * 60
+_WHATSAPP_HEALTH_PROBE_TIMEOUT_SECONDS = 0.5
+_WHATSAPP_HEALTH_REQUEST_TIMEOUT_SECONDS = 2.0
+_WHATSAPP_HEALTH_CONCURRENCY = 4
+
+
+def _transport_clock() -> float:
+    return time.monotonic()
+
+
+class WhatsAppProviderAccountRetired(Exception):
+    """The ingress owner is no longer active; reconciliation may reattach it."""
+
+
+def register_whatsapp_provider_transport(
+    account_id: UUID,
+    transport: WhatsAppProviderTransport,
+) -> None:
+    """Register the one physical upstream transport for an account."""
+
+    if account_id in _PROVIDER_TRANSPORTS:
+        raise RuntimeError(f"WhatsApp provider transport already registered for {account_id}")
+    _PROVIDER_TRANSPORTS[account_id] = transport
+    _PROVIDER_TRANSPORT_UNAVAILABLE_SINCE.pop(account_id, None)
+
+
+def unregister_whatsapp_provider_transport(account_id: UUID) -> None:
+    removed = _PROVIDER_TRANSPORTS.pop(account_id, None)
+    if removed is not None:
+        _PROVIDER_TRANSPORT_UNAVAILABLE_SINCE[account_id] = _transport_clock()
+
+
+def get_whatsapp_provider_transport(account_id: UUID) -> WhatsAppProviderTransport | None:
+    return _PROVIDER_TRANSPORTS.get(account_id)
+
+
+def whatsapp_provider_transport_status(
+    account_id: UUID, *, transport: WhatsAppProviderTransport | None = None
+) -> WhatsAppProviderTransportStatus:
+    now = _transport_clock()
+    transport = transport or get_whatsapp_provider_transport(account_id)
+    if transport is None:
+        unavailable_since = _PROVIDER_TRANSPORT_UNAVAILABLE_SINCE.get(
+            account_id, _PROVIDER_TRANSPORTS_STARTED_AT
+        )
+        return WhatsAppProviderTransportStatus(
+            available=False,
+            reconnecting=(now - unavailable_since < _PROVIDER_TRANSPORT_RECONNECT_GRACE_SECONDS),
+            mode="none",
+            reason="provider-transport-unavailable",
+            supports_outbound_messages=False,
+        )
+    return _connected_transport_status(account_id, connected=_transport_connected(transport))
+
+
+def _connected_transport_status(
+    account_id: UUID, *, connected: bool
+) -> WhatsAppProviderTransportStatus:
+    now = _transport_clock()
+    if connected:
+        _PROVIDER_TRANSPORT_UNAVAILABLE_SINCE.pop(account_id, None)
+        unavailable_since = now
+    else:
+        unavailable_since = _PROVIDER_TRANSPORT_UNAVAILABLE_SINCE.setdefault(account_id, now)
+    return WhatsAppProviderTransportStatus(
+        available=connected,
+        reconnecting=(
+            not connected and now - unavailable_since < _PROVIDER_TRANSPORT_RECONNECT_GRACE_SECONDS
+        ),
+        mode="sidecar",
+        reason=None if connected else "provider-transport-disconnected",
+        supports_outbound_messages=True,
+    )
+
+
+def _unavailable_transport_status(
+    account_id: UUID, *, mode: Literal["sidecar", "none"] = "none"
+) -> WhatsAppProviderTransportStatus:
+    now = _transport_clock()
+    unavailable_since = _PROVIDER_TRANSPORT_UNAVAILABLE_SINCE.setdefault(account_id, now)
+    return WhatsAppProviderTransportStatus(
+        available=False,
+        reconnecting=(now - unavailable_since < _PROVIDER_TRANSPORT_RECONNECT_GRACE_SECONDS),
+        mode=mode,
+        reason="provider-transport-unavailable",
+        supports_outbound_messages=mode == "sidecar",
+    )
+
+
+async def whatsapp_account_transport_status(
+    account: ChannelAccount,
+) -> WhatsAppProviderTransportStatus:
+    mode: Literal["sidecar", "none"] = "none"
+    try:
+        client = whatsapp_delivery_transport.resolve_whatsapp_sidecar_client(account)
+        if client is None:
+            config = account.config
+            # Only a legacy registration with no durable sidecar binding may
+            # use local health. A broken declared binding is never legacy.
+            if config is None or (
+                _is_object_dict(config)
+                and not {
+                    "connection_mode",
+                    "sidecar_account_id",
+                    "sidecar_config_revision",
+                }.intersection(config)
+            ):
+                return whatsapp_provider_transport_status(account.id)
+            return _unavailable_transport_status(account.id)
+        mode = "sidecar"
+        async with asyncio.timeout(_WHATSAPP_HEALTH_PROBE_TIMEOUT_SECONDS):
+            health = await client.health()
+    except Exception:  # A bad account or provider response must not fail the health list.
+        return _unavailable_transport_status(account.id, mode=mode)
+    return _connected_transport_status(account.id, connected=health.connected)
+
+
+async def whatsapp_account_transport_statuses(
+    accounts: Sequence[ChannelAccount],
+) -> dict[UUID, WhatsAppProviderTransportStatus]:
+    """Probe a detached read snapshot with fixed workers and one shared deadline."""
+    from app.services.whatsapp_sidecar_registry import get_active_whatsapp_sidecar_clients
+
+    whatsapp_accounts = [a for a in accounts if a.provider == CHANNEL_PROVIDER_WHATSAPP]
+    results = {
+        a.id: WhatsAppProviderTransportStatus(
+            available=False,
+            reconnecting=False,
+            mode="none",
+            reason="provider-transport-not-probed",
+            supports_outbound_messages=False,
+        )
+        for a in whatsapp_accounts
+    }
+    pool = get_active_whatsapp_sidecar_clients()
+    sessions: dict[UUID, list[ChannelAccount]] = {}
+    for account in whatsapp_accounts:
+        # Populate only revision-validated clients before reading the pool's
+        # round-robin order. Invalid/legacy bindings perform no provider I/O.
+        try:
+            client = whatsapp_delivery_transport.resolve_whatsapp_sidecar_client(account)
+        except Exception:
+            results[account.id] = _unavailable_transport_status(account.id)
+            continue
+        session_id = whatsapp_delivery_transport.whatsapp_sidecar_session_id(account)
+        if client is None or session_id is None or pool is None:
+            results[account.id] = await whatsapp_account_transport_status(account)
+        else:
+            sessions.setdefault(session_id, []).append(account)
+    order = pool.health_probe_order(set(sessions)) if pool is not None else []
+    pending = iter(order)
+
+    async def probe_accounts() -> None:
+        for session_id in pending:
+            if pool is not None:
+                pool.mark_health_probe_started(session_id)
+            for account in sessions[session_id]:
+                results[account.id] = await whatsapp_account_transport_status(account)
+
+    try:
+        async with asyncio.timeout(_WHATSAPP_HEALTH_REQUEST_TIMEOUT_SECONDS):
+            async with asyncio.TaskGroup() as group:
+                for _ in range(min(_WHATSAPP_HEALTH_CONCURRENCY, len(order))):
+                    group.create_task(probe_accounts())
+    except TimeoutError:
+        # Unstarted/cancelled probes retain not-probed, without changing failure clocks.
+        pass
+    return results
+
+
+class WhatsAppProviderBridge:
+    """Authorize synthetic Noise traffic and hand it to the physical transport."""
+
+    def __init__(
+        self,
+        sessionmaker: async_sessionmaker[AsyncSession],
+        *,
+        account_id: UUID,
+        transport: WhatsAppProviderTransport | None = None,
+    ) -> None:
+        self._sessionmaker = sessionmaker
+        self._account_id = account_id
+        self._transport_override = transport
+        self._forward_iq_inflight = 0
+
+    def _transport(self, account: ChannelAccount) -> WhatsAppProviderTransport | None:
+        return (
+            self._transport_override
+            or get_whatsapp_provider_transport(self._account_id)
+            or whatsapp_delivery_transport.resolve_whatsapp_delivery_transport(account)
+        )
+
+    async def store_outbound_message(
+        self,
+        message: WhatsAppOutboundMessage,
+        *,
+        bot_agent_link_id: UUID,
+    ) -> WhatsAppProviderRelayResult:
+        async with self._sessionmaker() as db:
+            account = await _load_active_whatsapp_account(db, account_id=self._account_id)
+            provider_payload = _provider_payload_from_outbound(message)
+            binding = await find_binding(
+                db,
+                account=account,
+                external_chat_id=message.to_jid,
+                bot_agent_link_id=bot_agent_link_id,
+            )
+            if (
+                binding is None
+                or await lock_active_binding_authority(
+                    db, account=account, binding=binding, bot_agent_link_id=bot_agent_link_id
+                )
+                is None
+            ):
+                raise HTTPException(
+                    status_code=403, detail="chat is not paired with this agent link"
+                )
+            semantic_payload = _canonical_outbound_payload(
+                provider_payload, binding.external_chat_id
+            )
+            # A stanza ID identifies the sending operation, not the message
+            # targeted inside an edit proto. Serialize that identity in Postgres.
+            lock_key = json.dumps(
+                [
+                    "whatsapp-outbox",
+                    str(account.id),
+                    str(bot_agent_link_id),
+                    binding.external_chat_id,
+                    message.message_id,
+                ],
+                separators=(",", ":"),
+            )
+            await db.execute(select(func.pg_advisory_xact_lock(func.hashtextextended(lock_key, 0))))
+            previous = list(
+                (
+                    await db.execute(
+                        select(ChannelMessage)
+                        .where(
+                            ChannelMessage.account_id == account.id,
+                            ChannelMessage.bot_agent_link_id == bot_agent_link_id,
+                            ChannelMessage.external_chat_id == binding.external_chat_id,
+                            ChannelMessage.direction == MESSAGE_DIRECTION_OUTBOUND,
+                            ChannelMessage.payload["providerPayload"]["messageId"].as_string()
+                            == message.message_id,
+                        )
+                        .limit(2)
+                        .with_for_update(read=True)
+                    )
+                ).scalars()
+            )
+            if previous:
+                stored = previous[0]
+                stored_payload = (stored.payload or {}).get("providerPayload")
+                stored_semantics = None
+                if isinstance(stored_payload, dict):
+                    try:
+                        stored_semantics = _canonical_outbound_payload(
+                            stored_payload, binding.external_chat_id
+                        )
+                    except HTTPException:
+                        # Invalid retained envelopes cannot authorize a successful replay.
+                        pass
+                if len(previous) != 1 or stored_semantics != semantic_payload:
+                    raise HTTPException(
+                        status_code=409, detail="whatsapp message identity conflict"
+                    )
+                delivery_id = await db.scalar(
+                    select(ChannelDelivery.id).where(
+                        ChannelDelivery.message_id == stored.id,
+                        ChannelDelivery.account_id == account.id,
+                        ChannelDelivery.bot_agent_link_id == bot_agent_link_id,
+                    )
+                )
+                if delivery_id is None:
+                    raise HTTPException(
+                        status_code=409, detail="whatsapp delivery receipt unavailable"
+                    )
+                result = WhatsAppProviderRelayResult(
+                    outcome="queued",
+                    external_chat_id=message.to_jid,
+                    provider_message_id=message.message_id,
+                    channel_message_id=stored.id,
+                    delivery_id=delivery_id,
+                )
+                await db.commit()
+                return result
+            queued, delivery = await enqueue_channel_outbound_message(
+                db,
+                account=account,
+                external_chat_id=binding.external_chat_id,
+                text=message.conversation or "",
+                bot_agent_link_id=bot_agent_link_id,
+            )
+            details = _outbound_debug_details(message)
+            payload = dict(queued.payload or {})
+            payload["providerPayload"] = provider_payload
+            queued.payload = payload
+            await record_channel_debug_event(
+                db,
+                account=account,
+                user_id=queued.user_id,
+                provider=CHANNEL_PROVIDER_WHATSAPP,
+                direction="agent",
+                stage="outbound_delivery",
+                outcome="queued",
+                external_chat_id=message.to_jid,
+                details={
+                    **details,
+                    "deliveryId": str(delivery.id),
+                    "channelMessageId": str(queued.id),
+                },
+            )
+            await db.commit()
+            return WhatsAppProviderRelayResult(
+                outcome="queued",
+                external_chat_id=message.to_jid,
+                provider_message_id=message.message_id,
+                channel_message_id=queued.id,
+                delivery_id=delivery.id,
+            )
+
+    async def relay_raw_node(
+        self,
+        node: BinaryNode,
+        lookup_inbound_sender: Callable[[str], str | None],
+        *,
+        bot_agent_link_id: UUID,
+    ) -> WhatsAppProviderNodeRelayResult:
+        attrs = _node_attrs(node)
+        tag = str(node.get("tag") or "")
+        external_chat_id = attrs.get("to") or attrs.get("recipient")
+        async with self._sessionmaker() as db:
+            account = await _load_active_whatsapp_account(db, account_id=self._account_id)
+            link = await lock_active_link_authority(
+                db,
+                account=account,
+                bot_agent_link_id=bot_agent_link_id,
+            )
+            if link is None:
+                return WhatsAppProviderNodeRelayResult(
+                    outcome="dropped",
+                    tag=tag,
+                    external_chat_id=external_chat_id,
+                    reason="link-authority-missing",
+                )
+            tenant_user_id = link.user_id
+            resolve_jid = await _build_bound_jid_resolver(
+                db,
+                account=account,
+                node=node,
+                bot_agent_link_id=bot_agent_link_id,
+            )
+            decision = decide_whatsapp_relay(
+                node,
+                resolve_jid=resolve_jid,
+                lookup_inbound_sender=lookup_inbound_sender,
+            )
+            details = _raw_relay_debug_details(node)
+            if decision.action == "drop" or decision.node is None:
+                await record_channel_debug_event(
+                    db,
+                    account=account,
+                    user_id=tenant_user_id,
+                    provider=CHANNEL_PROVIDER_WHATSAPP,
+                    direction="agent",
+                    stage="outbound_relay",
+                    outcome="dropped",
+                    external_chat_id=external_chat_id,
+                    details={**details, "reason": decision.reason or "unknown"},
+                )
+                await db.commit()
+                return WhatsAppProviderNodeRelayResult(
+                    outcome="dropped",
+                    tag=tag,
+                    external_chat_id=external_chat_id,
+                    reason=decision.reason,
+                )
+
+            transport = self._transport(account)
+            if transport is None:
+                await record_channel_debug_event(
+                    db,
+                    account=account,
+                    user_id=tenant_user_id,
+                    provider=CHANNEL_PROVIDER_WHATSAPP,
+                    direction="agent",
+                    stage="outbound_relay",
+                    outcome="unsupported",
+                    external_chat_id=external_chat_id,
+                    details={**details, "reason": "provider-transport-unavailable"},
+                )
+                await db.commit()
+                return WhatsAppProviderNodeRelayResult(
+                    outcome="unsupported",
+                    tag=tag,
+                    external_chat_id=external_chat_id,
+                    reason="provider-transport-unavailable",
+                )
+
+            try:
+                await transport.relay_raw_node(decision.node)
+            except Exception as exc:
+                await record_channel_debug_event(
+                    db,
+                    account=account,
+                    user_id=tenant_user_id,
+                    provider=CHANNEL_PROVIDER_WHATSAPP,
+                    direction="agent",
+                    stage="outbound_relay",
+                    outcome="failed",
+                    external_chat_id=external_chat_id,
+                    details={**details, "errorType": exc.__class__.__name__},
+                )
+                await db.commit()
+                return WhatsAppProviderNodeRelayResult(
+                    outcome="failed",
+                    tag=tag,
+                    external_chat_id=external_chat_id,
+                    reason=exc.__class__.__name__,
+                )
+
+            await record_channel_debug_event(
+                db,
+                account=account,
+                user_id=tenant_user_id,
+                provider=CHANNEL_PROVIDER_WHATSAPP,
+                direction="agent",
+                stage="outbound_relay",
+                outcome="relayed",
+                external_chat_id=external_chat_id,
+                details=details,
+            )
+            await db.commit()
+            return WhatsAppProviderNodeRelayResult(
+                outcome="relayed",
+                tag=tag,
+                external_chat_id=external_chat_id,
+            )
+
+    async def forward_iq(
+        self,
+        node: BinaryNode,
+        tenant_id: str | None,
+        *,
+        bot_agent_link_id: UUID,
+        self_lid: str | None = None,
+    ) -> BinaryNode | None:
+        if tenant_id != str(bot_agent_link_id):
+            return None
+        async with self._sessionmaker() as db:
+            account = await _load_active_whatsapp_account(db, account_id=self._account_id)
+            usync_targets = parse_whatsapp_usync_device_targets(node)
+            if usync_targets is not None:
+                usync_lids = await _authorized_usync_target_lids(
+                    db,
+                    account=account,
+                    targets=usync_targets,
+                    bot_agent_link_id=bot_agent_link_id,
+                    self_lid=self_lid,
+                )
+                if usync_lids is None:
+                    return None
+                return whatsapp_usync_device_result(
+                    node,
+                    target_lids=usync_lids,
+                    self_lid=self_lid,
+                )
+            if _is_authorized_provider_service_iq(node):
+                if not await _active_link_owns_account(
+                    db,
+                    account=account,
+                    bot_agent_link_id=bot_agent_link_id,
+                ):
+                    return None
+            else:
+                resolve_jid = await _build_bound_jid_resolver(
+                    db,
+                    account=account,
+                    node=node,
+                    bot_agent_link_id=bot_agent_link_id,
+                )
+                targets = _node_target_jids(node)
+                if not targets or any(resolve_jid(target) is None for target in targets):
+                    return None
+            transport = self._transport(account)
+            forwarded: BinaryNode | None = None
+            if transport is not None and self._forward_iq_inflight < 5:
+                self._forward_iq_inflight += 1
+                try:
+                    forwarded = await forward_iq_over(_query_iq(transport), node)
+                finally:
+                    self._forward_iq_inflight -= 1
+            if forwarded is not None:
+                return forwarded
+            return None
+
+    async def resolve_recipient_lid(
+        self,
+        jid: str,
+        *,
+        bot_agent_link_id: UUID,
+    ) -> str | None:
+        async with self._sessionmaker() as db:
+            account = await _load_active_whatsapp_account(db, account_id=self._account_id)
+            recipient_lids = await _authorized_usync_target_lids(
+                db,
+                account=account,
+                targets=(jid,),
+                bot_agent_link_id=bot_agent_link_id,
+            )
+            return recipient_lids.get(jid) if recipient_lids is not None else None
+
+
+async def relay_whatsapp_provider_payload(
+    *,
+    account: ChannelAccount,
+    external_chat_id: str,
+    text: str,
+    provider_payload: object | None,
+) -> tuple[str | None, dict[str, JsonValue]]:
+    transport = whatsapp_delivery_transport.resolve_whatsapp_delivery_transport(account)
+    if transport is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="whatsapp provider transport unavailable",
+        )
+    message = _outbound_from_provider_payload(
+        external_chat_id=external_chat_id,
+        text=text,
+        provider_payload=provider_payload,
+    )
+    try:
+        relayed_message_id = await transport.relay_outbound_message(message)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="whatsapp provider transport rejected message",
+        ) from exc
+    message_id = relayed_message_id or message.message_id
+    return message_id, {
+        "transport": "baileys",
+        "messageId": message_id,
+        "protoSha256": hashlib.sha256(message.message_proto).hexdigest(),
+    }
+
+
+async def persist_whatsapp_provider_event(
+    db: AsyncSession,
+    *,
+    account_id: UUID,
+    event: WhatsAppProviderMessageEvent,
+) -> None:
+    account = await _load_active_whatsapp_account(db, account_id=account_id)
+    if (
+        await find_existing_inbound_provider_event(
+            db,
+            account=account,
+            external_chat_id=event.remote_jid,
+            provider_event_id=event.message_id,
+            provider_event_scope=PROVIDER_EVENT_SCOPE_ACCOUNT,
+        )
+        is not None
+    ):
+        return
+    remote_jid = event.remote_jid
+    alt_jid = event.remote_jid_alt
+    route_jid = choose_whatsapp_route_jid(remote_jid, alt_jid)
+    external_chat_id = route_jid
+    external_chat_type = "group" if route_jid.endswith("@g.us") else "dm"
+    # The provider payload below retains the full pushName. Channel bindings
+    # use a bounded display label, matching their VARCHAR(300) schema.
+    external_chat_name = event.push_name[:300] if event.push_name is not None else None
+    binding_lookup = await resolve_whatsapp_binding_by_jids(
+        db,
+        account=account,
+        remote_jid=remote_jid,
+        alt_jid=alt_jid,
+    )
+    if binding_lookup.conflict:
+        if account.visibility == CHANNEL_VISIBILITY_PRIVATE:
+            await record_channel_debug_event(
+                db,
+                account=account,
+                user_id=require_channel_tenant_user_id(account),
+                provider=CHANNEL_PROVIDER_WHATSAPP,
+                direction="inbound",
+                stage="provider_ingress",
+                outcome="dropped",
+                external_chat_id=route_jid,
+                details={"reason": "binding-alias-conflict", "messageId": event.message_id},
+            )
+        await db.commit()
+        return
+    existing_binding = binding_lookup.binding
+    if existing_binding is not None:
+        external_chat_id = existing_binding.external_chat_id
+        external_chat_type = existing_binding.external_chat_type
+        external_chat_name = existing_binding.external_chat_name
+    text = whatsapp_text_from_message_proto(event.message_proto)
+    command = parse_channel_control_command(text)
+    if await channel_control_command_event_was_handled(
+        db,
+        account=account,
+        external_chat_id=external_chat_id,
+        provider_event_id=event.message_id,
+        provider_event_scope=PROVIDER_EVENT_SCOPE_ACCOUNT,
+        command=command,
+    ):
+        return
+    external_user_id = event.participant or event.participant_alt
+    if external_user_id is None and external_chat_type == "dm":
+        external_user_id = route_jid
+    binding_result = await resolve_inbound_binding(
+        db,
+        account=account,
+        external_chat_id=external_chat_id,
+        external_chat_type=external_chat_type,
+        external_chat_name=external_chat_name,
+        external_user_id=external_user_id,
+        text=text,
+        command=command,
+    )
+    payload = _provider_event_payload(event)
+    messages = await record_inbound_messages_for_bindings(
+        db,
+        account=account,
+        binding_result=binding_result,
+        external_chat_id=external_chat_id,
+        provider_message_id=event.message_id,
+        text=text,
+        payload=payload,
+        provider_event_scope=PROVIDER_EVENT_SCOPE_ACCOUNT,
+        require_active_authority=not binding_result.command_handled,
+    )
+    for _message, binding in messages:
+        if binding is not None:
+            await remember_whatsapp_binding_aliases(
+                db,
+                binding=binding,
+                remote_jid=remote_jid,
+                alt_jid=alt_jid,
+            )
+    await db.commit()
+    reply = await send_control_command_reply(
+        db,
+        account=account,
+        external_chat_id=external_chat_id,
+        command=command,
+        binding_result=binding_result,
+    )
+    if reply is not None:
+        await db.commit()
+
+
+async def _load_active_whatsapp_account(
+    db: AsyncSession,
+    *,
+    account_id: UUID,
+) -> ChannelAccount:
+    account = (
+        await db.execute(
+            select(ChannelAccount).where(
+                ChannelAccount.id == account_id,
+                ChannelAccount.provider == CHANNEL_PROVIDER_WHATSAPP,
+                ChannelAccount.archived_at.is_(None),
+                ChannelAccount.status == CHANNEL_STATUS_ACTIVE,
+            )
+        )
+    ).scalar_one_or_none()
+    if account is None:
+        raise WhatsAppProviderAccountRetired
+    return account
+
+
+async def _active_link_owns_account(
+    db: AsyncSession,
+    *,
+    account: ChannelAccount,
+    bot_agent_link_id: UUID,
+) -> bool:
+    return (
+        await lock_active_link_authority(db, account=account, bot_agent_link_id=bot_agent_link_id)
+        is not None
+    )
+
+
+def _canonical_outbound_payload(payload: object, external_chat_id: str) -> dict[str, JsonValue]:
+    message = _outbound_from_provider_payload(
+        external_chat_id=external_chat_id, text="", provider_payload=payload
+    )
+    canonical = _provider_payload_from_outbound(message)
+    # Signal ciphertext/type and managed routing are rebuilt by the physical
+    # socket. Every forwarded attribute and additional node remains semantic.
+    del canonical["encType"]
+    return canonical
+
+
+def _provider_payload_from_outbound(
+    message: WhatsAppOutboundMessage,
+) -> dict[str, JsonValue]:
+    attrs: dict[str, JsonValue] = {
+        key: value for key, value in relay_outbound_extra_attrs(message.attrs).items()
+    }
+    payload: dict[str, JsonValue] = {
+        "schemaVersion": WHATSAPP_PROVIDER_PAYLOAD_SCHEMA,
+        "messageId": message.message_id,
+        "messageProtoBase64": base64.b64encode(message.message_proto).decode("ascii"),
+        "encType": message.enc_type,
+        "attrs": attrs,
+    }
+    additional_nodes = validate_relay_outbound_additional_nodes(message.additional_nodes)
+    if additional_nodes:
+        payload["additionalNodes"] = [{"tag": "meta", "attrs": {"polltype": "creation"}}]
+    return payload
+
+
+def _outbound_from_provider_payload(
+    *,
+    external_chat_id: str,
+    text: str,
+    provider_payload: object | None,
+) -> WhatsAppOutboundMessage:
+    if provider_payload is None:
+        message_id = secrets.token_hex(10).upper()
+        return WhatsAppOutboundMessage(
+            to_jid=external_chat_id,
+            message_id=message_id,
+            message_proto=whatsapp_text_message_proto(text),
+            enc_type="msg",
+            attrs={"id": message_id, "to": external_chat_id},
+            conversation=text,
+        )
+    try:
+        payload = _PROVIDER_PAYLOAD_ADAPTER.validate_python(provider_payload, strict=True)
+    except ValidationError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="invalid whatsapp provider payload",
+        ) from exc
+    if payload.get("schemaVersion") != WHATSAPP_PROVIDER_PAYLOAD_SCHEMA:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="invalid whatsapp provider payload schema",
+        )
+    message_id = _required_payload_str(payload, "messageId")
+    raw_proto = _required_payload_str(payload, "messageProtoBase64")
+    try:
+        message_proto = base64.b64decode(raw_proto, validate=True)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="invalid whatsapp provider message proto",
+        ) from exc
+    if not message_proto:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="invalid whatsapp provider message proto",
+        )
+    enc_type = payload.get("encType")
+    if enc_type == "pkmsg":
+        normalized_enc_type: Literal["pkmsg", "msg", "skmsg"] = "pkmsg"
+    elif enc_type == "msg":
+        normalized_enc_type = "msg"
+    elif enc_type == "skmsg":
+        normalized_enc_type = "skmsg"
+    else:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="invalid whatsapp provider encryption type",
+        )
+    raw_attrs = payload.get("attrs")
+    if not isinstance(raw_attrs, dict):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="invalid whatsapp provider message attributes",
+        )
+    attrs: dict[str, str] = {}
+    for key, value in raw_attrs.items():
+        if not isinstance(value, str):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="invalid whatsapp provider message attributes",
+            )
+        attrs[key] = value
+    if attrs.get("to") not in {None, external_chat_id}:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="whatsapp provider payload target mismatch",
+        )
+    attrs["to"] = external_chat_id
+    attrs["id"] = message_id
+    try:
+        additional_nodes = validate_relay_outbound_additional_nodes(payload.get("additionalNodes"))
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="invalid whatsapp provider additional nodes",
+        ) from exc
+    return WhatsAppOutboundMessage(
+        to_jid=external_chat_id,
+        message_id=message_id,
+        message_proto=message_proto,
+        enc_type=normalized_enc_type,
+        attrs=attrs,
+        conversation=text or None,
+        additional_nodes=additional_nodes,
+    )
+
+
+def _provider_event_payload(event: WhatsAppProviderMessageEvent) -> dict[str, JsonValue]:
+    key: dict[str, JsonValue] = {
+        "id": event.message_id,
+        "remoteJid": event.remote_jid,
+        "fromMe": False,
+    }
+    if event.remote_jid_alt:
+        key["remoteJidAlt"] = event.remote_jid_alt
+    if event.participant:
+        key["participant"] = event.participant
+    if event.participant_alt:
+        key["participantAlt"] = event.participant_alt
+    payload: dict[str, JsonValue] = {
+        "schemaVersion": "clawdi.whatsappBaileysProviderEvent.v1",
+        "key": key,
+        "messageProtoBase64": base64.b64encode(event.message_proto).decode("ascii"),
+    }
+    if event.push_name:
+        payload["pushName"] = event.push_name
+    if event.message_timestamp:
+        payload["messageTimestamp"] = event.message_timestamp
+    return payload
+
+
+def _required_payload_str(payload: Mapping[str, JsonValue], key: str) -> str:
+    value = payload.get(key)
+    if not isinstance(value, str) or not value:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"invalid whatsapp provider payload {key}",
+        )
+    return value
+
+
+def _outbound_debug_details(message: WhatsAppOutboundMessage) -> dict[str, str | int]:
+    return {
+        "runtime": "baileys_noise",
+        "providerMessageId": message.message_id,
+        "protoBytes": len(message.message_proto),
+        "protoSha256": hashlib.sha256(message.message_proto).hexdigest(),
+        "encType": message.enc_type,
+    }
+
+
+async def _build_bound_jid_resolver(
+    db: AsyncSession,
+    *,
+    account: ChannelAccount,
+    node: BinaryNode,
+    bot_agent_link_id: UUID,
+) -> Callable[[str], str | None]:
+    candidate_bindings: dict[str, ChannelBinding | None] = {}
+    bindings: dict[UUID, ChannelBinding] = {}
+    candidates = _node_target_jids(node)
+    for candidate in candidates:
+        binding = await find_binding(
+            db,
+            account=account,
+            external_chat_id=candidate,
+            bot_agent_link_id=bot_agent_link_id,
+        )
+        if binding is not None:
+            bindings[binding.id] = binding
+        candidate_bindings[candidate] = binding
+    authorized: dict[UUID, ChannelBinding] = {}
+    for binding_id in sorted(bindings, key=str):
+        binding = bindings[binding_id]
+        leased = await lock_active_binding_authority(
+            db,
+            account=account,
+            binding=binding,
+            bot_agent_link_id=bot_agent_link_id,
+        )
+        if leased is not None:
+            authorized[binding_id] = leased
+    resolved: dict[str, str | None] = {}
+    for candidate, binding in candidate_bindings.items():
+        resolved[candidate] = (
+            authorized[binding.id].external_chat_id
+            if binding is not None and binding.id in authorized
+            else None
+        )
+    return resolved.get
+
+
+async def _authorized_usync_target_lids(
+    db: AsyncSession,
+    *,
+    account: ChannelAccount,
+    targets: tuple[str, ...],
+    bot_agent_link_id: UUID,
+    self_lid: str | None = None,
+) -> dict[str, str] | None:
+    normalized_self_lid = strip_whatsapp_device(self_lid) if self_lid is not None else None
+    resolved: dict[str, str] = {}
+    target_bindings: dict[str, ChannelBinding] = {}
+    bindings: dict[UUID, ChannelBinding] = {}
+    for target in targets:
+        if normalized_self_lid is not None and strip_whatsapp_device(target) == normalized_self_lid:
+            resolved[target] = normalized_self_lid
+            continue
+        binding = await find_binding(
+            db,
+            account=account,
+            external_chat_id=target,
+            bot_agent_link_id=bot_agent_link_id,
+        )
+        if binding is None:
+            return None
+        target_bindings[target] = binding
+        bindings[binding.id] = binding
+
+    if resolved and not await _active_link_owns_account(
+        db,
+        account=account,
+        bot_agent_link_id=bot_agent_link_id,
+    ):
+        return None
+
+    authorized: dict[UUID, ChannelBinding] = {}
+    for binding_id in sorted(bindings, key=str):
+        binding = await lock_active_binding_authority(
+            db,
+            account=account,
+            binding=bindings[binding_id],
+            bot_agent_link_id=bot_agent_link_id,
+        )
+        if binding is None:
+            return None
+        authorized[binding_id] = binding
+
+    aliases_result = await db.execute(
+        select(ChannelBindingAlias).where(
+            ChannelBindingAlias.account_id == account.id,
+            ChannelBindingAlias.bot_agent_link_id == bot_agent_link_id,
+            ChannelBindingAlias.binding_id.in_(authorized),
+        )
+    )
+    identifiers: dict[UUID, set[str]] = {
+        binding_id: {strip_whatsapp_device(binding.external_chat_id)}
+        for binding_id, binding in authorized.items()
+    }
+    for alias in aliases_result.scalars():
+        identifiers[alias.binding_id].add(strip_whatsapp_device(alias.alias_external_chat_id))
+
+    for target, binding in target_bindings.items():
+        target_jid = strip_whatsapp_device(target)
+        binding_identifiers = identifiers[binding.id]
+        if target_jid not in binding_identifiers:
+            return None
+        lids = {
+            identifier
+            for identifier in binding_identifiers
+            if (parsed := parse_whatsapp_jid(identifier)) is not None and parsed.server == "lid"
+        }
+        if len(lids) != 1:
+            return None
+        lid = lids.pop()
+        target_parsed = parse_whatsapp_jid(target_jid)
+        lid_parsed = parse_whatsapp_jid(lid)
+        if target_parsed is None or lid_parsed is None:
+            return None
+        # A PN inferred by replacing "@lid" with "@s.whatsapp.net" is not an
+        # observed alias. Refuse that same-number pair instead of guessing it.
+        if target_parsed.server == "s.whatsapp.net" and target_parsed.user == lid_parsed.user:
+            return None
+        resolved[target] = lid
+    return resolved
+
+
+def _node_target_jids(node: BinaryNode) -> tuple[str, ...]:
+    attrs = _node_attrs(node)
+    return tuple(
+        dict.fromkeys(target for key in ("to", "recipient", "jid") if (target := attrs.get(key)))
+    )
+
+
+def _is_authorized_provider_service_iq(node: BinaryNode) -> bool:
+    if node.get("tag") != "iq" or set(node).difference({"tag", "attrs", "content"}):
+        return False
+    attrs = _strict_string_dict(node.get("attrs"))
+    if attrs is None:
+        return False
+    if set(attrs) != {"id", "type", "xmlns", "to"} or not attrs["id"]:
+        return False
+    iq_type = attrs.get("type")
+    xmlns = attrs.get("xmlns")
+    target = attrs.get("to")
+    if iq_type is None or xmlns is None or target is None:
+        return False
+    # rc13/rc14 S_WHATSAPP_NET is the domain-only JID "@s.whatsapp.net".
+    # Keep the previously accepted literal only for these exact service IQs.
+    if target not in {"@s.whatsapp.net", "s.whatsapp.net"}:
+        return False
+    expected_child = {
+        ("set", "w:m"): "media_conn",
+        ("get", "privacy"): "privacy",
+    }.get((iq_type, xmlns))
+    content: object = node.get("content")
+    if expected_child is None or not _is_object_list(content) or len(content) != 1:
+        return False
+    child = content[0]
+    return (
+        _is_object_dict(child)
+        and not set(child).difference({"tag", "attrs", "content"})
+        and child.get("tag") == expected_child
+        and child.get("attrs") == {}
+        and child.get("content") is None
+    )
+
+
+def _raw_relay_debug_details(node: BinaryNode) -> dict[str, JsonValue]:
+    attrs = _node_attrs(node)
+    return {
+        "runtime": "baileys_noise",
+        "tag": str(node.get("tag") or ""),
+        "to": attrs.get("to"),
+        "recipient": attrs.get("recipient"),
+        "id": attrs.get("id"),
+        "type": attrs.get("type"),
+    }
+
+
+def _node_attrs(node: BinaryNode) -> dict[str, str]:
+    attrs: object = node.get("attrs")
+    if not _is_object_dict(attrs):
+        return {}
+    return {str(key): str(value) for key, value in attrs.items()}
+
+
+def _is_object_dict(value: object) -> TypeGuard[dict[object, object]]:
+    return isinstance(value, dict)
+
+
+def _is_object_list(value: object) -> TypeGuard[list[object]]:
+    return isinstance(value, list)
+
+
+def _strict_string_dict(value: object) -> dict[str, str] | None:
+    if not _is_object_dict(value):
+        return None
+    result: dict[str, str] = {}
+    for key, item in value.items():
+        if not isinstance(key, str) or not isinstance(item, str):
+            return None
+        result[key] = item
+    return result
+
+
+def _transport_connected(transport: WhatsAppProviderTransport) -> bool:
+    try:
+        connected = getattr(transport, "connected")
+    except AttributeError:
+        return True
+    except Exception:
+        return False
+    return connected if isinstance(connected, bool) else True
+
+
+def _query_iq(
+    transport: WhatsAppProviderTransport,
+) -> Callable[[BinaryNode, int], Awaitable[BinaryNode | None]]:
+    async def query(node: BinaryNode, timeout_ms: int) -> BinaryNode | None:
+        return await transport.query_iq(node, timeout_ms)
+
+    return query

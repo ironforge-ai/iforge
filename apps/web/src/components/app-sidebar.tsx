@@ -1,0 +1,1970 @@
+"use client";
+
+import { DESTINATIONS } from "@clawdi/shared";
+import type { components } from "@clawdi/shared/api";
+import {
+	closestCenter,
+	DndContext,
+	type DragEndEvent,
+	type DragOverEvent,
+	KeyboardCode,
+	KeyboardSensor,
+	type Modifier,
+	MouseSensor,
+	TouchSensor,
+	useSensor,
+	useSensors,
+} from "@dnd-kit/core";
+import {
+	arrayMove,
+	SortableContext,
+	sortableKeyboardCoordinates,
+	useSortable,
+	verticalListSortingStrategy,
+} from "@dnd-kit/sortable";
+import { CSS } from "@dnd-kit/utilities";
+import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { Link, useLocation, useRouter, useSearch } from "@tanstack/react-router";
+import {
+	BookOpen,
+	CircleAlert,
+	CircleHelp,
+	ExternalLink,
+	History,
+	LayoutDashboard,
+	type LucideIcon,
+	Mail,
+	Search,
+} from "lucide-react";
+import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { toast } from "sonner";
+import { useAccountDataIdentity } from "@/components/account-suspension-boundary";
+import { useSetBreadcrumbSegmentTitle } from "@/components/breadcrumb-title";
+import { useCommandPalette } from "@/components/command-palette";
+import { AgentIcon } from "@/components/dashboard/agent-icon";
+import {
+	AgentSourceBadge,
+	AgentSourceBadgeForEnvironment,
+	agentDisplayName,
+	agentSourceKindLabel,
+	agentTypeLabel,
+	LegacyAgentBadge,
+} from "@/components/dashboard/agent-label";
+import { useAgentProjectBindings } from "@/components/dashboard/agent-project-bindings-query";
+import { resolveAgentDefaultProject } from "@/components/dashboard/agent-project-scope";
+import {
+	type AgentCardStatusProjection,
+	type AgentTile,
+	agentTileMatchesRouteId,
+	compareAgentTiles,
+	selfManagedAgentTiles,
+} from "@/components/dashboard/agents-card";
+import { DaemonStatusBadge, type DaemonStatusSource } from "@/components/dashboard/daemon-status";
+import { NewAgentButton } from "@/components/dashboard/new-agent-button";
+import { IconChip } from "@/components/icon-chip";
+import { SettingsDialog } from "@/components/settings-dialog";
+import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
+import { Button } from "@/components/ui/button";
+import {
+	DropdownMenu,
+	DropdownMenuContent,
+	DropdownMenuGroup,
+	DropdownMenuItem,
+	DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
+import {
+	Sidebar,
+	SidebarContent,
+	SidebarGroup,
+	SidebarGroupContent,
+	SidebarGroupLabel,
+	SidebarHeader,
+	SidebarMenu,
+	SidebarMenuButton,
+	SidebarMenuItem,
+	SidebarSeparator,
+	useSidebar,
+} from "@/components/ui/sidebar";
+import { Skeleton } from "@/components/ui/skeleton";
+import { StatusDot } from "@/components/ui/status-badge";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+import { UserMenuItems } from "@/components/user-menu";
+import { connectedAdapterHasModule } from "@/lib/adapter-modules";
+import { preloadHostedAgentHome } from "@/lib/agent-home-loader";
+import {
+	type AgentOwnershipKind,
+	agentOwnershipKindFromId,
+	useAgentOwnership,
+} from "@/lib/agent-ownership";
+import { agentsQueryKey } from "@/lib/agent-queries";
+import {
+	type AgentSectionId,
+	agentProjectResourceHref,
+	agentRouteIdsEqual,
+	agentSectionHref,
+	CONNECTED_AGENT_SECTION_IDS,
+	parseAgentPathname,
+} from "@/lib/agent-routes";
+import { unwrap, useApi, useOpenApi } from "@/lib/api";
+import { useCurrentUser } from "@/lib/auth-client";
+import { useBillingLocked } from "@/lib/billing-lock";
+import {
+	availableAppsQueryOptions,
+	CONNECTOR_CATALOG_PAGE_SIZE,
+	connectionsQueryOptions,
+} from "@/lib/connectors-data";
+import { IS_HOSTED } from "@/lib/hosted";
+import type { AgentNavigationVariant } from "@/lib/navigation-model";
+import {
+	AGENT_SECTION_NAVIGATION_ITEMS,
+	agentNavigationGroups,
+	CANONICAL_NAVIGATION_IDENTITIES,
+	consoleNavigationGroups,
+	hostedAgentVisibleSectionIds,
+} from "@/lib/navigation-model";
+import { useProductAccess } from "@/lib/product-access";
+import { RESOURCE_TINT_CLASSES } from "@/lib/resource-identity";
+import { DEFAULT_SETTINGS_SECTION, type SettingsSectionId } from "@/lib/settings-routes";
+import { useHydrated } from "@/lib/use-hydrated";
+import { cn, errorMessage, relativeTime } from "@/lib/utils";
+
+type AgentChromeKind = AgentOwnershipKind;
+const IS_HOSTED_BUILD = import.meta.env.VITE_IFORGE_HOSTED === "true";
+const IS_DESKTOP_BUILD = import.meta.env.VITE_IFORGE_DESKTOP_BUILD === "true";
+const HAS_CHATWOOT_CONFIG = Boolean(
+	import.meta.env.VITE_CHATWOOT_BASE_URL && import.meta.env.VITE_CHATWOOT_WEBSITE_TOKEN,
+);
+const HostedUnifiedAgentListSensor = IS_HOSTED_BUILD
+	? lazy(() =>
+			import("@/hosted/use-unified-agent-list").then((m) => ({
+				default: m.HostedUnifiedAgentListSensor,
+			})),
+		)
+	: null;
+
+const ChatwootLiveChatMenuItem = IS_HOSTED_BUILD
+	? IS_DESKTOP_BUILD || !HAS_CHATWOOT_CONFIG
+		? null
+		: lazy(() =>
+				import("@/hosted/chatwoot-live-chat-menu-item").then((m) => ({
+					default: m.ChatwootLiveChatMenuItem,
+				})),
+			)
+	: null;
+
+function useAgentChromeKind(
+	agent: SidebarEnvironment | null,
+	tile: AgentTile | null,
+): AgentChromeKind {
+	const ownership = useAgentOwnership();
+	if (tile) return agentTileChromeKind(tile);
+	if (!IS_HOSTED || !agent) return "connected";
+	return agentOwnershipKindFromId(agent.id, ownership);
+}
+
+const LEGACY_DASHBOARD_TINT = "bg-warning-muted text-warning-muted-foreground";
+
+type SidebarEnvironment = components["schemas"]["AgentResponse"];
+const EMPTY_SIDEBAR_ENVIRONMENTS: SidebarEnvironment[] = [];
+
+type SidebarNavItem = {
+	id: string;
+	label: string;
+	href: string;
+	icon: LucideIcon;
+	tint: string;
+	tooltip: string;
+	active: boolean;
+	external?: boolean;
+	prefetch?: () => void;
+};
+
+type AgentPrimaryProjectNavigation = {
+	id: string;
+	contextProjectIds: readonly string[];
+};
+
+type ScopedAgentResourceSidebarTarget =
+	| { kind: "workspace"; resource: "skills" | "vaults" }
+	| { kind: "projects" }
+	| null;
+
+export function scopedAgentResourceSidebarTarget(
+	pathname: string,
+	searchStr: string,
+	primaryProjectId: string,
+	contextProjectIds: readonly string[],
+): ScopedAgentResourceSidebarTarget {
+	const route = parseAgentPathname(pathname);
+	if (!route || (route.section !== "skills" && route.section !== "vaults")) return null;
+
+	const projectId = new URLSearchParams(searchStr).get("project")?.trim();
+	if (!projectId) return null;
+	if (agentRouteIdsEqual(projectId, primaryProjectId)) {
+		return { kind: "workspace", resource: route.section };
+	}
+	if (contextProjectIds.some((id) => agentRouteIdsEqual(projectId, id))) {
+		return { kind: "projects" };
+	}
+	return null;
+}
+
+const RAIL_DRAG_ACTIVATION_DISTANCE = 10;
+const RAIL_KEYBOARD_CODES = {
+	start: [KeyboardCode.Space],
+	cancel: [KeyboardCode.Esc],
+	end: [KeyboardCode.Space, KeyboardCode.Enter, KeyboardCode.Tab],
+};
+
+const restrictRailDragToVerticalAxis: Modifier = ({ transform }) => ({
+	...transform,
+	x: 0,
+});
+
+const RAIL_DND_MODIFIERS = [restrictRailDragToVerticalAxis];
+const RAIL_COLD_LOADING_SLOTS = ["primary", "secondary"] as const;
+
+function reorderEnvironmentsForCache(
+	current: SidebarEnvironment[],
+	orderedIds: string[],
+): SidebarEnvironment[] {
+	const byId = new Map(current.map((env) => [env.id, env]));
+	const requested = new Set(orderedIds);
+	const reordered = orderedIds
+		.map((id) => byId.get(id))
+		.filter((env): env is SidebarEnvironment => Boolean(env));
+	reordered.push(...current.filter((env) => !requested.has(env.id)));
+	return reordered.map((env, index) => ({ ...env, sort_order: index }));
+}
+
+function reorderAgentTilesByIndex(current: AgentTile[], from: number, to: number): AgentTile[] {
+	return arrayMove(current, from, to).map((tile, index) => ({
+		...tile,
+		sortOrder: index,
+		env: tile.env ? { ...tile.env, sort_order: index } : tile.env,
+	}));
+}
+
+function agentTileChromeKind(tile: AgentTile): AgentChromeKind {
+	if (tile.source === "on-clawdi") return "cloud";
+	if (tile.source === "legacy-hosted") return "legacy";
+	return "connected";
+}
+
+function sameOrder(a: string[], b: string[]): boolean {
+	return a.length === b.length && a.every((id, index) => id === b[index]);
+}
+
+function SidebarNavSection({
+	label,
+	items,
+	before,
+	separated = false,
+	ariaLabel,
+	onNavigate,
+}: {
+	label: string | null;
+	items: SidebarNavItem[];
+	before?: React.ReactNode;
+	separated?: boolean;
+	ariaLabel?: string;
+	onNavigate?: () => void;
+}) {
+	return (
+		<SidebarGroup
+			role="group"
+			className={cn("pt-0", separated && "mt-2 border-t pt-2")}
+			aria-label={ariaLabel ?? label ?? undefined}
+		>
+			{label ? (
+				<SidebarGroupLabel className="min-w-0 truncate" title={label}>
+					{label}
+				</SidebarGroupLabel>
+			) : null}
+			<SidebarGroupContent>
+				<SidebarMenu>
+					{before}
+					{items.map((item) => {
+						const Icon = item.icon;
+						return (
+							<SidebarMenuItem key={item.id}>
+								<SidebarMenuButton
+									render={
+										item.external ? (
+											// biome-ignore lint/a11y/useAnchorContent: Base UI render placeholder; SidebarMenuButton supplies the accessible label.
+											<a
+												href={item.href}
+												target="_blank"
+												rel="noopener noreferrer"
+												aria-label={`Open ${item.label}`}
+												onClick={onNavigate}
+											/>
+										) : (
+											<Link
+												to={item.href}
+												onClick={onNavigate}
+												onMouseEnter={item.prefetch}
+												onFocus={item.prefetch}
+											/>
+										)
+									}
+									isActive={item.active}
+									tooltip={item.tooltip}
+								>
+									<IconChip size="xs" tint={item.tint}>
+										<Icon />
+									</IconChip>
+									<span>{item.label}</span>
+									{item.external ? (
+										<ExternalLink className="ml-auto size-3 text-muted-foreground" />
+									) : null}
+								</SidebarMenuButton>
+							</SidebarMenuItem>
+						);
+					})}
+				</SidebarMenu>
+			</SidebarGroupContent>
+		</SidebarGroup>
+	);
+}
+
+function usePrefetchConnectorsCatalog() {
+	const ready = Boolean(useAccountDataIdentity());
+	const api = useOpenApi();
+	const queryClient = useQueryClient();
+	return useCallback(() => {
+		if (!ready) return;
+		void queryClient.prefetchQuery(
+			availableAppsQueryOptions(api, {
+				page: 1,
+				pageSize: CONNECTOR_CATALOG_PAGE_SIZE,
+			}),
+		);
+		void queryClient.prefetchQuery(connectionsQueryOptions(api));
+	}, [api, queryClient, ready]);
+}
+
+function ConsoleNavigationSections({
+	pathname,
+	showCloudFeatures,
+	onNavigate,
+}: {
+	pathname: string;
+	showCloudFeatures: boolean;
+	onNavigate?: () => void;
+}) {
+	const prefetchConnectorsCatalog = usePrefetchConnectorsCatalog();
+	return consoleNavigationGroups(showCloudFeatures).map((group) => (
+		<SidebarNavSection
+			key={group.id}
+			label={group.label}
+			items={group.items.map((item) => ({
+				...item,
+				active:
+					item.href === "/"
+						? pathname === item.href
+						: pathname === item.href || pathname.startsWith(`${item.href}/`),
+				prefetch: item.id === "connectors" ? prefetchConnectorsCatalog : undefined,
+			}))}
+			separated={group.separated}
+			ariaLabel={group.label ?? "Primary navigation"}
+			onNavigate={onNavigate}
+		/>
+	));
+}
+
+function AgentSectionList({
+	agentId,
+	variant,
+	runtime,
+	visibleSectionIds,
+	activeSection,
+	primaryProject,
+	allowWorkspaceSkills = true,
+	extraPrimaryItems = [],
+	loading = false,
+	onNavigate,
+}: {
+	agentId: string;
+	variant: AgentNavigationVariant;
+	runtime?: AgentTile["agentType"];
+	visibleSectionIds?: readonly AgentSectionId[];
+	activeSection: AgentSectionId;
+	primaryProject?: AgentPrimaryProjectNavigation | null;
+	allowWorkspaceSkills?: boolean;
+	extraPrimaryItems?: SidebarNavItem[];
+	loading?: boolean;
+	onNavigate?: () => void;
+}) {
+	const { pathname, searchStr } = useLocation({
+		select: (location) => ({
+			pathname: location.pathname,
+			searchStr: location.searchStr,
+		}),
+	});
+	const prefetchConnectorsCatalog = usePrefetchConnectorsCatalog();
+	const groups = agentNavigationGroups(variant, visibleSectionIds, runtime);
+	const activeAgentRoute = parseAgentPathname(pathname);
+	const primaryProjectRouteActive = Boolean(
+		primaryProject && agentRouteIdsEqual(activeAgentRoute?.projectId, primaryProject.id),
+	);
+	const scopedResourceTarget = primaryProject
+		? scopedAgentResourceSidebarTarget(
+				pathname,
+				searchStr,
+				primaryProject.id,
+				primaryProject.contextProjectIds,
+			)
+		: null;
+	const activePrimaryProjectResource =
+		(primaryProjectRouteActive ? activeAgentRoute?.projectResource : null) ??
+		(scopedResourceTarget?.kind === "workspace" ? scopedResourceTarget.resource : null);
+	const isFlatProjectResourceRoute = activeAgentRoute?.section === "skills";
+	// Invalid, legacy, and not-yet-resolved flat resource URLs all return through
+	// Projects. Keep that safe parent active until an exact Workspace or linked
+	// Project context has been proven instead of misleadingly highlighting Overview.
+	const activeContextProjectResource =
+		activeAgentRoute?.section !== "vaults" &&
+		(scopedResourceTarget?.kind === "projects" ||
+			(isFlatProjectResourceRoute && !activePrimaryProjectResource));
+	const normalizedActiveSection =
+		loading || groups.some((group) => group.items.some((item) => item.id === activeSection))
+			? activeSection
+			: "overview";
+	const primaryProjectItems = primaryProject
+		? (["skills", "vaults"] as const)
+				.filter((section) => allowWorkspaceSkills || section !== "skills")
+				.map((section): SidebarNavItem => {
+					const item = AGENT_SECTION_NAVIGATION_ITEMS[section];
+					return {
+						id: `primary-project-${section}`,
+						label: item.label,
+						href:
+							section === "vaults"
+								? agentSectionHref(agentId, "vaults")
+								: agentProjectResourceHref(agentId, primaryProject.id, section),
+						icon: item.icon,
+						tint: item.tint,
+						tooltip: section === "vaults" ? "Available Vaults" : `${item.label} in Workspace`,
+						active:
+							section === "vaults"
+								? activeAgentRoute?.section === "vaults" || activePrimaryProjectResource === section
+								: activePrimaryProjectResource === section,
+					};
+				})
+		: [];
+
+	return (
+		<>
+			{groups.map((group) => {
+				const items = [
+					...group.items.map((item): SidebarNavItem => {
+						return {
+							id: item.id,
+							label: item.label,
+							href: agentSectionHref(agentId, item.id),
+							icon: item.icon,
+							tint: item.tint,
+							tooltip: item.tooltip,
+							active:
+								item.id === "projects"
+									? activeContextProjectResource ||
+										(normalizedActiveSection === "projects" && !activePrimaryProjectResource)
+									: normalizedActiveSection === item.id &&
+										!activePrimaryProjectResource &&
+										!activeContextProjectResource &&
+										activeAgentRoute?.section !== "vaults",
+							prefetch: item.id === "connectors" ? prefetchConnectorsCatalog : undefined,
+						};
+					}),
+					...(group.id === "workspace" ? primaryProjectItems : []),
+					...(group.id === "primary" ? extraPrimaryItems : []),
+				];
+				return (
+					<SidebarNavSection
+						key={group.id}
+						label={group.label}
+						items={items}
+						separated={group.separated}
+						ariaLabel={
+							group.label ?? (group.id === "settings" ? "Agent settings" : "Primary navigation")
+						}
+						onNavigate={onNavigate}
+					/>
+				);
+			})}
+			{loading ? <AgentNavigationLoadingRows /> : null}
+		</>
+	);
+}
+
+function AgentFocusSections({
+	agentId,
+	kind,
+	resolved,
+	loading,
+	runtime,
+	adapterModules,
+	filesAvailable,
+	activeSection,
+	primaryProject,
+	onNavigate,
+}: {
+	agentId: string;
+	kind: AgentChromeKind;
+	resolved: boolean;
+	loading: boolean;
+	runtime?: AgentTile["agentType"];
+	adapterModules?: SidebarEnvironment["adapter_modules"];
+	filesAvailable?: boolean;
+	activeSection: AgentSectionId;
+	primaryProject?: AgentPrimaryProjectNavigation | null;
+	onNavigate?: () => void;
+}) {
+	const { legacyDashboardUrl } = useProductAccess();
+	const legacyDashboardHref = resolved && kind === "legacy" ? legacyDashboardUrl : null;
+	const connectedVisibleSectionIds = CONNECTED_AGENT_SECTION_IDS.filter(
+		(section) => section !== "sessions" || connectedAdapterHasModule(adapterModules, "sessions"),
+	);
+	const allowWorkspaceSkills =
+		kind === "cloud" || connectedAdapterHasModule(adapterModules, "skills");
+	const extraPrimaryItems: SidebarNavItem[] = legacyDashboardHref
+		? [
+				{
+					id: "legacy-dashboard",
+					label: "Legacy dashboard",
+					href: legacyDashboardHref,
+					icon: History,
+					tint: LEGACY_DASHBOARD_TINT,
+					tooltip: "Open legacy dashboard",
+					active: false,
+					external: true,
+				},
+			]
+		: [];
+	return (
+		<AgentSectionList
+			agentId={agentId}
+			variant={kind === "cloud" || (!resolved && !loading) ? "hosted" : "connected"}
+			loading={loading}
+			runtime={runtime}
+			visibleSectionIds={
+				!resolved
+					? ["overview"]
+					: kind === "cloud"
+						? hostedAgentVisibleSectionIds(filesAvailable === true)
+						: connectedVisibleSectionIds
+			}
+			activeSection={activeSection}
+			primaryProject={primaryProject}
+			allowWorkspaceSkills={allowWorkspaceSkills}
+			extraPrimaryItems={extraPrimaryItems}
+			onNavigate={onNavigate}
+		/>
+	);
+}
+
+function AgentNavigationLoadingRows() {
+	return (
+		<SidebarGroup role="group" className="pt-0" aria-label="Navigation loading">
+			<SidebarGroupContent>
+				<SidebarMenu>
+					{["70%", "58%", "64%"].map((width) => (
+						<SidebarMenuItem key={width}>
+							<div className="flex h-8 items-center gap-2 rounded-md px-2">
+								<Skeleton className="size-5 rounded-md" />
+								<Skeleton className="h-4 flex-1" style={{ maxWidth: width }} />
+							</div>
+						</SidebarMenuItem>
+					))}
+				</SidebarMenu>
+			</SidebarGroupContent>
+		</SidebarGroup>
+	);
+}
+
+function SidebarMainNavigation({
+	pathname,
+	showCloudFeatures,
+	activeAgentId,
+	activeAgentTile,
+	activeAgentKind,
+	agentsLoaded,
+	activeSection,
+	primaryProject,
+	onNavigate,
+}: {
+	pathname: string;
+	showCloudFeatures: boolean;
+	activeAgentId: string | null;
+	activeAgentTile: AgentTile | null;
+	activeAgentKind: AgentChromeKind;
+	agentsLoaded: boolean;
+	activeSection: AgentSectionId;
+	primaryProject?: AgentPrimaryProjectNavigation | null;
+	onNavigate?: () => void;
+}) {
+	if (activeAgentId) {
+		const resolved = Boolean(activeAgentTile) && activeAgentKind !== "unresolved";
+		const loading =
+			!resolved && (!agentsLoaded || activeAgentKind === "unresolved" || !showCloudFeatures);
+		return (
+			<AgentFocusSections
+				agentId={activeAgentId}
+				kind={activeAgentKind}
+				resolved={resolved}
+				loading={loading}
+				runtime={activeAgentTile?.agentType}
+				adapterModules={activeAgentTile?.env?.adapter_modules}
+				filesAvailable={activeAgentTile?.filesAvailable}
+				activeSection={activeSection}
+				primaryProject={resolved ? primaryProject : null}
+				onNavigate={onNavigate}
+			/>
+		);
+	}
+	return (
+		<ConsoleNavigationSections
+			pathname={pathname}
+			showCloudFeatures={showCloudFeatures}
+			onNavigate={onNavigate}
+		/>
+	);
+}
+
+type FocusNavigationPaneProps = {
+	className?: string;
+	pathname: string;
+	showCloudFeatures: boolean;
+	activeAgentId: string | null;
+	activeAgent: SidebarEnvironment | null;
+	activeAgentTile: AgentTile | null;
+	activeAgentKind: AgentChromeKind;
+	activeAgentName: string | null;
+	agentsLoaded: boolean;
+	activeSection: AgentSectionId;
+	primaryProject?: AgentPrimaryProjectNavigation | null;
+	onNavigate?: () => void;
+};
+
+function FocusNavigationPane({
+	className,
+	pathname,
+	showCloudFeatures,
+	activeAgentId,
+	activeAgent,
+	activeAgentTile,
+	activeAgentKind,
+	activeAgentName,
+	agentsLoaded,
+	activeSection,
+	primaryProject,
+	onNavigate,
+}: FocusNavigationPaneProps) {
+	return (
+		<div className={cn("flex min-h-0 flex-1 flex-col", className)}>
+			<SidebarHeader className="px-4 pt-3 pb-2">
+				<FocusHeader
+					activeAgent={activeAgent}
+					activeAgentTile={activeAgentTile}
+					activeAgentKind={activeAgentKind}
+					activeAgentId={activeAgentId}
+					activeAgentName={activeAgentName}
+				/>
+			</SidebarHeader>
+			<SidebarContent className="pb-[calc(var(--header-height)+env(safe-area-inset-bottom)+0.75rem)]">
+				<SidebarMainNavigation
+					pathname={pathname}
+					showCloudFeatures={showCloudFeatures}
+					activeAgentId={activeAgentId}
+					activeAgentTile={activeAgentTile}
+					activeAgentKind={activeAgentKind}
+					agentsLoaded={agentsLoaded}
+					activeSection={activeSection}
+					primaryProject={primaryProject}
+					onNavigate={onNavigate}
+				/>
+			</SidebarContent>
+		</div>
+	);
+}
+
+function RailFocusButton({
+	render,
+	label,
+	caption,
+	active,
+	className,
+	showTooltip = true,
+	children,
+}: {
+	render: React.ReactElement;
+	label: string;
+	caption?: string;
+	active: boolean;
+	className?: string;
+	showTooltip?: boolean;
+	children: React.ReactNode;
+}) {
+	const hasCaption = Boolean(caption);
+	const button = (
+		<SidebarMenuButton
+			render={render}
+			size="lg"
+			isActive={active}
+			aria-label={label}
+			// Chromeless tiles: no accent plate on hover/active — the left
+			// marker (peeking on hover, full bar when active) and the caption
+			// color carry the state, so uneven inner margins stay invisible.
+			className={cn(
+				"hover:bg-transparent active:bg-transparent data-active:bg-transparent data-active:font-medium",
+				hasCaption
+					? "h-[4.25rem] w-full flex-col justify-center gap-1 rounded-lg px-1 py-1"
+					: "size-11 justify-center rounded-lg p-0",
+				className,
+			)}
+		>
+			{children}
+			{caption ? (
+				<span
+					className={cn(
+						"block max-w-full truncate text-center text-2xs font-medium",
+						active ? "text-sidebar-foreground" : "text-muted-foreground",
+					)}
+					title={label}
+				>
+					{caption}
+				</span>
+			) : null}
+			<span className="sr-only">{label}</span>
+		</SidebarMenuButton>
+	);
+	return (
+		<div
+			className={cn(
+				"group/rail-focus relative flex min-w-0 items-center justify-center",
+				hasCaption ? "h-[4.25rem] w-full" : "size-11",
+			)}
+		>
+			<span
+				aria-hidden="true"
+				className={cn(
+					"absolute -left-1.5 w-1 rounded-r-full bg-sidebar-foreground/70 opacity-0 transition-[height,opacity] duration-200 ease-out",
+					active
+						? hasCaption
+							? "h-11 opacity-100"
+							: "h-8 opacity-100"
+						: "h-2 group-hover/rail-focus:h-4 group-hover/rail-focus:opacity-50",
+				)}
+			/>
+			{showTooltip ? (
+				<Tooltip>
+					<TooltipTrigger render={button} />
+					<TooltipContent side="right" align="center">
+						{label}
+					</TooltipContent>
+				</Tooltip>
+			) : (
+				button
+			)}
+		</div>
+	);
+}
+
+/**
+ * One rail tile for every rail entry (Console, agents): identical item
+ * geometry, so the absolute active marker lands on the same x for all of
+ * them. Sortable entries inject dnd-kit refs/props from outside.
+ */
+function RailTileButton({
+	itemRef,
+	itemStyle,
+	itemClassName,
+	itemTestId,
+	render,
+	label,
+	caption,
+	active,
+	className,
+	showTooltip = true,
+	children,
+}: {
+	itemRef?: React.Ref<HTMLLIElement>;
+	itemStyle?: React.CSSProperties;
+	itemClassName?: string;
+	itemTestId?: string;
+	render: React.ReactElement;
+	label: string;
+	caption?: string;
+	active: boolean;
+	className?: string;
+	showTooltip?: boolean;
+	children: React.ReactNode;
+}) {
+	return (
+		<SidebarMenuItem
+			ref={itemRef}
+			data-testid={itemTestId}
+			style={itemStyle}
+			className={cn("relative h-[4.25rem] w-full", itemClassName)}
+		>
+			<RailFocusButton
+				render={render}
+				label={label}
+				caption={caption}
+				active={active}
+				className={className}
+				showTooltip={showTooltip}
+			>
+				{children}
+			</RailFocusButton>
+		</SidebarMenuItem>
+	);
+}
+
+function SortableAgentRailItem({
+	agent,
+	active,
+	onNavigate,
+	showTooltip,
+}: {
+	agent: AgentTile;
+	active: boolean;
+	onNavigate?: () => void;
+	showTooltip: boolean;
+}) {
+	const router = useRouter();
+	const {
+		attributes,
+		listeners,
+		setActivatorNodeRef,
+		setNodeRef,
+		transform,
+		transition,
+		isDragging,
+	} = useSortable({
+		id: agent.id,
+		disabled: !agent.env,
+	});
+	const kind = agentTileChromeKind(agent);
+	const label = agent.name;
+	const caption = agent.name;
+	const style: React.CSSProperties = {
+		transform: CSS.Transform.toString(transform),
+		transition: isDragging ? undefined : transition,
+		zIndex: isDragging ? 20 : undefined,
+	};
+	const activateAgent = () => {
+		if (!agent.href) return;
+		onNavigate?.();
+		void router.navigate({ href: agent.href });
+	};
+	const preloadAgent = () => {
+		if (!agent.href) return;
+		void router.preloadRoute({ to: agent.href }).catch(() => undefined);
+		preloadHostedAgentHome();
+	};
+
+	// Touch preloading uses capture to coexist with dnd-kit's bubble-phase touch listener below.
+	return (
+		<RailTileButton
+			itemRef={setNodeRef}
+			itemTestId="app-sidebar-agent-tile"
+			itemStyle={style}
+			itemClassName={cn("touch-pan-y will-change-transform", isDragging && "opacity-80")}
+			render={
+				<button
+					ref={setActivatorNodeRef}
+					type="button"
+					disabled={!agent.href}
+					onClick={activateAgent}
+					onFocus={preloadAgent}
+					onMouseEnter={preloadAgent}
+					onTouchStartCapture={preloadAgent}
+					{...attributes}
+					aria-disabled={agent.href ? undefined : true}
+					aria-describedby={agent.env ? attributes["aria-describedby"] : undefined}
+					aria-roledescription={agent.env ? attributes["aria-roledescription"] : undefined}
+					{...listeners}
+				/>
+			}
+			label={label}
+			caption={caption}
+			active={active}
+			className={cn("touch-pan-y", agent.href && "cursor-pointer")}
+			showTooltip={showTooltip}
+		>
+			{/* The corner markers protrude past the icon, so the wrapper carries
+			    a small margin to keep them off the rail's overflow-hidden clip
+			    edge. The background-colored ring lifts the badge off the avatar
+			    instead of letting it smear across it. */}
+			<span className="relative m-0.5 inline-flex rounded-md">
+				<AgentIcon agent={agent.agentType} size="rail" avatarUrl={agent.avatarUrl} />
+				{kind === "cloud" ? (
+					<span
+						data-agent-rail-corner-marker="cloud"
+						className="-top-1.5 -right-1.5 pointer-events-none absolute z-10"
+					>
+						<AgentSourceBadge source="hosted" iconOnly className="ring-2 ring-sidebar" />
+					</span>
+				) : kind === "legacy" ? (
+					<span
+						data-agent-rail-corner-marker="legacy"
+						className="-top-1.5 -right-1.5 pointer-events-none absolute z-10"
+					>
+						<LegacyAgentBadge iconOnly className="ring-2 ring-sidebar" />
+					</span>
+				) : null}
+			</span>
+		</RailTileButton>
+	);
+}
+
+export type AgentRailLoadState = "loading" | "unavailable" | "settled";
+
+/**
+ * The rail skeleton is for first load only. When the hosted inventory settles
+ * as unavailable (e.g. `/v2/deployments` answering 503 `compute_unavailable`),
+ * the rail settles too instead of loading forever.
+ */
+export function agentRailLoadState({
+	agentsLoaded,
+	agentCount,
+	billingLocked,
+	inventoryUnavailable,
+}: {
+	agentsLoaded: boolean;
+	agentCount: number;
+	billingLocked: boolean;
+	inventoryUnavailable: boolean;
+}): AgentRailLoadState {
+	// iforge (06.3 L1): a disabled query must not read as loading forever.
+	if (agentsLoaded || agentCount > 0 || billingLocked) return "settled";
+	return inventoryUnavailable ? "unavailable" : "loading";
+}
+
+function AgentRailUnavailableSlot({
+	onRetry,
+	showTooltip,
+}: {
+	onRetry: (() => void) | null;
+	showTooltip: boolean;
+}) {
+	return (
+		<RailTileButton
+			itemTestId="app-sidebar-agent-unavailable"
+			render={<button type="button" disabled={!onRetry} onClick={() => onRetry?.()} />}
+			label="Agents couldn’t load. Retry"
+			caption="Retry"
+			active={false}
+			showTooltip={showTooltip}
+		>
+			<IconChip size="sm" className="size-10 [&>svg]:size-5">
+				<CircleAlert />
+			</IconChip>
+		</RailTileButton>
+	);
+}
+
+function AgentRailLoadingSlots() {
+	return RAIL_COLD_LOADING_SLOTS.map((slot) => (
+		<SidebarMenuItem
+			key={slot}
+			data-testid="app-sidebar-agent-loading-slot"
+			aria-hidden="true"
+			className="flex h-[4.25rem] w-full flex-col items-center justify-center gap-1 px-1 py-1"
+		>
+			<Skeleton className="size-10 shrink-0 rounded-md" />
+			<Skeleton className="h-2.5 w-12 max-w-full" />
+		</SidebarMenuItem>
+	));
+}
+
+function FocusRailContent({
+	agents,
+	loadState,
+	onRetry,
+	activeAgentId,
+	onNavigate,
+	showTooltips = true,
+}: {
+	agents: AgentTile[];
+	loadState: AgentRailLoadState;
+	onRetry: (() => void) | null;
+	activeAgentId: string | null;
+	onNavigate?: () => void;
+	showTooltips?: boolean;
+}) {
+	const api = useApi();
+	const queryClient = useQueryClient();
+	const [railAgents, setRailAgents] = useState<AgentTile[]>(() =>
+		[...agents].sort(compareAgentTiles),
+	);
+	const railAgentsRef = useRef(railAgents);
+	const dragStartRailAgents = useRef<AgentTile[] | null>(null);
+	const setRailAgentsOrder = (next: AgentTile[]) => {
+		railAgentsRef.current = next;
+		setRailAgents(next);
+	};
+	// Mouse and touch sensors keep scrolling distinct from drag activation. Enter
+	// remains ordinary button activation; Space follows dnd-kit's screen-reader instructions.
+	const sensors = useSensors(
+		useSensor(MouseSensor, {
+			activationConstraint: { distance: RAIL_DRAG_ACTIVATION_DISTANCE },
+		}),
+		useSensor(TouchSensor, { activationConstraint: { delay: 200, tolerance: 8 } }),
+		useSensor(KeyboardSensor, {
+			coordinateGetter: sortableKeyboardCoordinates,
+			keyboardCodes: RAIL_KEYBOARD_CODES,
+		}),
+	);
+	useEffect(() => {
+		if (!dragStartRailAgents.current) {
+			setRailAgentsOrder([...agents].sort(compareAgentTiles));
+		}
+	}, [agents]);
+	const orderedAgents = railAgents;
+	const orderedAgentIds = orderedAgents.map((agent) => agent.id);
+	const reorderAgents = useMutation({
+		mutationFn: async ({
+			environmentIds,
+		}: {
+			environmentIds: string[];
+			previousRail: AgentTile[];
+		}) => unwrap(await api.PATCH("/v1/agents/order", { body: { agent_ids: environmentIds } })),
+		onMutate: async ({ environmentIds, previousRail }) => {
+			await queryClient.cancelQueries({ queryKey: ["get", "/v1/agents"] });
+			const previous = queryClient.getQueryData<SidebarEnvironment[]>(agentsQueryKey);
+			queryClient.setQueryData<SidebarEnvironment[]>(agentsQueryKey, (current) =>
+				current ? reorderEnvironmentsForCache(current, environmentIds) : current,
+			);
+			return { previous, previousRail };
+		},
+		onError: (error, _variables, context) => {
+			if (context?.previous) {
+				queryClient.setQueryData(agentsQueryKey, context.previous);
+			}
+			if (context?.previousRail) setRailAgentsOrder(context.previousRail);
+			toast.error("Couldn't reorder agents", { description: errorMessage(error) });
+		},
+		onSuccess: (data) => {
+			queryClient.setQueryData(agentsQueryKey, data);
+		},
+	});
+	const onDragEnd = (event: DragEndEvent) => {
+		const { active, over } = event;
+		const initialAgents = dragStartRailAgents.current;
+		dragStartRailAgents.current = null;
+		if (!over) {
+			if (initialAgents) setRailAgentsOrder(initialAgents);
+			return;
+		}
+		let finalAgents = railAgentsRef.current;
+		const initialIds = (initialAgents ?? orderedAgents).map((agent) => agent.id);
+		let finalIds = finalAgents.map((agent) => agent.id);
+		if (sameOrder(initialIds, finalIds) && active.id !== over.id) {
+			const from = finalIds.indexOf(String(active.id));
+			const to = finalIds.indexOf(String(over.id));
+			if (from >= 0 && to >= 0) {
+				finalAgents = reorderAgentTilesByIndex(finalAgents, from, to);
+				setRailAgentsOrder(finalAgents);
+				finalIds = finalAgents.map((agent) => agent.id);
+			}
+		}
+		if (sameOrder(initialIds, finalIds)) return;
+		reorderAgents.mutate({
+			environmentIds: finalAgents.flatMap((agent) => (agent.env ? [agent.env.id] : [])),
+			previousRail: initialAgents ?? orderedAgents,
+		});
+	};
+	const onDragOver = (event: DragOverEvent) => {
+		const { active, over } = event;
+		if (!over || active.id === over.id) return;
+		const current = railAgentsRef.current;
+		const activeId = String(active.id);
+		const overId = String(over.id);
+		const from = current.findIndex((agent) => agent.id === activeId);
+		const to = current.findIndex((agent) => agent.id === overId);
+		if (from < 0 || to < 0 || from === to) return;
+		setRailAgentsOrder(reorderAgentTilesByIndex(current, from, to));
+	};
+	const beginRailDragGesture = () => {
+		dragStartRailAgents.current = railAgentsRef.current;
+	};
+
+	return (
+		<>
+			<SidebarHeader
+				data-iforge-window-drag-region
+				className={cn(
+					"h-(--clawdi-rail-width) items-center justify-center p-0",
+					IS_DESKTOP_BUILD && "h-[calc(var(--clawdi-rail-width)+2rem)] pt-8",
+				)}
+			>
+				<SidebarMenu className="items-center">
+					<SidebarMenuItem>
+						<a
+							href={DESTINATIONS.webOrigin}
+							target="_blank"
+							rel="noopener noreferrer"
+							aria-label="Open iforge homepage"
+							className="flex size-11 items-center justify-center rounded-lg transition-colors hover:bg-sidebar-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+						>
+							<img
+								src="/iforge-logo-transparent.png"
+								alt=""
+								className="size-9 shrink-0 rounded-md"
+							/>
+							<span className="sr-only">iforge</span>
+						</a>
+					</SidebarMenuItem>
+				</SidebarMenu>
+			</SidebarHeader>
+
+			<SidebarSeparator className="mx-auto w-8" />
+
+			<SidebarContent className="items-center gap-2 overflow-x-hidden overflow-y-auto px-1.5 pt-2.5 pb-[calc(var(--header-height)+env(safe-area-inset-bottom)+0.75rem)] [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
+				<SidebarMenu className="w-full items-center">
+					<RailTileButton
+						render={<Link to="/" onClick={onNavigate} />}
+						label="Console"
+						caption="Console"
+						active={!activeAgentId}
+						showTooltip={showTooltips}
+					>
+						<IconChip
+							size="sm"
+							tint={RESOURCE_TINT_CLASSES.overview}
+							className="size-10 [&>svg]:size-5"
+						>
+							<LayoutDashboard />
+						</IconChip>
+					</RailTileButton>
+				</SidebarMenu>
+
+				<SidebarSeparator className="mx-auto w-8" />
+
+				<SidebarMenu className="w-full items-center gap-1" data-testid="app-sidebar-agent-tiles">
+					<DndContext
+						sensors={sensors}
+						collisionDetection={closestCenter}
+						modifiers={RAIL_DND_MODIFIERS}
+						onDragStart={beginRailDragGesture}
+						onDragCancel={() => {
+							if (dragStartRailAgents.current) {
+								setRailAgentsOrder(dragStartRailAgents.current);
+							} else {
+								setRailAgentsOrder([...agents].sort(compareAgentTiles));
+							}
+							dragStartRailAgents.current = null;
+						}}
+						onDragOver={onDragOver}
+						onDragEnd={onDragEnd}
+					>
+						<SortableContext items={orderedAgentIds} strategy={verticalListSortingStrategy}>
+							{orderedAgents.map((agent) => (
+								<SortableAgentRailItem
+									key={agent.id}
+									agent={agent}
+									active={Boolean(activeAgentId && agentTileMatchesRouteId(agent, activeAgentId))}
+									onNavigate={onNavigate}
+									showTooltip={showTooltips}
+								/>
+							))}
+						</SortableContext>
+					</DndContext>
+					{loadState === "loading" ? <AgentRailLoadingSlots /> : null}
+					{loadState === "unavailable" ? (
+						<AgentRailUnavailableSlot onRetry={onRetry} showTooltip={showTooltips} />
+					) : null}
+					<ReadyNewAgentButton showTooltips={showTooltips} onNavigate={onNavigate} />
+				</SidebarMenu>
+			</SidebarContent>
+		</>
+	);
+}
+
+function agentVersionLabel(version: string | null | undefined): string | null {
+	const trimmed = version?.trim();
+	if (!trimmed) return null;
+	return trimmed.startsWith("v") ? trimmed : `v${trimmed}`;
+}
+
+function agentHeaderMeta(
+	agent: SidebarEnvironment,
+	kind: AgentChromeKind,
+): {
+	visibleLabel: string;
+	detailLabel: string;
+	activityLabel: string;
+} {
+	const sourceDetail =
+		kind === "cloud" ? agentSourceKindLabel("hosted") : kind === "legacy" ? "Legacy" : null;
+	// Legacy v1 agents run in a hosted runtime image too, so both hosted
+	// kinds get the "runtime" suffix.
+	const runtime = kind === "legacy";
+	const typeLabel = agentTypeLabel(agent.agent_type);
+	const version = agentVersionLabel(agent.agent_version);
+	const relativeSeen = agent.last_seen_at ? relativeTime(agent.last_seen_at) : null;
+	const activityLabel = relativeSeen ? `last seen ${relativeSeen}` : "never seen";
+	const visible = [runtime ? `${typeLabel} runtime` : typeLabel, agent.os?.trim() || null].filter(
+		(item): item is string => Boolean(item),
+	);
+	const detail = [
+		sourceDetail,
+		runtime ? `${typeLabel} runtime` : typeLabel,
+		version,
+		agent.os?.trim() || null,
+	].filter((item): item is string => Boolean(item));
+	return { visibleLabel: visible.join(" · "), detailLabel: detail.join(" · "), activityLabel };
+}
+
+export function focusHeaderSyncSource(
+	kind: AgentChromeKind,
+	hasEnvironment: boolean,
+): DaemonStatusSource | null {
+	if (!hasEnvironment || kind === "unresolved") return null;
+	if (kind === "cloud") return null;
+	return kind === "connected" ? "self-managed" : "on-clawdi";
+}
+
+export function focusHeaderComputeStatus(
+	kind: AgentChromeKind,
+	tile: AgentTile | null,
+): AgentCardStatusProjection["visual"] | null {
+	return kind === "cloud" ? (tile?.cardStatus?.visual ?? null) : null;
+}
+
+const FOCUS_HEADER_STATUS_CLASS = "mt-2 flex min-w-0 items-center gap-2 text-xs leading-4";
+
+function FocusHeader({
+	activeAgent,
+	activeAgentTile,
+	activeAgentKind,
+	activeAgentId,
+	activeAgentName,
+}: {
+	activeAgent: SidebarEnvironment | null;
+	activeAgentTile: AgentTile | null;
+	activeAgentKind: AgentChromeKind;
+	activeAgentId: string | null;
+	activeAgentName: string | null;
+}) {
+	const { legacyDashboardUrl } = useProductAccess();
+	if (!activeAgent && !activeAgentId) {
+		return (
+			<div className="min-w-0">
+				<div className="truncate text-sm font-semibold leading-5">Console</div>
+				<div className="truncate text-xs leading-4 text-muted-foreground">Library and agents</div>
+			</div>
+		);
+	}
+
+	if (activeAgentKind === "unresolved") {
+		return (
+			<div className="min-w-0 space-y-2" role="status" aria-label="Agent ownership loading">
+				<Skeleton className="h-4 w-32" />
+				<Skeleton className="h-3 w-24" />
+				<Skeleton className="h-4 w-20" />
+			</div>
+		);
+	}
+
+	if (!activeAgent && !activeAgentTile) {
+		return (
+			<div className="min-w-0">
+				<div className="truncate text-sm font-semibold leading-5">Agent not found</div>
+				<div className="truncate text-xs leading-4 text-muted-foreground">
+					No details are available
+				</div>
+			</div>
+		);
+	}
+
+	const name = activeAgentName ?? "Agent";
+	const meta = activeAgent ? agentHeaderMeta(activeAgent, activeAgentKind) : null;
+	const activityLabel =
+		activeAgentKind === "cloud" ? null : (meta?.activityLabel ?? "Agent details unavailable");
+	const visibleLabel = meta?.visibleLabel;
+	const detailLabel = meta?.detailLabel;
+	const manageHref = activeAgentKind === "legacy" ? (legacyDashboardUrl ?? undefined) : undefined;
+	const syncSource = focusHeaderSyncSource(activeAgentKind, Boolean(activeAgent));
+	const computeStatus = focusHeaderComputeStatus(activeAgentKind, activeAgentTile);
+	return (
+		<div className="min-w-0 text-left">
+			<div className="flex min-w-0 items-center gap-2" title={name}>
+				<span className="truncate text-sm font-semibold leading-5">{name}</span>
+				{activeAgentKind === "cloud" ? (
+					activeAgent ? (
+						<AgentSourceBadgeForEnvironment
+							env={activeAgent}
+							ownershipKind={activeAgentKind}
+							compact
+						/>
+					) : (
+						<AgentSourceBadge source="hosted" compact />
+					)
+				) : activeAgentKind === "legacy" ? (
+					<LegacyAgentBadge compact />
+				) : null}
+			</div>
+			{visibleLabel ? (
+				<div className="mt-1 truncate text-xs leading-4 text-muted-foreground" title={detailLabel}>
+					{visibleLabel}
+				</div>
+			) : null}
+			{computeStatus ? (
+				<div
+					data-testid="app-sidebar-agent-status"
+					data-agent-status-source="hosted"
+					className={FOCUS_HEADER_STATUS_CLASS}
+					title={computeStatus.tooltip}
+				>
+					<StatusDot className={computeStatus.dotClass} />
+					<span className="truncate font-medium">{computeStatus.label}</span>
+				</div>
+			) : activeAgent && syncSource ? (
+				<div
+					data-testid="app-sidebar-agent-status"
+					data-agent-status-source="connected"
+					className={cn(FOCUS_HEADER_STATUS_CLASS, "justify-between")}
+				>
+					{/* Cloud and legacy agents use supervised-runtime copy. Legacy
+					 * remediation stays in v1 when that dashboard is configured. */}
+					<DaemonStatusBadge
+						env={activeAgent}
+						source={syncSource}
+						manageHref={manageHref}
+						compact
+						tooltipDetail={detailLabel}
+					/>
+					<span
+						className="min-w-0 truncate text-muted-foreground"
+						title={activityLabel ?? undefined}
+					>
+						{activityLabel}
+					</span>
+				</div>
+			) : activeAgentKind !== "cloud" ? (
+				<div
+					data-testid="app-sidebar-agent-status"
+					data-agent-status-source="fallback"
+					className={FOCUS_HEADER_STATUS_CLASS}
+				>
+					<FocusStatusFallback />
+				</div>
+			) : null}
+		</div>
+	);
+}
+
+function FocusStatusFallback() {
+	return (
+		<span className="inline-flex items-center gap-1.5 whitespace-nowrap text-muted-foreground">
+			<StatusDot className="border border-muted-foreground/50 bg-transparent" />
+			<span>Status</span>
+		</span>
+	);
+}
+
+function RailSidebar({
+	agents,
+	loadState,
+	onRetry,
+	activeAgentId,
+}: {
+	agents: AgentTile[];
+	loadState: AgentRailLoadState;
+	onRetry: (() => void) | null;
+	activeAgentId: string | null;
+}) {
+	return (
+		<Sidebar
+			collapsible="none"
+			style={{ "--sidebar-width": "var(--clawdi-rail-width)" } as React.CSSProperties}
+			className="sticky top-0 z-20 hidden h-svh shrink-0 border-r bg-sidebar/95 md:flex"
+			aria-label="Focus rail"
+			data-testid="app-sidebar-agent-rail"
+		>
+			<FocusRailContent
+				agents={agents}
+				loadState={loadState}
+				onRetry={onRetry}
+				activeAgentId={activeAgentId}
+			/>
+		</Sidebar>
+	);
+}
+
+function GitHubIcon({ className, ...props }: React.ComponentProps<"svg">) {
+	return (
+		<svg
+			viewBox="0 0 24 24"
+			fill="currentColor"
+			aria-hidden="true"
+			className={className}
+			{...props}
+		>
+			<path d="M12 .297c-6.63 0-12 5.373-12 12 0 5.303 3.438 9.8 8.205 11.385.6.113.82-.258.82-.577 0-.285-.01-1.04-.015-2.04-3.338.724-4.042-1.61-4.042-1.61-.546-1.387-1.333-1.757-1.333-1.757-1.09-.745.083-.729.083-.729 1.205.085 1.84 1.237 1.84 1.237 1.07 1.835 2.807 1.305 3.492.997.108-.775.418-1.305.762-1.605-2.665-.3-5.466-1.332-5.466-5.93 0-1.31.468-2.382 1.235-3.222-.123-.303-.535-1.523.118-3.176 0 0 1.008-.322 3.3 1.23.957-.266 1.983-.399 3.003-.404 1.02.005 2.047.138 3.006.404 2.29-1.552 3.296-1.23 3.296-1.23.655 1.653.243 2.873.12 3.176.77.84 1.233 1.912 1.233 3.222 0 4.61-2.805 5.625-5.475 5.922.43.372.823 1.103.823 2.222 0 1.605-.015 2.898-.015 3.293 0 .322.216.694.825.576C20.565 22.092 24 17.592 24 12.297c0-6.627-5.373-12-12-12" />
+		</svg>
+	);
+}
+
+function HelpMenuItems() {
+	return (
+		<DropdownMenuGroup>
+			{ChatwootLiveChatMenuItem ? (
+				<Suspense fallback={null}>
+					<ChatwootLiveChatMenuItem />
+				</Suspense>
+			) : null}
+			<DropdownMenuItem
+				render={
+					<a
+						href={DESTINATIONS.docsUrl}
+						target="_blank"
+						rel="noopener noreferrer"
+						aria-label="Open Docs"
+					/>
+				}
+			>
+				<BookOpen />
+				Docs
+				<ExternalLink className="ml-auto size-3.5 text-muted-foreground" />
+			</DropdownMenuItem>
+			<DropdownMenuItem
+				render={
+					<a
+						href={DESTINATIONS.githubUrl}
+						target="_blank"
+						rel="noopener noreferrer"
+						aria-label="Open GitHub"
+					/>
+				}
+			>
+				<GitHubIcon />
+				GitHub
+				<ExternalLink className="ml-auto size-3.5 text-muted-foreground" />
+			</DropdownMenuItem>
+			<DropdownMenuItem
+				render={<a href={`mailto:${DESTINATIONS.supportEmail}`} aria-label="Email support" />}
+			>
+				<Mail />
+				{DESTINATIONS.supportEmail}
+			</DropdownMenuItem>
+		</DropdownMenuGroup>
+	);
+}
+
+function GlobalControlButton({
+	label,
+	children,
+	onClick,
+	disabled = false,
+	active = false,
+	tooltipSide = "top",
+	showTooltip = true,
+}: {
+	label: string;
+	children: React.ReactNode;
+	onClick?: () => void;
+	disabled?: boolean;
+	active?: boolean;
+	tooltipSide?: "right" | "top";
+	showTooltip?: boolean;
+}) {
+	const button = (
+		<Button
+			type="button"
+			variant={active ? "secondary" : "ghost"}
+			size="icon-lg"
+			onClick={onClick}
+			disabled={disabled}
+			aria-label={label}
+			aria-pressed={active}
+			data-testid={`app-sidebar-${label.toLowerCase()}-button`}
+			className={cn("rounded-lg", active && "ring-2 ring-ring/40")}
+		>
+			{children}
+		</Button>
+	);
+	if (!showTooltip) return button;
+	return (
+		<Tooltip>
+			<TooltipTrigger render={button} />
+			<TooltipContent side={tooltipSide}>{label}</TooltipContent>
+		</Tooltip>
+	);
+}
+
+function HelpControl({
+	disabled = false,
+	showTooltip = true,
+}: {
+	disabled?: boolean;
+	showTooltip?: boolean;
+}) {
+	const trigger = (
+		<DropdownMenuTrigger
+			render={
+				<Button
+					type="button"
+					variant="ghost"
+					size="icon-lg"
+					disabled={disabled}
+					aria-label="Help"
+					data-testid="app-sidebar-help-menu-button"
+					className="rounded-lg"
+				/>
+			}
+		>
+			<CircleHelp />
+		</DropdownMenuTrigger>
+	);
+	return (
+		<DropdownMenu>
+			{showTooltip ? (
+				<Tooltip>
+					<TooltipTrigger render={trigger} />
+					<TooltipContent side="top">Help</TooltipContent>
+				</Tooltip>
+			) : (
+				trigger
+			)}
+			<DropdownMenuContent side="top" align="start" className="min-w-56">
+				<HelpMenuItems />
+			</DropdownMenuContent>
+		</DropdownMenu>
+	);
+}
+
+function UserControl({
+	user,
+	disabled = false,
+	showTooltip = true,
+}: {
+	user: ReturnType<typeof useCurrentUser>["user"];
+	disabled?: boolean;
+	showTooltip?: boolean;
+}) {
+	const initial = user?.fullName?.[0] ?? user?.primaryEmailAddress?.emailAddress?.[0] ?? "U";
+	const trigger = (
+		<DropdownMenuTrigger
+			render={
+				<Button
+					type="button"
+					variant="ghost"
+					size="icon-lg"
+					disabled={disabled}
+					className="rounded-lg"
+					aria-label="User menu"
+					data-testid="app-sidebar-user-menu-button"
+				/>
+			}
+		>
+			<Avatar className="size-8 rounded-md">
+				{user?.imageUrl ? <AvatarImage src={user.imageUrl} alt={user.fullName ?? ""} /> : null}
+				<AvatarFallback className="rounded-md">{initial}</AvatarFallback>
+			</Avatar>
+		</DropdownMenuTrigger>
+	);
+	return (
+		<DropdownMenu>
+			{showTooltip ? (
+				<Tooltip>
+					<TooltipTrigger render={trigger} />
+					<TooltipContent side="top">User menu</TooltipContent>
+				</Tooltip>
+			) : (
+				trigger
+			)}
+			<DropdownMenuContent className="min-w-56 rounded-lg" side="top" align="start">
+				<UserMenuItems />
+			</DropdownMenuContent>
+		</DropdownMenu>
+	);
+}
+
+function GlobalControls({
+	user,
+	controlsReady,
+	onSearch,
+	onSettings,
+	settingsOpen,
+	showTooltips = true,
+}: {
+	user: ReturnType<typeof useCurrentUser>["user"];
+	controlsReady: boolean;
+	onSearch: () => void;
+	onSettings: () => void;
+	settingsOpen: boolean;
+	showTooltips?: boolean;
+}) {
+	const settingsIdentity = CANONICAL_NAVIGATION_IDENTITIES.settings;
+	const SettingsIcon = settingsIdentity.icon;
+	return (
+		<SidebarMenu className="w-full flex-row items-center gap-1">
+			<SidebarMenuItem>
+				<UserControl user={user} disabled={!controlsReady} showTooltip={showTooltips} />
+			</SidebarMenuItem>
+			<SidebarMenuItem className="ml-auto">
+				<GlobalControlButton
+					label="Search"
+					onClick={onSearch}
+					disabled={!controlsReady}
+					showTooltip={showTooltips}
+				>
+					<Search />
+				</GlobalControlButton>
+			</SidebarMenuItem>
+			<SidebarMenuItem>
+				<HelpControl disabled={!controlsReady} showTooltip={showTooltips} />
+			</SidebarMenuItem>
+			<SidebarMenuItem>
+				<GlobalControlButton
+					label={settingsIdentity.label}
+					onClick={onSettings}
+					disabled={!controlsReady}
+					active={settingsOpen}
+					showTooltip={showTooltips}
+				>
+					<SettingsIcon />
+				</GlobalControlButton>
+			</SidebarMenuItem>
+		</SidebarMenu>
+	);
+}
+
+function SidebarGlobalControlsBar({
+	user,
+	controlsReady,
+	onSearch,
+	onSettings,
+	settingsOpen,
+	showTooltips = true,
+	mobile = false,
+	collapsed = false,
+}: {
+	user: ReturnType<typeof useCurrentUser>["user"];
+	controlsReady: boolean;
+	onSearch: () => void;
+	onSettings: () => void;
+	settingsOpen: boolean;
+	showTooltips?: boolean;
+	mobile?: boolean;
+	collapsed?: boolean;
+}) {
+	if (!mobile && collapsed) return null;
+	return (
+		<div
+			data-sidebar="global-controls"
+			data-testid="app-sidebar-global-controls"
+			className={cn(
+				"z-30 items-center border-border border-t bg-sidebar px-3 text-sidebar-foreground",
+				mobile
+					? "absolute inset-x-0 bottom-0 flex h-[calc(var(--header-height)+env(safe-area-inset-bottom))] pb-[env(safe-area-inset-bottom)]"
+					: "fixed bottom-0 left-0 hidden h-(--header-height) w-[calc(var(--clawdi-rail-width)+var(--sidebar-width))] md:flex",
+			)}
+		>
+			<GlobalControls
+				user={user}
+				controlsReady={controlsReady}
+				onSearch={onSearch}
+				onSettings={onSettings}
+				settingsOpen={settingsOpen}
+				showTooltips={showTooltips}
+			/>
+		</div>
+	);
+}
+
+function ReadyNewAgentButton({
+	showTooltips,
+	onNavigate,
+}: {
+	showTooltips: boolean;
+	onNavigate?: () => void;
+}) {
+	return useAccountDataIdentity() ? (
+		<NewAgentButton compact showTooltip={showTooltips} onNavigate={onNavigate} />
+	) : null;
+}
+
+export function AppSidebar({
+	className,
+	variant,
+	style,
+	...props
+}: React.ComponentProps<typeof Sidebar>) {
+	const router = useRouter();
+	const pathname = useLocation({ select: (location) => location.pathname });
+	const routeSearch = useSearch({ from: "/_protected/_dashboard" });
+	const ready = Boolean(useAccountDataIdentity());
+	// iforge (06.3 L1): a billing-locked shell sends no gated /v1 request (they
+	// would only answer 403 billing_required). UX only; the server enforces.
+	const billingLocked = useBillingLocked();
+	const { user: currentUser } = useCurrentUser();
+	const user = ready ? currentUser : null;
+	const { setOpen: setPaletteOpen } = useCommandPalette();
+	const { isMobile, setOpenMobile, state: sidebarState } = useSidebar();
+	const $api = useOpenApi();
+	const hostedAccess = useProductAccess();
+	const hydrated = useHydrated() && ready;
+	const [hostedAgentTiles, setHostedAgentTiles] = useState<AgentTile[] | null>(null);
+	const [hostedMembershipResolved, setHostedMembershipResolved] = useState(false);
+	const [hostedInventoryFetching, setHostedInventoryFetching] = useState(false);
+	const [hostedInventoryUnavailable, setHostedInventoryUnavailable] = useState(false);
+	const [retryHostedInventory, setRetryHostedInventory] = useState<(() => void) | null>(null);
+	const updateHostedAgentList = useCallback(
+		(
+			tiles: AgentTile[] | null,
+			membershipResolved: boolean,
+			inventoryFetching: boolean,
+			inventoryUnavailable: boolean,
+			retry: (() => void) | null,
+		) => {
+			setHostedAgentTiles(tiles);
+			setHostedMembershipResolved(membershipResolved);
+			setHostedInventoryFetching(inventoryFetching);
+			setHostedInventoryUnavailable(inventoryUnavailable);
+			// Wrapped: a bare function passed to a state setter would be called as an updater.
+			setRetryHostedInventory(() => retry);
+		},
+		[],
+	);
+	const showCloudFeatures = hydrated && IS_HOSTED && hostedAccess.canCreateCloudAgents;
+	const agentRoute = parseAgentPathname(pathname);
+	const activeAgentId = agentRoute?.agentId ?? null;
+	const { data: environments } = $api.useQuery(
+		"get",
+		"/v1/agents",
+		{},
+		{
+			enabled: ready && !billingLocked, // iforge (06.3 L1)
+			refetchInterval: activeAgentId ? 10_000 : false,
+			refetchIntervalInBackground: false,
+		},
+	);
+	const hydratedEnvironments = hydrated ? environments : undefined;
+	const selfManagedTiles = useMemo(
+		() => selfManagedAgentTiles(hydratedEnvironments),
+		[hydratedEnvironments],
+	);
+	const unifiedAgentListEnabled = hydrated && Boolean(HostedUnifiedAgentListSensor);
+	const agentsLoaded = unifiedAgentListEnabled
+		? hostedAgentTiles !== null && hostedMembershipResolved
+		: hydratedEnvironments !== undefined;
+	const agents = unifiedAgentListEnabled ? (hostedAgentTiles ?? []) : selfManagedTiles;
+	const agentRailState = agentRailLoadState({
+		agentsLoaded,
+		agentCount: agents.length,
+		billingLocked,
+		inventoryUnavailable: unifiedAgentListEnabled && hostedInventoryUnavailable,
+	});
+	const activeAgentTile = activeAgentId
+		? (agents.find((tile) => agentTileMatchesRouteId(tile, activeAgentId)) ?? null)
+		: null;
+	const activeAgent = activeAgentId
+		? (hydratedEnvironments?.find((env) => env.id === activeAgentId) ?? null)
+		: null;
+	const defaultProjectBindings = useAgentProjectBindings(activeAgent?.id, {
+		enabled: hydrated && Boolean(activeAgent?.default_project_id) && !billingLocked, // iforge (06.3 L1)
+	});
+	const navigableProjects = $api.useQuery(
+		"get",
+		"/v1/projects",
+		{},
+		// iforge (06.3 L1)
+		{ enabled: hydrated && Boolean(activeAgent?.default_project_id) && !billingLocked },
+	);
+	const resolvedPrimaryProject =
+		defaultProjectBindings.isLoading ||
+		defaultProjectBindings.error ||
+		navigableProjects.isLoading ||
+		navigableProjects.error
+			? null
+			: resolveAgentDefaultProject(
+					defaultProjectBindings.data ?? [],
+					navigableProjects.data ?? [],
+					activeAgent?.default_project_id,
+				);
+	const primaryProject = resolvedPrimaryProject
+		? {
+				id: resolvedPrimaryProject.id,
+				contextProjectIds: (defaultProjectBindings.data ?? [])
+					.filter((binding) => binding.binding_type === "context")
+					.map((binding) => binding.project_id),
+			}
+		: null;
+	const classifiedActiveAgentKind = useAgentChromeKind(activeAgent, activeAgentTile);
+	const activeAgentKind =
+		activeAgentTile || !activeAgentId || (agentsLoaded && !hostedInventoryFetching)
+			? classifiedActiveAgentKind
+			: "unresolved";
+	const activeAgentName =
+		activeAgentTile?.name ??
+		(activeAgentKind === "connected" && activeAgent ? agentDisplayName(activeAgent) : null);
+	useSetBreadcrumbSegmentTitle(
+		activeAgentId ? agentSectionHref(activeAgentId) : null,
+		activeAgentName,
+	);
+	const activeSection = agentRoute?.section ?? "overview";
+	const settingsSection = routeSearch.settings ?? null;
+	const settingsOpen = settingsSection !== null;
+	const activeSettingsSection = settingsSection ?? DEFAULT_SETTINGS_SECTION;
+	const setSettingsSection = (section: SettingsSectionId | null) =>
+		router.navigate({
+			to: ".",
+			search: (current) => ({ ...current, settings: section ?? undefined }),
+			hash: true,
+			replace: true,
+			resetScroll: false,
+		});
+	const openSettings = () => {
+		void setSettingsSection(settingsSection ?? DEFAULT_SETTINGS_SECTION);
+	};
+	const changeSettingsSection = (section: SettingsSectionId) => {
+		void setSettingsSection(section);
+	};
+	const setSettingsOpen = (nextOpen: boolean) => {
+		if (nextOpen) {
+			openSettings();
+			return;
+		}
+		void setSettingsSection(null);
+	};
+	const closeMobileSidebar = () => setOpenMobile(false);
+	const openSearch = () => {
+		closeMobileSidebar();
+		setPaletteOpen(true);
+	};
+	const openSettingsFromSidebar = () => {
+		closeMobileSidebar();
+		openSettings();
+	};
+
+	return (
+		<>
+			{unifiedAgentListEnabled &&
+			hydratedEnvironments !== undefined &&
+			HostedUnifiedAgentListSensor ? (
+				<Suspense fallback={null}>
+					<HostedUnifiedAgentListSensor
+						cloudEnvs={hydratedEnvironments ?? EMPTY_SIDEBAR_ENVIRONMENTS}
+						showCloudDeployments
+						showLegacyAgents={hostedAccess.canUseLegacyHostedDashboard}
+						onChange={updateHostedAgentList}
+					/>
+				</Suspense>
+			) : null}
+			{!isMobile ? (
+				<RailSidebar
+					agents={agents}
+					loadState={agentRailState}
+					onRetry={retryHostedInventory}
+					activeAgentId={activeAgentId}
+				/>
+			) : null}
+			<Sidebar
+				collapsible="offcanvas"
+				variant={variant}
+				data-testid="app-sidebar"
+				style={style}
+				className={cn(
+					"data-[side=left]:left-[var(--clawdi-rail-width)] data-[side=left]:group-data-[collapsible=offcanvas]:left-[calc(var(--sidebar-width)*-1)]",
+					className,
+				)}
+				{...props}
+			>
+				{!isMobile ? (
+					<FocusNavigationPane
+						pathname={pathname}
+						showCloudFeatures={showCloudFeatures}
+						activeAgentId={activeAgentId}
+						activeAgent={activeAgent ?? null}
+						activeAgentTile={activeAgentTile}
+						activeAgentKind={activeAgentKind}
+						activeAgentName={activeAgentName}
+						agentsLoaded={agentsLoaded}
+						activeSection={activeSection}
+						primaryProject={primaryProject}
+					/>
+				) : null}
+
+				{isMobile ? (
+					<div
+						className="relative flex min-h-0 flex-1"
+						style={
+							{
+								"--clawdi-rail-width": "calc(var(--spacing) * 20)",
+								"--header-height": "calc(var(--spacing) * 12)",
+							} as React.CSSProperties
+						}
+					>
+						<nav
+							className="flex w-(--clawdi-rail-width) shrink-0 flex-col border-r bg-sidebar/95"
+							aria-label="Focus rail"
+						>
+							<FocusRailContent
+								agents={agents}
+								loadState={agentRailState}
+								onRetry={retryHostedInventory}
+								activeAgentId={activeAgentId}
+								onNavigate={closeMobileSidebar}
+								showTooltips={false}
+							/>
+						</nav>
+						<FocusNavigationPane
+							className="min-w-0"
+							pathname={pathname}
+							showCloudFeatures={showCloudFeatures}
+							activeAgentId={activeAgentId}
+							activeAgent={activeAgent ?? null}
+							activeAgentTile={activeAgentTile}
+							activeAgentKind={activeAgentKind}
+							activeAgentName={activeAgentName}
+							agentsLoaded={agentsLoaded}
+							activeSection={activeSection}
+							primaryProject={primaryProject}
+							onNavigate={closeMobileSidebar}
+						/>
+						<SidebarGlobalControlsBar
+							user={user}
+							controlsReady={hydrated}
+							onSearch={openSearch}
+							onSettings={openSettingsFromSidebar}
+							settingsOpen={settingsOpen}
+							showTooltips={false}
+							mobile
+						/>
+					</div>
+				) : null}
+			</Sidebar>
+			{!isMobile ? (
+				<SidebarGlobalControlsBar
+					user={user}
+					controlsReady={hydrated}
+					onSearch={openSearch}
+					onSettings={openSettingsFromSidebar}
+					settingsOpen={settingsOpen}
+					collapsed={sidebarState === "collapsed"}
+				/>
+			) : null}
+			{ready ? (
+				<SettingsDialog
+					open={settingsOpen}
+					section={activeSettingsSection}
+					agentTiles={agents}
+					hasExistingCloudAgents={
+						hostedAgentTiles?.some((tile) => tile.source === "on-clawdi") ?? false
+					}
+					cloudInventoryResolved={agentsLoaded}
+					cloudInventoryUnavailable={unifiedAgentListEnabled && hostedInventoryUnavailable} // iforge (06.1 UI-REVIEW)
+					onRetryCloudInventory={retryHostedInventory} // iforge (06.1 UI-REVIEW)
+					onSectionChange={changeSettingsSection}
+					onOpenChange={setSettingsOpen}
+				/>
+			) : null}
+		</>
+	);
+}

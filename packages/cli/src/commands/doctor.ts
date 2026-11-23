@@ -1,0 +1,200 @@
+import { existsSync, readdirSync } from "node:fs";
+import { join } from "node:path";
+import chalk from "chalk";
+import type { AgentAdapter } from "../adapters/base";
+import { adapterRegistry, allAdapterEntries } from "../adapters/registry";
+import { ApiClient, ApiError, unwrap } from "../lib/api-client";
+import { getAuth, getClawdiDir, getConfig, isLoggedIn } from "../lib/config";
+
+interface Check {
+	name: string;
+	ok: boolean;
+	detail?: string;
+	hint?: string;
+}
+
+interface JsonRpcResponse {
+	jsonrpc?: unknown;
+	id?: unknown;
+	result?: unknown;
+	error?: unknown;
+}
+
+async function checkAuth(): Promise<Check> {
+	const auth = getAuth();
+	if (!auth) {
+		return {
+			name: "Auth",
+			ok: false,
+			detail: "not logged in",
+			hint: "Run `iforge auth login`",
+		};
+	}
+	return {
+		name: "Auth",
+		ok: true,
+		detail: auth.email || auth.userId || "logged in",
+	};
+}
+
+async function checkApiReachable(): Promise<Check> {
+	const config = getConfig();
+	if (!isLoggedIn()) {
+		return { name: "API reachability", ok: false, detail: "skipped (not logged in)" };
+	}
+	try {
+		const api = new ApiClient();
+		unwrap(await api.GET("/v1/auth/me"));
+		return { name: "API reachability", ok: true, detail: config.apiUrl };
+	} catch (e) {
+		const msg =
+			e instanceof ApiError ? `${config.apiUrl} → ${e.status || "network error"}` : String(e);
+		return {
+			name: "API reachability",
+			ok: false,
+			detail: msg,
+			hint: e instanceof ApiError ? e.hint : "Check IFORGE_API_URL",
+		};
+	}
+}
+
+async function checkAgents(): Promise<Check[]> {
+	const adapters: AgentAdapter[] = allAdapterEntries().map((entry) => entry.create());
+	const results: Check[] = [];
+	for (const a of adapters) {
+		const label = adapterRegistry[a.agentType].displayName;
+		const detected = await a.detect();
+		if (!detected) {
+			results.push({ name: `Agent: ${label}`, ok: false, detail: "not installed" });
+			continue;
+		}
+		const version = await a.getVersion();
+		results.push({
+			name: `Agent: ${label}`,
+			ok: true,
+			detail: version ?? "detected",
+		});
+	}
+	return results;
+}
+
+function checkRegisteredEnvs(): Check {
+	const envDir = join(getClawdiDir(), "environments");
+	if (!existsSync(envDir)) {
+		return {
+			name: "Environments",
+			ok: false,
+			detail: "none registered",
+			hint: "Run `iforge setup` to register this machine",
+		};
+	}
+	const files = readdirSync(envDir).filter((f) => f.endsWith(".json"));
+	if (files.length === 0) {
+		return {
+			name: "Environments",
+			ok: false,
+			detail: "none registered",
+			hint: "Run `iforge setup`",
+		};
+	}
+	return {
+		name: "Environments",
+		ok: true,
+		detail: files.map((f) => f.slice(0, -".json".length)).join(", "),
+	};
+}
+
+async function checkVault(): Promise<Check> {
+	if (!isLoggedIn()) {
+		return { name: "Vault metadata", ok: false, detail: "skipped (not logged in)" };
+	}
+	try {
+		const api = new ApiClient();
+		const page = unwrap(
+			await api.GET("/v1/vault", {
+				params: { query: { page_size: 1 } },
+			}),
+		);
+		return {
+			name: "Vault metadata",
+			ok: true,
+			detail: `${page.total} vault${page.total === 1 ? "" : "s"} reachable`,
+		};
+	} catch (e) {
+		return {
+			name: "Vault metadata",
+			ok: false,
+			detail: e instanceof ApiError ? `status ${e.status}` : String(e),
+			hint: e instanceof ApiError ? e.hint : undefined,
+		};
+	}
+}
+
+async function checkMcp(): Promise<Check> {
+	if (!isLoggedIn()) {
+		return { name: "Clawdi MCP", ok: false, detail: "skipped (not logged in)" };
+	}
+	try {
+		const api = new ApiClient();
+		const response = await api.postJsonBody<JsonRpcResponse>("/v1/mcp/clawdi", {
+			jsonrpc: "2.0",
+			id: 1,
+			method: "ping",
+			params: {},
+		});
+		if (
+			response.jsonrpc !== "2.0" ||
+			response.id !== 1 ||
+			!("result" in response) ||
+			response.error !== undefined
+		) {
+			throw new Error("invalid JSON-RPC response");
+		}
+		return { name: "Clawdi MCP", ok: true, detail: "endpoint reachable" };
+	} catch (e) {
+		return {
+			name: "Clawdi MCP",
+			ok: false,
+			detail: e instanceof ApiError ? `status ${e.status}` : String(e),
+			hint: e instanceof ApiError ? e.hint : undefined,
+		};
+	}
+}
+
+export async function doctor(opts: { json?: boolean } = {}) {
+	const checks: Check[] = [];
+	checks.push(await checkAuth());
+	checks.push(await checkApiReachable());
+	checks.push(...(await checkAgents()));
+	checks.push(checkRegisteredEnvs());
+	checks.push(await checkVault());
+	checks.push(await checkMcp());
+
+	const failed = checks.filter((c) => !c.ok).length;
+
+	if (opts.json || !process.stdout.isTTY) {
+		console.log(JSON.stringify(checks, null, 2));
+		if (failed > 0) process.exitCode = 1;
+		return;
+	}
+
+	console.log(chalk.bold("iforge doctor"));
+	console.log();
+	for (const c of checks) {
+		const icon = c.ok ? chalk.green("✓") : chalk.red("✗");
+		const name = c.ok ? chalk.white(c.name) : chalk.red(c.name);
+		const detail = c.detail ? chalk.gray(` — ${c.detail}`) : "";
+		console.log(`  ${icon} ${name}${detail}`);
+		if (!c.ok && c.hint) {
+			console.log(chalk.gray(`     ${c.hint}`));
+		}
+	}
+	console.log();
+
+	if (failed === 0) {
+		console.log(chalk.green("All checks passed."));
+	} else {
+		console.log(chalk.yellow(`${failed} check${failed === 1 ? "" : "s"} failed.`));
+		process.exitCode = 1;
+	}
+}

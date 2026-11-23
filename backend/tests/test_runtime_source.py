@@ -1,0 +1,2006 @@
+from __future__ import annotations
+
+import json
+from datetime import UTC, datetime
+from pathlib import Path
+from uuid import UUID, uuid4
+
+import pytest
+from pydantic import ValidationError
+
+import app.schemas.runtime as runtime_schemas
+from app.core.companion_registry import COMPANION_REGISTRY, CompanionRegistryEntry
+from app.models.agent_plugin import AgentPluginInstallation
+from app.models.ai_provider import AiProvider, AiProviderAuthPayload
+from app.models.channel import (
+    ChannelAccount,
+    ChannelAgentCredential,
+    ChannelBotAgentLink,
+    ChannelWhatsAppAuthCert,
+)
+from app.models.hosted_runtime import (
+    HostedRuntimeConfigObservation,
+    HostedRuntimeSecret,
+    HostedRuntimeState,
+)
+from app.models.session import AgentEnvironment
+from app.schemas.native_provider import native_provider
+from app.schemas.runtime import HostedCodexProviderProjection
+from app.services.channels import channel_runtime_account_key, channel_runtime_placeholder_token
+from app.services.managed_ai_provider import (
+    CLAWDI_MANAGED_PROVIDER_ID,
+    V2_LEGACY_MANAGED_AI_PROVIDER_ID,
+    V2_LEGACY_PUBLIC_MANAGED_AI_PROVIDER_ID,
+    V2_MANAGED_AI_PROVIDER_ID,
+)
+from app.services.runtime_source import (
+    RUNTIME_SOURCE_RENDERER_REVISION,
+    CompanionEmitDecision,
+    CompanionEmitOmission,
+    RuntimeSourceBatch,
+    RuntimeSourceError,
+    RuntimeSourceRow,
+    _gate_companion_kinds,
+    _project_agent_plugins,
+    expected_runtime_bundle_v2_etag,
+    render_runtime_bundle,
+    render_runtime_source,
+)
+from tests.hosted_runtime_fixtures import CANONICAL_CODEX_TOOL_PROVIDER_ID, filebrowser_companion
+
+USER_ID = UUID("10000000-0000-0000-0000-000000000001")
+ENV_ID = UUID("20000000-0000-0000-0000-000000000002")
+PROVIDER_ROW_ID = UUID("30000000-0000-0000-0000-000000000003")
+AUTH_ROW_ID = UUID("40000000-0000-0000-0000-000000000004")
+ACCOUNT_ID = UUID("50000000-0000-0000-0000-000000000005")
+LINK_ID = UUID("60000000-0000-0000-0000-000000000006")
+PREFIX_COLLISION_ACCOUNT_ID = UUID("50000000-0000-ffff-0000-000000000007")
+PREFIX_COLLISION_LINK_ID = UUID("60000000-0000-0000-0000-000000000008")
+AUTH_TOKEN_SECRET_ID = UUID("70000000-0000-0000-0000-000000000009")
+GATEWAY_TOKEN_SECRET_ID = UUID("70000000-0000-0000-0000-000000000010")
+TEST_AGENT_PLUGIN_DIGEST = f"sha256-tree-v1:{'b' * 64}"
+TEST_AGENT_PLUGIN_ID = UUID("01987b48-b641-79f2-b839-92ae5fc782fe")
+
+
+def _agent_plugin_row(
+    *,
+    package_key: str = "acme-tools",
+    installation_id: UUID = TEST_AGENT_PLUGIN_ID,
+    version: str = "1.0.0",
+    store_path: str = "v2/plugins/acme-tools",
+    content_digest: str = TEST_AGENT_PLUGIN_DIGEST,
+) -> AgentPluginInstallation:
+    return AgentPluginInstallation(
+        id=installation_id,
+        environment_id=ENV_ID,
+        plugin_name=package_key,
+        catalog_revision="a" * 40,
+        version=version,
+        agent_plugins_schema="https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+        source={
+            "type": "github",
+            "url": "https://github.com/Clawdi-AI/store",
+            "path": store_path,
+            "commit": "a" * 40,
+        },
+        content_digest=content_digest,
+    )
+
+
+def _agent_plugins(*rows: AgentPluginInstallation) -> dict[str, object]:
+    return {
+        "schemaVersion": 1,
+        "installations": {
+            row.plugin_name: {
+                "installationId": str(row.id),
+                "version": row.version,
+                "agentPluginsSchema": (row.agent_plugins_schema),
+                "source": row.source,
+                "contentDigest": row.content_digest,
+            }
+            for row in rows
+        },
+    }
+
+
+def test_agent_plugin_release_source_requires_its_independent_capability() -> None:
+    row = _agent_plugin_row()
+    row.source = {
+        "type": "github-release",
+        "url": "https://github.com/acme/plugins/releases/download/acme-v1.0.0/acme-1.0.0.tar.gz",
+        "archiveDigest": f"sha256:{'c' * 64}",
+    }
+
+    assert _project_agent_plugins((row,), include_github_release_sources=False) is None
+    projected = _project_agent_plugins((row,))
+    assert projected is not None
+    assert projected.installations[row.plugin_name].source.type == "github-release"
+
+
+def _use_agent_plugin_state(
+    batch: RuntimeSourceBatch,
+    *installations: AgentPluginInstallation,
+) -> HostedRuntimeState:
+    state = batch.rows[ENV_ID].state
+    assert state is not None
+    state.mcp = {
+        "servers": {
+            "clawdi": {"command": "clawdi", "args": ["mcp"]},
+            "workspace-tools": {"command": "node", "args": ["workspace-tools.js"]},
+        }
+    }
+    state.skills = {
+        "entries": {
+            "clawdi": {"enabled": True, "version": 1},
+            "workspace-helper": {"enabled": True, "version": 1},
+        }
+    }
+    batch.agent_plugins[ENV_ID] = installations
+    return state
+
+
+def test_runtime_bundle_v2_etag_is_derived_from_source_revision() -> None:
+    source_revision = "a" * 64
+    assert expected_runtime_bundle_v2_etag(source_revision) == f'"sha256:{source_revision}"'
+    assert expected_runtime_bundle_v2_etag("b" * 64) != expected_runtime_bundle_v2_etag(
+        source_revision
+    )
+
+
+def _batch(
+    *,
+    provider_label: str = "Primary",
+    channel_name: str = "Bot",
+    token: bytes = b"token",
+    generation: int = 2,
+    apply_generation: int | None = 1,
+) -> RuntimeSourceBatch:
+    now = datetime(2026, 7, 13, tzinfo=UTC)
+    environment = AgentEnvironment(id=ENV_ID, user_id=USER_ID)
+    state = HostedRuntimeState(
+        environment_id=ENV_ID,
+        deployment_id="dep_test",
+        instance_id="hri_test",
+        generation=generation,
+        apply_generation=apply_generation,
+        cli_package_spec="clawdi@1.2.3-test",
+        locale={"language": "en", "timezone": "UTC"},
+        system={
+            "openclawControlUiAllowedOrigins": ["https://agent.example.test"],
+            "openclawGatewayTrustedProxies": ["10.173.0.1"],
+            "openclawGatewayAuth": {
+                "mode": "token",
+                "tokenRef": "secret://runtime/openclaw/gateway-token",
+                "deviceAuthRequired": False,
+                "activation": {
+                    "enabled": True,
+                    "capability": "openclaw-native-auth-v1",
+                },
+            },
+        },
+        egress_engine={
+            "type": "mitmproxy",
+            "version": "12.2.3",
+            "url": "https://downloads.mitmproxy.org/12.2.3/mitmproxy-12.2.3-linux-x86_64.tar.gz",
+            "sha256": "2e95286b618fa6fd33e5e62a78c2e5112571d85f42ec2bac29b97ee242bdb5c5",
+        },
+        runtimes={
+            "openclaw": {
+                "enabled": True,
+                "providerMode": "configured",
+                "provider_ids": [CANONICAL_CODEX_TOOL_PROVIDER_ID],
+                "primary_model": {
+                    "provider_id": CANONICAL_CODEX_TOOL_PROVIDER_ID,
+                    "model": "gpt-test",
+                },
+                "install": {"source": "official"},
+                "run": {
+                    "args": ["gateway", "run"],
+                    "secretEnv": {
+                        "OPENCLAW_GATEWAY_TOKEN": "secret://runtime/openclaw/gateway-token"
+                    },
+                },
+                "services": {},
+            }
+        },
+        live_sync={
+            "enabled": True,
+            "agents": [{"agentType": "openclaw", "environmentId": str(ENV_ID)}],
+        },
+        recovery={"cacheManifest": True, "allowOfflineBoot": True},
+        skills={"entries": {"clawdi": {"enabled": True, "version": 1}}},
+        tools={
+            "codex": {
+                "enabled": True,
+                "provider_id": CANONICAL_CODEX_TOOL_PROVIDER_ID,
+                "primary_model": {
+                    "provider_id": CANONICAL_CODEX_TOOL_PROVIDER_ID,
+                    "model": "gpt-test",
+                },
+            }
+        },
+    )
+    state.created_at = now
+    provider = AiProvider(
+        id=PROVIDER_ROW_ID,
+        owner_user_id=USER_ID,
+        provider_id=CANONICAL_CODEX_TOOL_PROVIDER_ID,
+        type="custom_openai_compatible",
+        label=provider_label,
+        base_url="https://provider.test/v1",
+        api_mode="openai_chat",
+        auth_type="api_key",
+        auth_metadata={"source": "managed", "profile": "default"},
+        managed_by="clawdi",
+    )
+    auth = AiProviderAuthPayload(
+        id=AUTH_ROW_ID,
+        owner_user_id=USER_ID,
+        provider_id=CANONICAL_CODEX_TOOL_PROVIDER_ID,
+        auth_profile="default",
+        kind="api_key",
+        source="managed",
+        encrypted_payload=b"provider-ciphertext",
+        nonce=b"provider-nonce",
+    )
+    account = ChannelAccount(
+        id=ACCOUNT_ID,
+        user_id=USER_ID,
+        provider="telegram",
+        name=channel_name,
+        status="active",
+        visibility="private",
+        webhook_secret_hash="hash",
+    )
+    link = ChannelBotAgentLink(
+        id=LINK_ID,
+        account_id=ACCOUNT_ID,
+        user_id=USER_ID,
+        agent_id=ENV_ID,
+        status="active",
+        encrypted_agent_token=token,
+        agent_token_nonce=b"channel-nonce",
+    )
+    return RuntimeSourceBatch(
+        rows={ENV_ID: RuntimeSourceRow(environment, state)},
+        providers={(USER_ID, CANONICAL_CODEX_TOOL_PROVIDER_ID): provider},
+        auth_payloads={(USER_ID, CANONICAL_CODEX_TOOL_PROVIDER_ID, "default"): auth},
+        channels={ENV_ID: ((account, link),)},
+        runtime_secrets={
+            ENV_ID: (
+                HostedRuntimeSecret(
+                    id=AUTH_TOKEN_SECRET_ID,
+                    environment_id=ENV_ID,
+                    secret_ref="secret://clawdi/auth-token",
+                    encrypted_value=b"runtime-auth-ciphertext",
+                    nonce=b"runtime-auth-nonce",
+                    key_version="vault.v1",
+                ),
+                HostedRuntimeSecret(
+                    id=GATEWAY_TOKEN_SECRET_ID,
+                    environment_id=ENV_ID,
+                    secret_ref="secret://runtime/openclaw/gateway-token",
+                    encrypted_value=b"gateway-token-ciphertext",
+                    nonce=b"gateway-token-nonce",
+                    key_version="vault.v1",
+                ),
+            )
+        },
+    )
+
+
+def _replace_runtime_provider(
+    batch: RuntimeSourceBatch,
+    *,
+    provider_id: str,
+    provider_row_id: UUID,
+    auth_row_id: UUID,
+) -> None:
+    state = batch.rows[ENV_ID].state
+    assert state is not None
+    runtime = dict(state.runtimes["openclaw"])
+    runtime["provider_ids"] = [provider_id]
+    runtime["primary_model"] = {"provider_id": provider_id, "model": "gpt-test"}
+    state.runtimes = {"openclaw": runtime}
+    batch.providers[(USER_ID, provider_id)] = AiProvider(
+        id=provider_row_id,
+        owner_user_id=USER_ID,
+        provider_id=provider_id,
+        type="openai",
+        label="Runtime provider",
+        base_url="https://provider-two.test/v1",
+        api_mode="responses",
+        auth_type="api_key",
+        auth_metadata={"source": "managed", "profile": "default"},
+        managed_by="clawdi",
+    )
+    batch.auth_payloads[(USER_ID, provider_id, "default")] = AiProviderAuthPayload(
+        id=auth_row_id,
+        owner_user_id=USER_ID,
+        provider_id=provider_id,
+        auth_profile="default",
+        kind="api_key",
+        source="managed",
+        encrypted_payload=b"provider-two-ciphertext",
+        nonce=b"provider-two-nonce",
+    )
+
+
+def _add_prefix_colliding_channel(batch: RuntimeSourceBatch) -> None:
+    account = ChannelAccount(
+        id=PREFIX_COLLISION_ACCOUNT_ID,
+        user_id=USER_ID,
+        provider="discord",
+        name="Second bot",
+        status="active",
+        visibility="private",
+        webhook_secret_hash="second-hash",
+    )
+    link = ChannelBotAgentLink(
+        id=PREFIX_COLLISION_LINK_ID,
+        account_id=PREFIX_COLLISION_ACCOUNT_ID,
+        user_id=USER_ID,
+        agent_id=ENV_ID,
+        status="active",
+        encrypted_agent_token=b"second-channel-token",
+        agent_token_nonce=b"second-channel-nonce",
+    )
+    batch.channels[ENV_ID] = (*batch.channels[ENV_ID], (account, link))
+
+
+def _use_whatsapp_channel(
+    batch: RuntimeSourceBatch,
+) -> tuple[ChannelAgentCredential, ChannelWhatsAppAuthCert]:
+    account, link = batch.channels[ENV_ID][0]
+    account.provider = "whatsapp"
+    credential = ChannelAgentCredential(
+        id=UUID("80000000-0000-0000-0000-000000000011"),
+        account_id=account.id,
+        bot_agent_link_id=link.id,
+        user_id=USER_ID,
+        provider="whatsapp",
+        identity_pub_key_hash="1" * 64,
+        identity_public_key=b"identity-public-key",
+        synthetic_jid="15551234567:1@s.whatsapp.net",
+        encrypted_credentials=b'{"advSecretKey":"managed-whatsapp"}',
+        credential_nonce=b"credential-nonce",
+    )
+    auth_cert = ChannelWhatsAppAuthCert(
+        id=UUID("90000000-0000-0000-0000-000000000012"),
+        account_id=account.id,
+        user_id=USER_ID,
+        root_public_key=b"r" * 32,
+        encrypted_root_private_key=b"root-private",
+        root_private_key_nonce=b"root-nonce",
+        intermediate_public_key=b"i" * 32,
+        encrypted_intermediate_private_key=b"intermediate-private",
+        intermediate_private_key_nonce=b"intermediate-nonce",
+        serial=7,
+    )
+    batch.channel_credentials[link.id] = credential
+    batch.whatsapp_auth_certs[account.id] = auth_cert
+    return credential, auth_cert
+
+
+def _render(batch: RuntimeSourceBatch):
+    return render_runtime_source(
+        batch,
+        environment_id=ENV_ID,
+        public_api_url="https://cloud.test/",
+        vault_key_identity="vault-key-generation-1",
+        decrypt_secrets=False,
+    )
+
+
+def connection_source_fixture() -> RuntimeSourceBatch:
+    batch = _batch()
+    _replace_runtime_provider(
+        batch, provider_id="saved-connection", provider_row_id=uuid4(), auth_row_id=uuid4()
+    )
+    provider = batch.providers[(USER_ID, "saved-connection")]
+    provider.configuration_mode = "connection"
+    provider.managed_by = "user"
+    provider.api_mode = "openai_responses"
+    provider.runtime_env_name = "SAVED_CONNECTION_KEY"
+    provider.models = [{"id": "historic-model", "context_window": 8192}]
+    return batch
+
+
+@pytest.mark.parametrize("mode", ["connection", "custom"])
+def test_connection_source_emits_only_owned_routing_and_credentials(mode: str) -> None:
+    batch = connection_source_fixture()
+    batch.providers[(USER_ID, "saved-connection")].configuration_mode = mode
+    source = _render(batch)
+    provider = source.manifest["providers"]["saved-connection"]
+    assert provider["configurationMode"] == mode
+    assert provider["managed_by"] == "user"
+    assert provider["runtimeEnvName"] == "SAVED_CONNECTION_KEY"
+    assert provider["apiKeySecretRef"]
+    assert "models" not in provider
+    assert "nativeProvider" not in provider
+    assert source.manifest["runtimes"]["openclaw"]["primary_model"] is None
+    assert batch.providers[(USER_ID, "saved-connection")].models == [
+        {"id": "historic-model", "context_window": 8192}
+    ]
+    batch.providers[(USER_ID, "saved-connection")].api_mode = None
+    assert _render(batch).manifest["providers"]["saved-connection"]["apiMode"] == "openai_responses"
+
+
+def _mixed_capability_source(mode: str = "custom") -> RuntimeSourceBatch:
+    batch = connection_source_fixture()
+    provider = batch.providers[(USER_ID, "saved-connection")]
+    provider.configuration_mode = mode
+    if mode == "native":
+        routing = native_provider("openai")
+        provider.native_provider = routing.id
+        provider.native_variant = routing.variant
+        for field in ("type", "base_url", "api_mode", "runtime_env_name"):
+            setattr(provider, field, getattr(routing, field))
+        provider.models = []
+    state = batch.rows[ENV_ID].state
+    assert state is not None
+    state.runtimes["openclaw"]["primary_model"] = None
+    state.runtimes["openclaw"]["provider_ids"].append(CANONICAL_CODEX_TOOL_PROVIDER_ID)
+    batch.providers[(USER_ID, CANONICAL_CODEX_TOOL_PROVIDER_ID)].models = [
+        {"id": "gpt-test", "capabilities": {"chat": True}},
+        {"id": "multimodal-test", "capabilities": {"chat": True, "embeddings": True}},
+        {
+            "id": "embedding-test",
+            "capabilities": {"chat": False, "embeddings": True},
+            "max_input_tokens": 8192,
+        },
+    ]
+    return batch
+
+
+@pytest.mark.parametrize("mode", ["native", "connection", "custom"])
+def test_native_owned_chat_projects_managed_embeddings_without_changing_sources(mode: str) -> None:
+    batch = _mixed_capability_source(mode)
+    state = batch.rows[ENV_ID].state
+    assert state is not None
+    original_state = json.dumps(state.runtimes, sort_keys=True)
+    managed = batch.providers[(USER_ID, CANONICAL_CODEX_TOOL_PROVIDER_ID)]
+    original_models = json.dumps(managed.models, sort_keys=True)
+    tool_before = _render(_batch()).manifest["terminalTooling"]
+
+    source = _render(batch)
+
+    assert source.manifest["runtimes"]["openclaw"].get("primary_model") is None
+    assert source.manifest["providers"]["saved-connection"]["configurationMode"] == mode
+    assert source.manifest["providers"]["saved-connection"]["apiKeySecretRef"]
+    auxiliary = source.manifest["providers"][CLAWDI_MANAGED_PROVIDER_ID]
+    assert auxiliary["models"] == [managed.models[-1]]
+    assert auxiliary["apiKeySecretRef"] == "secret://tool.codex.apiKey"
+    assert source.manifest["terminalTooling"] == tool_before
+    assert json.dumps(state.runtimes, sort_keys=True) == original_state
+    assert json.dumps(managed.models, sort_keys=True) == original_models
+
+
+@pytest.mark.parametrize("primary_provider", ["saved-connection", CANONICAL_CODEX_TOOL_PROVIDER_ID])
+def test_explicit_catalog_primary_keeps_full_managed_capabilities(primary_provider: str) -> None:
+    batch = _mixed_capability_source("native")
+    state = batch.rows[ENV_ID].state
+    assert state is not None
+    if primary_provider == "saved-connection":
+        provider = batch.providers[(USER_ID, "saved-connection")]
+        provider.configuration_mode = "catalog"
+        provider.native_provider = None
+    state.runtimes["openclaw"]["primary_model"] = {
+        "provider_id": primary_provider,
+        "model": "gpt-test",
+    }
+
+    source = _render(batch)
+
+    assert source.manifest["providers"][CLAWDI_MANAGED_PROVIDER_ID]["models"] == (
+        batch.providers[(USER_ID, CANONICAL_CODEX_TOOL_PROVIDER_ID)].models
+    )
+    assert source.manifest["runtimes"]["openclaw"]["primary_model"]["model"] == "gpt-test"
+
+
+@pytest.mark.parametrize("failure", ["no_embeddings", "catalog_chat", "unmanaged_auxiliary"])
+def test_managed_auxiliary_projection_does_not_hide_invalid_chat_bindings(failure: str) -> None:
+    batch = _mixed_capability_source()
+    state = batch.rows[ENV_ID].state
+    assert state is not None
+    if failure == "no_embeddings":
+        batch.providers[(USER_ID, CANONICAL_CODEX_TOOL_PROVIDER_ID)].models = [
+            {"id": "gpt-test", "capabilities": {"chat": True}}
+        ]
+    elif failure == "catalog_chat":
+        batch.providers[(USER_ID, "saved-connection")].configuration_mode = "catalog"
+    else:
+        extra = AiProvider(
+            id=uuid4(),
+            owner_user_id=USER_ID,
+            provider_id="extra-catalog",
+            type="openai",
+            base_url="https://extra.example.test/v1",
+            api_mode="openai_responses",
+            auth_type="none",
+            managed_by="user",
+            models=[{"id": "embedding-test", "capabilities": {"chat": False, "embeddings": True}}],
+        )
+        batch.providers[(USER_ID, extra.provider_id)] = extra
+        state.runtimes["openclaw"]["provider_ids"] = ["saved-connection", extra.provider_id]
+    with pytest.raises(RuntimeSourceError, match="Configured chat requires"):
+        _render(batch)
+
+
+def test_runtime_source_revision_uses_only_projected_descriptor_and_secret_sources() -> None:
+    initial = _render(_batch())
+    irrelevant = _render(_batch(provider_label="Renamed", channel_name="Renamed bot"))
+    rotated = _render(_batch(token=b"rotated-token"))
+
+    assert initial.source_revision == irrelevant.source_revision
+    assert initial.source_revision != rotated.source_revision
+    assert initial.manifest["system"]["openclawGatewayTrustedProxies"] == ["10.173.0.1"]
+    assert initial.manifest["skills"] == {"entries": {"clawdi": {"enabled": True, "version": 1}}}
+    assert initial.secret_values == {}
+    assert initial.channel_bindings == [
+        {
+            "provider": "telegram",
+            "accountKey": f"clawdi_{ACCOUNT_ID.hex}",
+            "agentTokenSecretRef": (
+                f"secret://channels/telegram/clawdi_{ACCOUNT_ID.hex}/agent-token"
+            ),
+            "placeholderTokenSecretRef": (
+                f"secret://channels/telegram/clawdi_{ACCOUNT_ID.hex}/placeholder-token"
+            ),
+        }
+    ]
+
+
+def test_runtime_source_revalidates_persisted_agent_plugins_before_rendering() -> None:
+    batch = _batch()
+    batch.agent_plugins[ENV_ID] = (
+        _agent_plugin_row(package_key="acme.tools", content_digest="not-a-digest"),
+    )
+
+    with pytest.raises(RuntimeSourceError, match="Agent Plugins desired state is invalid"):
+        _render(batch)
+
+
+def test_runtime_source_owns_the_public_clawdi_mcp_url() -> None:
+    first = _batch()
+    second = _batch()
+    for batch in (first, second):
+        state = batch.rows[ENV_ID].state
+        assert state is not None
+        state.mcp = {
+            "servers": {
+                "clawdi": {
+                    "platform": "clawdi",
+                    "transport": "streamable-http",
+                    "headers": {
+                        "Authorization": {
+                            "secretRef": "secret://clawdi/auth-token",
+                            "prefix": "Bearer ",
+                        }
+                    },
+                }
+            }
+        }
+    second_state = second.rows[ENV_ID].state
+    assert second_state is not None
+    second_state.mcp["servers"]["clawdi"] = {
+        **second_state.mcp["servers"]["clawdi"],
+        "url": "https://stale-hosted.example/v1/mcp/clawdi",
+    }
+    del second_state.mcp["servers"]["clawdi"]["platform"]
+
+    first_render = _render(first)
+    second_render = _render(second)
+
+    assert first_render.manifest["mcp"]["servers"]["clawdi"]["url"] == (
+        "https://cloud.test/v1/mcp/clawdi"
+    )
+    assert first_render.source_revision == second_render.source_revision
+    first_state = first.rows[ENV_ID].state
+    assert first_state is not None
+    assert first_state.mcp["servers"]["clawdi"] == {
+        "platform": "clawdi",
+        "transport": "streamable-http",
+        "headers": {
+            "Authorization": {
+                "secretRef": "secret://clawdi/auth-token",
+                "prefix": "Bearer ",
+            }
+        },
+    }
+
+
+def test_runtime_source_keeps_builtin_clawdi_and_makes_reserved_desired_row_inert() -> None:
+    batch = _batch()
+    reserved = _agent_plugin_row(
+        package_key="clawdi",
+        store_path="v2/plugins/clawdi",
+    )
+    generic = _agent_plugin_row(
+        installation_id=UUID("01987b48-b641-79f2-b839-92ae5fc782ff"),
+    )
+    _use_agent_plugin_state(batch, reserved, generic)
+
+    legacy_client = render_runtime_source(
+        batch,
+        environment_id=ENV_ID,
+        public_api_url="https://cloud.test/",
+        vault_key_identity="vault-key-generation-1",
+        decrypt_secrets=False,
+        project_agent_plugins=False,
+    )
+    capable_client = _render(batch)
+
+    assert "agentPlugins" not in legacy_client.manifest
+    assert set(capable_client.manifest["agentPlugins"]["installations"]) == {"acme-tools"}
+    assert set(capable_client.manifest["mcp"]["servers"]) == {"clawdi", "workspace-tools"}
+    assert set(capable_client.manifest["skills"]["entries"]) == {
+        "clawdi",
+        "workspace-helper",
+    }
+    assert "egressProfiles" not in capable_client.manifest
+    assert legacy_client.source_revision != capable_client.source_revision
+
+
+def test_runtime_source_binds_whatsapp_capability_and_revision_to_link_credential_and_cert(
+    monkeypatch,
+) -> None:
+    from app.services import runtime_source
+
+    batch = _batch()
+    credential, auth_cert = _use_whatsapp_channel(batch)
+    account, link = batch.channels[ENV_ID][0]
+    monkeypatch.setattr(runtime_source, "decrypt", lambda ciphertext, _nonce: ciphertext.decode())
+
+    source = render_runtime_source(
+        batch,
+        environment_id=ENV_ID,
+        public_api_url="https://cloud.test/",
+        vault_key_identity="vault-key-generation-1",
+        decrypt_secrets=True,
+    )
+    account_key = channel_runtime_account_key(account.id)
+    agent_ref = f"secret://channels/whatsapp/{account_key}/links/{link.id}/agent-token"
+    capability_ref = f"secret://channels/whatsapp/{account_key}/links/{link.id}/egress-capability"
+    credential_ref = (
+        f"secret://channels/whatsapp/{account_key}/credentials/{credential.id}/creds-json"
+    )
+    assert source.channel_bindings == [
+        {
+            "provider": "whatsapp",
+            "accountId": str(account.id),
+            "accountKey": account_key,
+            "linkId": str(link.id),
+            "agentTokenSecretRef": agent_ref,
+            "placeholderTokenSecretRef": capability_ref,
+            "credential": {
+                "id": str(credential.id),
+                "credsSecretRef": credential_ref,
+                "authCert": {
+                    "SERIAL": 7,
+                    "ISSUER": "clawdi",
+                    "PUBLIC_KEY": {
+                        "type": "Buffer",
+                        "data": "cnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnI=",
+                    },
+                },
+            },
+        }
+    ]
+    assert source.secret_values[capability_ref] == channel_runtime_placeholder_token(
+        "whatsapp", account_key, link_id=link.id
+    )
+    assert source.secret_values[credential_ref] == credential.encrypted_credentials.decode()
+
+    initial_revision = source.source_revision
+    credential.encrypted_credentials = b'{"advSecretKey":"rotated"}'
+    credential_rotated = _render(batch)
+    credential.encrypted_credentials = b'{"advSecretKey":"managed-whatsapp"}'
+    auth_cert.root_public_key = b"s" * 32
+    cert_rotated = _render(batch)
+
+    assert credential_rotated.source_revision != initial_revision
+    assert cert_rotated.source_revision != initial_revision
+
+
+def test_runtime_source_delivers_owned_oauth_only_to_selected_runtime(monkeypatch) -> None:
+    from app.services import runtime_source
+
+    batch = _batch()
+    state = batch.rows[ENV_ID].state
+    assert state is not None
+    runtime = dict(state.runtimes["openclaw"])
+    runtime["provider_ids"] = ["openai-codex"]
+    runtime["primary_model"] = {
+        "provider_id": "openai-codex",
+        "model": "gpt-test",
+    }
+    state.runtimes = {"openclaw": runtime}
+    provider = AiProvider(
+        id=uuid4(),
+        owner_user_id=USER_ID,
+        provider_id="openai-codex",
+        type="openai",
+        label="ChatGPT",
+        base_url="https://api.openai.com/v1",
+        api_mode="openai_responses",
+        auth_type="agent_profile",
+        auth_metadata={"tool": "codex", "profile": "default"},
+        managed_by="user",
+    )
+    payload = AiProviderAuthPayload(
+        id=uuid4(),
+        owner_user_id=USER_ID,
+        provider_id="openai-codex",
+        auth_profile="default",
+        kind="agent_profile",
+        source="managed",
+        encrypted_payload=b"oauth-ciphertext",
+        nonce=b"oauth-nonce",
+        credential_revision="oauth-revision-1",
+        consumer_environment_id=ENV_ID,
+        consumer_runtime="openclaw",
+    )
+    batch.providers[(USER_ID, provider.provider_id)] = provider
+    batch.auth_payloads[(USER_ID, provider.provider_id, "default")] = payload
+
+    def record_decrypt(ciphertext: bytes, nonce: bytes) -> str:
+        if ciphertext == b"oauth-ciphertext" and nonce == b"oauth-nonce":
+            return '{"kind":"local_agent_profile","files":[]}'
+        return "managed-tool-key"
+
+    monkeypatch.setattr(runtime_source, "decrypt", record_decrypt)
+    source = render_runtime_source(
+        batch,
+        environment_id=ENV_ID,
+        public_api_url="https://cloud.test/",
+        vault_key_identity="vault-key-generation-1",
+        decrypt_secrets=True,
+    )
+
+    projected_provider = source.manifest["providers"]["openai-codex"]
+    auth = projected_provider["auth"]
+    assert auth == {
+        "type": "agent_profile",
+        "tool": "codex",
+        "profile": "default",
+        "credentialSecretRef": "secret://provider.openai-codex.oauthProfile",
+        "credentialRevision": "oauth-revision-1",
+    }
+    assert source.secret_values["secret://provider.openai-codex.oauthProfile"] == (
+        '{"kind":"local_agent_profile","files":[]}'
+    )
+    assert "apiKeySecretRef" not in projected_provider
+    terminal_provider = source.manifest["terminalTooling"]["codex"]["provider"]
+    assert terminal_provider["apiKeySecretRef"] == "secret://tool.codex.apiKey"
+    assert "auth" not in terminal_provider
+
+
+def test_runtime_source_refuses_oauth_owned_by_another_runtime() -> None:
+    batch = _batch()
+    state = batch.rows[ENV_ID].state
+    assert state is not None
+    runtime = dict(state.runtimes["openclaw"])
+    runtime["provider_ids"] = ["openai-codex"]
+    runtime["primary_model"] = {
+        "provider_id": "openai-codex",
+        "model": "gpt-test",
+    }
+    state.runtimes = {"openclaw": runtime}
+    batch.providers[(USER_ID, "openai-codex")] = AiProvider(
+        id=uuid4(),
+        owner_user_id=USER_ID,
+        provider_id="openai-codex",
+        type="openai",
+        base_url="https://api.openai.com/v1",
+        api_mode="openai_responses",
+        auth_type="agent_profile",
+        auth_metadata={"tool": "codex", "profile": "default"},
+        managed_by="user",
+    )
+    batch.auth_payloads[(USER_ID, "openai-codex", "default")] = AiProviderAuthPayload(
+        id=uuid4(),
+        owner_user_id=USER_ID,
+        provider_id="openai-codex",
+        auth_profile="default",
+        kind="agent_profile",
+        source="managed",
+        encrypted_payload=b"oauth-ciphertext",
+        nonce=b"oauth-nonce",
+        credential_revision="oauth-revision-1",
+        consumer_environment_id=uuid4(),
+        consumer_runtime="hermes",
+    )
+
+    source = _render(batch)
+
+    projected = source.manifest["providers"]["openai-codex"]
+    assert projected["status"] == "error"
+    assert projected["error"]["code"] == "provider_oauth_credential_unavailable"
+    assert "credentialSecretRef" not in projected["auth"]
+
+
+def test_runtime_secret_summary_uses_ciphertext_identity_without_decrypt(monkeypatch) -> None:
+    from app.services import runtime_source
+
+    batch = _batch()
+
+    def fail_decrypt(_ciphertext: bytes, _nonce: bytes) -> str:
+        raise AssertionError("summary rendering must not decrypt runtime secrets")
+
+    monkeypatch.setattr(runtime_source, "decrypt", fail_decrypt)
+    initial = _render(batch)
+    assert initial.secret_values == {}
+    rotated = _batch()
+    rotated.runtime_secrets[ENV_ID][0].encrypted_value = b"rotated-runtime-auth-ciphertext"
+    assert _render(rotated).source_revision != initial.source_revision
+
+
+def test_runtime_secret_source_collision_fails_before_decrypt(monkeypatch) -> None:
+    from app.services import runtime_source
+
+    batch = _batch()
+    batch.runtime_secrets[ENV_ID][0].secret_ref = "secret://tool.codex.apiKey"
+    decrypt_calls: list[tuple[bytes, bytes]] = []
+
+    def record_decrypt(ciphertext: bytes, nonce: bytes) -> str:
+        decrypt_calls.append((ciphertext, nonce))
+        return "unused"
+
+    monkeypatch.setattr(runtime_source, "decrypt", record_decrypt)
+    with pytest.raises(
+        RuntimeSourceError,
+        match=r"Runtime secret reference collision: secret://tool\.codex\.apiKey",
+    ):
+        render_runtime_source(
+            batch,
+            environment_id=ENV_ID,
+            public_api_url="https://cloud.test/",
+            vault_key_identity="vault-key-generation-1",
+            decrypt_secrets=True,
+        )
+    assert decrypt_calls == []
+
+
+def test_runtime_source_rejects_non_public_provider_without_decrypting_secret(monkeypatch) -> None:
+    from app.services import runtime_source
+
+    batch = _batch()
+    provider = batch.providers[(USER_ID, CANONICAL_CODEX_TOOL_PROVIDER_ID)]
+    provider.base_url = "https://provider.home.arpa/v1"
+
+    decrypt_calls: list[tuple[bytes, bytes]] = []
+
+    def record_decrypt(ciphertext: bytes, nonce: bytes) -> str:
+        decrypt_calls.append((ciphertext, nonce))
+        return "must-not-be-projected"
+
+    monkeypatch.setattr(runtime_source, "decrypt", record_decrypt)
+
+    with pytest.raises(RuntimeSourceError, match="public host"):
+        render_runtime_source(
+            batch,
+            environment_id=ENV_ID,
+            public_api_url="https://api.example.test",
+            vault_key_identity="vault-key",
+            decrypt_secrets=True,
+        )
+    assert decrypt_calls == []
+
+
+def test_runtime_source_never_decrypts_or_projects_channel_provider_token(monkeypatch) -> None:
+    from app.services import runtime_source
+
+    batch = _batch()
+    account, _link = batch.channels[ENV_ID][0]
+    account.encrypted_provider_token = b"real-provider-token-ciphertext"
+    account.provider_token_nonce = b"real-provider-token-nonce"
+    decrypt_calls: list[tuple[bytes, bytes]] = []
+
+    def record_decrypt(ciphertext: bytes, nonce: bytes) -> str:
+        decrypt_calls.append((ciphertext, nonce))
+        return "projected-secret"
+
+    monkeypatch.setattr(runtime_source, "decrypt", record_decrypt)
+    bundle = render_runtime_bundle(
+        render_runtime_source(
+            batch,
+            environment_id=ENV_ID,
+            public_api_url="https://cloud.test/",
+            vault_key_identity="vault-key-generation-1",
+            decrypt_secrets=True,
+        )
+    )
+
+    assert (b"real-provider-token-ciphertext", b"real-provider-token-nonce") not in decrypt_calls
+    assert "real-provider-token" not in json.dumps(bundle)
+
+
+def test_runtime_bundle_omits_legacy_apply_generation_and_tracks_explicit_apply_only_changes() -> (
+    None
+):
+    legacy = render_runtime_source(
+        _batch(apply_generation=None),
+        environment_id=ENV_ID,
+        public_api_url="https://cloud.test/",
+        vault_key_identity="vault-key-generation-1",
+        decrypt_secrets=False,
+    )
+    apply_one = render_runtime_source(
+        _batch(apply_generation=1),
+        environment_id=ENV_ID,
+        public_api_url="https://cloud.test/",
+        vault_key_identity="vault-key-generation-1",
+        decrypt_secrets=False,
+    )
+    apply_three = render_runtime_source(
+        _batch(apply_generation=3),
+        environment_id=ENV_ID,
+        public_api_url="https://cloud.test/",
+        vault_key_identity="vault-key-generation-1",
+        decrypt_secrets=False,
+    )
+
+    legacy_bundle = render_runtime_bundle(legacy)
+    assert "applyGeneration" not in legacy_bundle
+    assert legacy_bundle["manifest"]["generation"] == 2
+    assert apply_one.manifest == apply_three.manifest
+    assert apply_one.source_revision != apply_three.source_revision
+    assert render_runtime_bundle(apply_one)["applyGeneration"] == 1
+    assert render_runtime_bundle(apply_three)["applyGeneration"] == 3
+
+
+def test_unmanaged_runtime_tool_secret_uses_auth_payload_without_user_vault_refs(
+    monkeypatch,
+) -> None:
+    from app.services import runtime_source
+
+    batch = _batch()
+    state = batch.rows[ENV_ID].state
+    assert state is not None
+    runtime = dict(state.runtimes["openclaw"])
+    runtime["providerMode"] = "unmanaged"
+    runtime["provider_ids"] = []
+    runtime.pop("primary_model")
+    state.runtimes = {"openclaw": runtime}
+    batch.channels.clear()
+    batch.runtime_secrets.clear()
+    decrypt_calls: list[tuple[bytes, bytes]] = []
+
+    def record_decrypt(ciphertext: bytes, nonce: bytes) -> str:
+        decrypt_calls.append((ciphertext, nonce))
+        return "sk-codex-tool"
+
+    monkeypatch.setattr(runtime_source, "decrypt", record_decrypt)
+    source = render_runtime_source(
+        batch,
+        environment_id=ENV_ID,
+        public_api_url="https://cloud.test/",
+        vault_key_identity="platform-key-generation-1",
+        decrypt_secrets=True,
+    )
+    bundle = render_runtime_bundle(source)
+
+    assert source.manifest["providers"] == {}
+    assert source.manifest["runtimes"]["openclaw"]["providerMode"] == "unmanaged"
+    assert source.manifest["terminalTooling"]["codex"]["provider_id"] == (
+        CLAWDI_MANAGED_PROVIDER_ID
+    )
+    assert source.manifest["terminalTooling"]["codex"]["provider"]["apiMode"] == (
+        "openai_responses"
+    )
+    assert source.secret_values == {"secret://tool.codex.apiKey": "sk-codex-tool"}
+    assert decrypt_calls == [(b"provider-ciphertext", b"provider-nonce")]
+    assert "iforge://" not in json.dumps(bundle)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("apiMode", "openai_chat"),
+        ("runtimeEnvName", "OPENAI_API_KEY"),
+        ("runtimeEnvName", "CUSTOM_OPENAI_API_KEY"),
+    ],
+)
+def test_codex_tool_projection_rejects_invalid_fixed_fields(field: str, value: str) -> None:
+    projection = {
+        "kind": "openai-compatible",
+        "type": "custom_openai_compatible",
+        "baseUrl": "https://provider.test/v1",
+        "apiMode": "openai_responses",
+        "managed_by": "clawdi",
+        "runtimeEnvName": "CLAWDI_AI_API_KEY",
+        "apiKeySecretRef": "secret://tool.codex.apiKey",
+    }
+    projection[field] = value
+
+    with pytest.raises(ValueError):
+        HostedCodexProviderProjection.model_validate(projection)
+
+
+def test_codex_tool_env_is_canonical_during_cli_upgrade_handoff() -> None:
+    batch = _batch()
+    row = batch.rows[ENV_ID]
+    assert row.state is not None
+    row.state.cli_package_spec = "clawdi@0.14.11"
+    source_revision = "a" * 64
+    etag = expected_runtime_bundle_v2_etag(source_revision)
+    observation = HostedRuntimeConfigObservation(
+        environment_id=ENV_ID,
+        observed_config_generation=row.state.apply_generation,
+        observed_manifest_etag=etag,
+        observed_source_revision=source_revision,
+        diagnostics={
+            "schemaVersion": "clawdi.hostedRuntimeObserved.v2",
+            "reportedAt": "2026-07-13T00:00:00Z",
+            "runtimeMode": "hosted",
+            "status": "ok",
+            "activeCliVersion": "0.14.10",
+            "applied": {
+                "etag": etag,
+                "sourceRevision": source_revision,
+                "generation": row.state.apply_generation,
+                "instanceId": row.state.instance_id,
+                "appliedProviderIds": ["managed"],
+            },
+            "boot": None,
+            "cli": None,
+            "convergeError": None,
+        },
+    )
+    batch.rows[ENV_ID] = RuntimeSourceRow(row.environment, row.state, observation)
+
+    provider = _render(batch).manifest["terminalTooling"]["codex"]["provider"]
+    assert provider["runtimeEnvName"] == "CLAWDI_AI_API_KEY"
+
+
+def test_legacy_managed_v2_chat_storage_projects_responses() -> None:
+    source = _render(_batch())
+
+    runtime_provider = source.manifest["providers"][CLAWDI_MANAGED_PROVIDER_ID]
+    assert runtime_provider["apiMode"] == "openai_responses"
+    assert runtime_provider["models"] == [{"id": "gpt-test"}]
+    codex_provider = source.manifest["terminalTooling"]["codex"]["provider"]
+    assert codex_provider == {
+        "kind": "openai-compatible",
+        "type": "custom_openai_compatible",
+        "baseUrl": "https://provider.test/v1",
+        "apiMode": "openai_responses",
+        "managed_by": "clawdi",
+        "runtimeEnvName": "CLAWDI_AI_API_KEY",
+        "apiKeySecretRef": "secret://tool.codex.apiKey",
+    }
+
+
+def test_managed_v2_exact_provider_source_projects_bare_agent_identity() -> None:
+    batch = _batch()
+    source_provider_id = CANONICAL_CODEX_TOOL_PROVIDER_ID
+    scoped_provider = batch.providers[(USER_ID, source_provider_id)]
+    scoped_provider.models = [{"id": "scoped-model", "label": "Scoped model"}]
+    batch.providers[(USER_ID, V2_MANAGED_AI_PROVIDER_ID)] = AiProvider(
+        id=uuid4(),
+        owner_user_id=USER_ID,
+        provider_id=V2_MANAGED_AI_PROVIDER_ID,
+        type=scoped_provider.type,
+        label=scoped_provider.label,
+        base_url=scoped_provider.base_url,
+        api_mode=scoped_provider.api_mode,
+        auth_type=scoped_provider.auth_type,
+        auth_metadata=scoped_provider.auth_metadata,
+        managed_by=scoped_provider.managed_by,
+        models=[{"id": "wrong-user-level-model"}],
+    )
+
+    source = _render(batch)
+    manifest = source.manifest
+
+    assert manifest["runtimes"]["openclaw"]["provider_ids"] == [CLAWDI_MANAGED_PROVIDER_ID]
+    assert manifest["runtimes"]["openclaw"]["primary_model"] == {
+        "provider_id": CLAWDI_MANAGED_PROVIDER_ID,
+        "model": "gpt-test",
+    }
+    assert set(manifest["providers"]) == {CLAWDI_MANAGED_PROVIDER_ID}
+    assert manifest["providers"][CLAWDI_MANAGED_PROVIDER_ID]["models"] == [
+        {"id": "gpt-test"},
+        {"id": "scoped-model", "label": "Scoped model"},
+    ]
+    assert scoped_provider.models == [{"id": "scoped-model", "label": "Scoped model"}]
+    assert manifest["providers"][CLAWDI_MANAGED_PROVIDER_ID]["apiKeySecretRef"] == (
+        "secret://tool.codex.apiKey"
+    )
+    assert manifest["terminalTooling"]["codex"]["provider_id"] == CLAWDI_MANAGED_PROVIDER_ID
+    assert manifest["terminalTooling"]["codex"]["primary_model"]["provider_id"] == (
+        CLAWDI_MANAGED_PROVIDER_ID
+    )
+    assert source_provider_id not in json.dumps(manifest)
+
+
+@pytest.mark.parametrize(
+    ("runtime_provider_id", "codex_provider_id", "error"),
+    [
+        (
+            CLAWDI_MANAGED_PROVIDER_ID,
+            CANONICAL_CODEX_TOOL_PROVIDER_ID,
+            "exact deployment source",
+        ),
+        (
+            V2_LEGACY_PUBLIC_MANAGED_AI_PROVIDER_ID,
+            CANONICAL_CODEX_TOOL_PROVIDER_ID,
+            "exact deployment source",
+        ),
+        (
+            V2_LEGACY_MANAGED_AI_PROVIDER_ID,
+            CANONICAL_CODEX_TOOL_PROVIDER_ID,
+            "exact deployment source",
+        ),
+        (
+            "clawdi-v2-deployment-0",
+            CANONICAL_CODEX_TOOL_PROVIDER_ID,
+            "source is invalid",
+        ),
+        (
+            "clawdi-v2-deployment-43",
+            "clawdi-v2-deployment-43",
+            "missing or archived",
+        ),
+        (
+            CANONICAL_CODEX_TOOL_PROVIDER_ID,
+            "custom-managed-provider",
+            "Codex tool provider must use its exact deployment source",
+        ),
+        (
+            CANONICAL_CODEX_TOOL_PROVIDER_ID,
+            "clawdi-v2-deployment-43",
+            "multiple provider bindings",
+        ),
+    ],
+    ids=[
+        "bare",
+        "legacy-public",
+        "legacy-internal",
+        "malformed",
+        "missing",
+        "custom-codex-source",
+        "mismatch",
+    ],
+)
+def test_managed_v2_provider_source_fails_closed(
+    runtime_provider_id: str,
+    codex_provider_id: str,
+    error: str,
+) -> None:
+    batch = _batch()
+    state = batch.rows[ENV_ID].state
+    assert state is not None and state.tools is not None
+    runtime = state.runtimes["openclaw"]
+    runtime["provider_ids"] = [runtime_provider_id]
+    runtime["primary_model"]["provider_id"] = runtime_provider_id
+    state.tools["codex"]["provider_id"] = codex_provider_id
+    state.tools["codex"]["primary_model"]["provider_id"] = codex_provider_id
+    batch.providers.clear()
+    batch.auth_payloads.clear()
+
+    with pytest.raises(RuntimeSourceError, match=error):
+        _render(batch)
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        "missing_provider",
+        "user_owned",
+        "missing_payload",
+        "payload_kind",
+        "payload_source",
+        "provider_auth_type",
+        "api_mode",
+    ],
+)
+def test_codex_tool_provider_fails_closed_without_platform_credential(failure: str) -> None:
+    batch = _batch()
+    if failure == "missing_provider":
+        batch.providers.clear()
+    elif failure == "user_owned":
+        batch.providers[(USER_ID, CANONICAL_CODEX_TOOL_PROVIDER_ID)].managed_by = "user"
+    elif failure == "missing_payload":
+        batch.auth_payloads.clear()
+    elif failure == "payload_kind":
+        batch.auth_payloads[
+            (USER_ID, CANONICAL_CODEX_TOOL_PROVIDER_ID, "default")
+        ].kind = "oauth_profile"
+    elif failure == "payload_source":
+        batch.auth_payloads[(USER_ID, CANONICAL_CODEX_TOOL_PROVIDER_ID, "default")].source = "vault"
+    elif failure == "provider_auth_type":
+        batch.providers[(USER_ID, CANONICAL_CODEX_TOOL_PROVIDER_ID)].auth_type = "agent_profile"
+    else:
+        batch.providers[(USER_ID, CANONICAL_CODEX_TOOL_PROVIDER_ID)].api_mode = "anthropic_messages"
+
+    with pytest.raises(RuntimeSourceError, match="Hosted Codex tool provider"):
+        _render(batch)
+
+
+def test_runtime_source_preserves_runtime_and_codex_tool_provider_ids(monkeypatch) -> None:
+    from app.services import runtime_source
+
+    batch = _batch()
+    _replace_runtime_provider(
+        batch,
+        provider_id="managed-",
+        provider_row_id=UUID("30000000-0000-0000-0000-000000000013"),
+        auth_row_id=UUID("40000000-0000-0000-0000-000000000014"),
+    )
+
+    decrypt_calls: list[tuple[bytes, bytes]] = []
+
+    def record_decrypt(ciphertext: bytes, nonce: bytes) -> str:
+        decrypt_calls.append((ciphertext, nonce))
+        return ciphertext.decode()
+
+    monkeypatch.setattr(runtime_source, "decrypt", record_decrypt)
+
+    source = render_runtime_source(
+        batch,
+        environment_id=ENV_ID,
+        public_api_url="https://cloud.test/",
+        vault_key_identity="vault-key-generation-1",
+        decrypt_secrets=True,
+    )
+    assert source.secret_values["secret://tool.codex.apiKey"] == "provider-ciphertext"
+    assert source.secret_values["secret://provider.managed-.apiKey"] == "provider-two-ciphertext"
+    assert len(decrypt_calls) == 5
+
+
+def test_runtime_source_rejects_unknown_runtime_secret_key_version_before_decrypt(
+    monkeypatch,
+) -> None:
+    from app.services import runtime_source
+
+    batch = _batch()
+    runtime_secret = batch.runtime_secrets[ENV_ID][0]
+    runtime_secret.key_version = "vault.future"
+    decrypt_calls: list[tuple[bytes, bytes]] = []
+
+    def record_decrypt(ciphertext: bytes, nonce: bytes) -> str:
+        decrypt_calls.append((ciphertext, nonce))
+        return "must-not-decrypt"
+
+    monkeypatch.setattr(runtime_source, "decrypt", record_decrypt)
+
+    with pytest.raises(RuntimeSourceError, match="Hosted runtime secret source is invalid"):
+        render_runtime_source(
+            batch,
+            environment_id=ENV_ID,
+            public_api_url="https://cloud.test/",
+            vault_key_identity="vault-key-generation-1",
+            decrypt_secrets=False,
+        )
+    assert decrypt_calls == []
+
+
+def test_runtime_source_rejects_duplicate_normalized_provider_ref_before_decrypt(
+    monkeypatch,
+) -> None:
+    from app.services import runtime_source
+
+    batch = _batch()
+    _replace_runtime_provider(
+        batch,
+        provider_id="managed-",
+        provider_row_id=UUID("30000000-0000-0000-0000-000000000013"),
+        auth_row_id=UUID("40000000-0000-0000-0000-000000000014"),
+    )
+    # Collision rejection must remain independent of how provider refs are projected.
+    monkeypatch.setattr(
+        runtime_source,
+        "_provider_secret_ref",
+        lambda value: f"secret://provider.{value.rstrip('-')}.apiKey",
+    )
+    monkeypatch.setattr(
+        runtime_source,
+        "_CODEX_TOOL_SECRET_REF",
+        "secret://provider.managed.apiKey",
+    )
+    decrypt_calls: list[tuple[bytes, bytes]] = []
+
+    def record_decrypt(ciphertext: bytes, nonce: bytes) -> str:
+        decrypt_calls.append((ciphertext, nonce))
+        return "unused"
+
+    monkeypatch.setattr(runtime_source, "decrypt", record_decrypt)
+
+    with pytest.raises(
+        RuntimeSourceError,
+        match=r"Runtime secret reference collision: secret://provider\.managed\.apiKey",
+    ):
+        render_runtime_source(
+            batch,
+            environment_id=ENV_ID,
+            public_api_url="https://cloud.test/",
+            vault_key_identity="vault-key-generation-1",
+            decrypt_secrets=True,
+        )
+    assert decrypt_calls == []
+
+
+@pytest.mark.parametrize(
+    ("provider", "label"),
+    [("telegram", "Telegram"), ("discord", "Discord")],
+)
+def test_runtime_source_rejects_duplicate_provider_accounts_before_decrypt(
+    monkeypatch,
+    provider: str,
+    label: str,
+) -> None:
+    from app.services import runtime_source
+
+    batch = _batch()
+    account, _link = batch.channels[ENV_ID][0]
+    account.provider = provider
+    batch.channels[ENV_ID] = (*batch.channels[ENV_ID], *batch.channels[ENV_ID])
+    decrypt_calls: list[tuple[bytes, bytes]] = []
+
+    def record_decrypt(ciphertext: bytes, nonce: bytes) -> str:
+        decrypt_calls.append((ciphertext, nonce))
+        return "unused"
+
+    monkeypatch.setattr(runtime_source, "decrypt", record_decrypt)
+
+    with pytest.raises(
+        RuntimeSourceError,
+        match=(
+            rf"This Agent has multiple active {label} bots\. "
+            r"Unlink the extras until only one remains\."
+        ),
+    ):
+        render_runtime_source(
+            batch,
+            environment_id=ENV_ID,
+            public_api_url="https://cloud.test/",
+            vault_key_identity="vault-key-generation-1",
+            decrypt_secrets=True,
+        )
+    assert decrypt_calls == []
+
+
+def test_runtime_source_account_keys_use_full_uuid_and_avoid_prefix_collisions() -> None:
+    batch = _batch()
+    _add_prefix_colliding_channel(batch)
+
+    first = _render(batch)
+    second = _render(batch)
+
+    assert first.channel_bindings == second.channel_bindings
+    assert [binding["accountKey"] for binding in first.channel_bindings] == [
+        f"clawdi_{ACCOUNT_ID.hex}",
+        f"clawdi_{PREFIX_COLLISION_ACCOUNT_ID.hex}",
+    ]
+    assert all(
+        len(binding["accountKey"]) == len("clawdi_") + 32
+        and binding["accountKey"].removeprefix("clawdi_")
+        in {ACCOUNT_ID.hex, PREFIX_COLLISION_ACCOUNT_ID.hex}
+        for binding in first.channel_bindings
+    )
+
+
+def test_runtime_bundle_matches_shared_golden(monkeypatch) -> None:
+    from app.services import runtime_source
+
+    plaintext_by_ciphertext = {
+        b"provider-ciphertext": "sk-provider-golden",
+        b"runtime-auth-ciphertext": "runtime-auth-token-golden",
+        b"gateway-token-ciphertext": "openclaw-gateway-token-golden",
+        b"token": "123456789:telegram-agent-golden",
+    }
+    monkeypatch.setattr(
+        runtime_source,
+        "decrypt",
+        lambda ciphertext, _nonce: plaintext_by_ciphertext[ciphertext],
+    )
+    batch = _batch()
+    source = render_runtime_source(
+        batch,
+        environment_id=ENV_ID,
+        public_api_url="https://cloud.test/",
+        vault_key_identity="vault-key-generation-1",
+        decrypt_secrets=True,
+    )
+    fixture_path = Path(__file__).parents[2] / "test-fixtures/runtime-bundle-v2.golden.json"
+    golden = json.loads(fixture_path.read_text())
+    expected_revision = "a477a6cf87a5632571f9127123288031e366c291fb7b87df29732544e5a885d1"
+    assert (
+        RUNTIME_SOURCE_RENDERER_REVISION,
+        source.source_revision,
+        golden["sourceRevision"],
+    ) == (
+        "runtime-source.v5",
+        expected_revision,
+        expected_revision,
+    ), (
+        "Renderer output changed: bump RUNTIME_SOURCE_RENDERER_REVISION and update "
+        "the golden source revision"
+    )
+    assert render_runtime_bundle(source) == golden
+
+
+# --- Companion `sourceRoot` cross-language parity (Phase 4, T-4-15) -------------------
+#
+# The Zod half in `packages/cli/src/runtime/manifest-contract.ts` accepts BOTH hosted-home
+# spellings. These cases pin the Pydantic half to the same value set so neither language can
+# admit a payload the other rejects: a one-sided contract is a gate that can be bypassed by
+# routing through the other half.
+
+
+def _file_browser_companion_payload(**overrides: object) -> dict[str, object]:
+    # The Files release pins left `app.schemas.runtime` with #1025 (the schema now checks only
+    # that each asset URL matches its own version), so the shared fixture is the pin source.
+    payload: dict[str, object] = filebrowser_companion("hdep_source_root")["filebrowser"]
+    payload["sourceRoot"] = "/home/iforge"
+    payload.update(overrides)
+    return payload
+
+
+def test_companion_source_root_accepts_post_rename_hosted_home() -> None:
+    companions = runtime_schemas.HostedRuntimeCompanions.model_validate(
+        {"filebrowser": _file_browser_companion_payload(sourceRoot="/home/iforge")}
+    )
+    assert companions.filebrowser is not None
+    assert companions.filebrowser.sourceRoot == "/home/iforge"
+
+
+def test_companion_source_root_rejects_the_pre_rename_hosted_home() -> None:
+    # iforge names only (user directive, 2026-09-30): no image emits `/home/clawdi`, so it is
+    # refused like any other foreign home rather than accepted as an alias.
+    with pytest.raises(ValidationError):
+        runtime_schemas.HostedRuntimeCompanions.model_validate(
+            {"filebrowser": _file_browser_companion_payload(sourceRoot="/home/clawdi")}
+        )
+
+
+def test_companion_source_root_rejects_a_third_value() -> None:
+    # A single literal, not a free string.
+    with pytest.raises(ValidationError):
+        runtime_schemas.HostedRuntimeCompanions.model_validate(
+            {"filebrowser": _file_browser_companion_payload(sourceRoot="/home/somebody-else")}
+        )
+
+
+# `commit` is no longer a literal pin: #1025 made `version` and `commit` pattern-checked and moved
+# the release pins to the hosted runtime authority. `version` still fails here because the asset
+# URLs must name the release they claim, and these assets name v1.5.0-stable.
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("port", 9121),
+        ("version", "v1.4.0-stable"),
+        ("listen", "127.0.0.1"),
+        ("baseURL", "/files"),
+        ("healthPath", "/healthz"),
+    ],
+)
+def test_companion_non_source_root_fields_keep_their_literal_pins(
+    field: str, value: object
+) -> None:
+    # Widening `sourceRoot` must not widen anything else in the entry.
+    with pytest.raises(ValidationError):
+        runtime_schemas.HostedRuntimeCompanions.model_validate(
+            {"filebrowser": _file_browser_companion_payload(**{field: value})}
+        )
+
+
+# --- The emit-time minimum-CLI-version gate (COMP-03 / D-08 / D-15) ------------------------
+#
+# Each companion kind declares, in `config/companion-registry.txt`, the lowest CLI version that
+# can parse it. The gate refuses to emit a kind to a runtime whose LAST REPORTED version is below
+# that minimum, so the consumer-first rollout order is enforced against the deployed fleet rather
+# than only against the release pipeline. D-15 makes it FAIL CLOSED: no usable reported version
+# is no proof the CLI can parse anything, so only the ungated floor is emitted.
+#
+# The registry ships exactly one kind today (`filebrowser`, ungated at `0.0.0`), which is the
+# whole reason a current fleet sees no behaviour change. Every gated case below therefore has to
+# introduce a gated kind, and it does so by monkeypatching COMPANION_REGISTRY rather than editing
+# the contract file: the parity suites in test_companion_registry.py pin that file to both
+# language embeds, so a fixture kind added there would be a three-way contract change, not a test.
+
+GATED_KIND = "future"
+GATED_MIN_CLI_VERSION = "2.0.0"
+UNGATED_KIND = "filebrowser"
+
+
+def _gated_entry(min_cli_version: str = GATED_MIN_CLI_VERSION) -> CompanionRegistryEntry:
+    return CompanionRegistryEntry(
+        artifact_kind="binary-sha256",
+        min_cli_version=min_cli_version,
+        uid="preallocated",
+        port=9121,
+        egress="redirect",
+    )
+
+
+def _with_gated_kind(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    kind: str = GATED_KIND,
+    min_cli_version: str = GATED_MIN_CLI_VERSION,
+) -> None:
+    """Add one gated kind to the registry for the duration of a test.
+
+    ``companion_kinds_at_or_below`` reads COMPANION_REGISTRY at CALL time, so patching the
+    mapping is enough; nothing in the gate closes over the registry at import.
+    """
+    monkeypatch.setitem(COMPANION_REGISTRY, kind, _gated_entry(min_cli_version))
+
+
+def _observation(diagnostics: object) -> HostedRuntimeConfigObservation:
+    return HostedRuntimeConfigObservation(environment_id=ENV_ID, diagnostics=diagnostics)
+
+
+def _observed_diagnostics(active_cli_version: str | None) -> dict[str, object]:
+    return {
+        "schemaVersion": "clawdi.hostedRuntimeObserved.v2",
+        "reportedAt": "2026-07-13T00:00:00+00:00",
+        "runtimeMode": "hosted",
+        "status": "ok",
+        "activeCliVersion": active_cli_version,
+        "applied": None,
+        "boot": None,
+        "cli": None,
+    }
+
+
+def _reported(active_cli_version: str | None) -> HostedRuntimeConfigObservation:
+    return _observation(_observed_diagnostics(active_cli_version))
+
+
+def _causes(decision: CompanionEmitDecision) -> dict[str, CompanionEmitOmission]:
+    return {record.kind: record.cause for record in decision.omissions}
+
+
+def test_gate_admits_a_kind_whose_minimum_is_below_the_reported_version(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _with_gated_kind(monkeypatch)
+
+    decision = _gate_companion_kinds([UNGATED_KIND, GATED_KIND], _reported("2.1.0"))
+
+    assert set(decision.admitted) == {UNGATED_KIND, GATED_KIND}
+    assert decision.omissions == ()
+
+
+def test_gate_admits_a_kind_whose_minimum_equals_the_reported_version(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # "the minimum version that can parse it" -- the bound is inclusive, so the exact minimum is
+    # admitted. An exclusive bound would withhold a kind from the very release built to parse it.
+    _with_gated_kind(monkeypatch)
+
+    decision = _gate_companion_kinds([GATED_KIND], _reported(GATED_MIN_CLI_VERSION))
+
+    assert decision.admitted == (GATED_KIND,)
+    assert decision.omissions == ()
+
+
+def test_gate_omits_a_kind_whose_minimum_is_above_the_reported_version(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _with_gated_kind(monkeypatch)
+
+    decision = _gate_companion_kinds([UNGATED_KIND, GATED_KIND], _reported("1.9.9"))
+
+    assert decision.admitted == (UNGATED_KIND,)
+    assert len(decision.omissions) == 1
+    record = decision.omissions[0]
+    assert record.kind == GATED_KIND
+    assert record.cause is CompanionEmitOmission.STALE_REPORTED_VERSION
+    # T-4-26: the record carries BOTH versions, so an operator can tell "upgrade the runtime"
+    # apart from "this kind is not deployed yet" without going to read the registry.
+    assert record.reported_version == "1.9.9"
+    assert record.required_min_cli_version == GATED_MIN_CLI_VERSION
+
+
+def test_gate_fails_closed_when_there_is_no_observation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # D-15, and the deliberate deviation from 04-RESEARCH.md Q3: the COMMANDED version
+    # (state.cli_package_spec) is NOT used as a fallback here.
+    _with_gated_kind(monkeypatch)
+
+    decision = _gate_companion_kinds([UNGATED_KIND, GATED_KIND], None)
+
+    assert decision.admitted == (UNGATED_KIND,)
+    assert _causes(decision) == {GATED_KIND: CompanionEmitOmission.NO_OBSERVATION}
+    assert decision.omissions[0].reported_version is None
+
+
+def test_gate_fails_closed_when_the_observation_payload_was_purged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A purge sets `diagnostics={}` (app/services/runtime_observation.py:1532), so an empty
+    # object is the shape a purge leaves behind -- distinct from "never reported" and from
+    # "reported no version", because the three have three different operator responses.
+    _with_gated_kind(monkeypatch)
+
+    decision = _gate_companion_kinds([UNGATED_KIND, GATED_KIND], _observation({}))
+
+    assert decision.admitted == (UNGATED_KIND,)
+    assert _causes(decision) == {GATED_KIND: CompanionEmitOmission.PURGED_OBSERVATION}
+
+
+def test_gate_fails_closed_when_the_reported_version_is_explicitly_null(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # `activeCliVersion: str | None` -- "reported, but reported no version" is representable on
+    # the wire and is not the same event as "never reported".
+    _with_gated_kind(monkeypatch)
+
+    decision = _gate_companion_kinds([UNGATED_KIND, GATED_KIND], _reported(None))
+
+    assert decision.admitted == (UNGATED_KIND,)
+    assert _causes(decision) == {GATED_KIND: CompanionEmitOmission.NULL_REPORTED_VERSION}
+
+
+def test_gate_fails_closed_on_an_unparseable_reported_version(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # T-4-27: garbage is an omission cause, never an admission. A comparator that returned
+    # "satisfied" for input it could not read would make the gate bypassable with a bad string.
+    _with_gated_kind(monkeypatch)
+
+    decision = _gate_companion_kinds([UNGATED_KIND, GATED_KIND], _reported("not-a-version"))
+
+    assert decision.admitted == (UNGATED_KIND,)
+    assert _causes(decision) == {GATED_KIND: CompanionEmitOmission.UNPARSEABLE_REPORTED_VERSION}
+    assert decision.omissions[0].reported_version == "not-a-version"
+
+
+def test_gate_returns_rather_than_raises_on_diagnostics_that_fail_validation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # T-4-10: raising would become a RuntimeSourceError, then a 409, and would deny the WHOLE
+    # manifest to precisely the stale client this gate exists to protect.
+    _with_gated_kind(monkeypatch)
+
+    decision = _gate_companion_kinds(
+        [UNGATED_KIND, GATED_KIND], _observation({"schemaVersion": "something-else"})
+    )
+
+    assert decision.admitted == (UNGATED_KIND,)
+    assert _causes(decision) == {GATED_KIND: CompanionEmitOmission.INVALID_DIAGNOSTICS}
+
+
+@pytest.mark.parametrize(
+    ("label", "diagnostics"),
+    [
+        ("purged payload", {}),
+        ("explicit null version", _observed_diagnostics(None)),
+        ("unvalidatable diagnostics", {"schemaVersion": "something-else"}),
+    ],
+)
+def test_gate_admits_the_ungated_floor_under_every_present_absent_version_cause(
+    monkeypatch: pytest.MonkeyPatch, label: str, diagnostics: object
+) -> None:
+    # D-15's "no observed version means the backend emits only the legacy filebrowser shape".
+    # The floor is admitted UNCONDITIONALLY: every deployed CLI already parses it, so withholding
+    # it would withdraw a working companion to enforce a rule protecting kinds that do not exist.
+    _with_gated_kind(monkeypatch)
+
+    decision = _gate_companion_kinds([UNGATED_KIND, GATED_KIND], _observation(diagnostics))
+
+    assert decision.admitted == (UNGATED_KIND,), label
+    assert [record.kind for record in decision.omissions] == [GATED_KIND], label
+
+
+def test_gate_admits_the_ungated_floor_when_there_is_no_observation_row(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The fourth absent-version cause, which cannot be parametrized with the other three
+    # because it has no observation object at all.
+    _with_gated_kind(monkeypatch)
+
+    decision = _gate_companion_kinds([UNGATED_KIND, GATED_KIND], None)
+
+    assert decision.admitted == (UNGATED_KIND,)
+    assert [record.kind for record in decision.omissions] == [GATED_KIND]
+
+
+def test_gate_omits_a_prerelease_of_the_minimum(monkeypatch: pytest.MonkeyPatch) -> None:
+    # semver 2.0.0 precedence: a prerelease sorts BELOW the release it precedes, so 2.0.0-rc.1
+    # does not satisfy a minimum of 2.0.0. It is a build before the release, not the release.
+    _with_gated_kind(monkeypatch)
+
+    decision = _gate_companion_kinds([GATED_KIND], _reported("2.0.0-rc.1"))
+
+    assert decision.admitted == ()
+    assert _causes(decision) == {GATED_KIND: CompanionEmitOmission.STALE_REPORTED_VERSION}
+
+
+def test_gate_strips_the_package_spec_prefix_from_the_reported_version(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Mirrors `project_runtime_skills.py`'s `removeprefix("clawdi@")`: some reporters send the
+    # package spec rather than the bare version, and an unstripped spec is unparseable -- which
+    # would fail a runtime closed for a version that is in fact current.
+    _with_gated_kind(monkeypatch)
+
+    decision = _gate_companion_kinds([GATED_KIND], _reported("clawdi@2.0.0"))
+
+    assert decision.admitted == (GATED_KIND,)
+    assert decision.omissions == ()
+
+
+def test_gate_admits_a_declared_key_the_registry_does_not_know() -> None:
+    # The gate compares against a DECLARED minimum. A key with no registry entry has no declared
+    # minimum, so it is outside the gate's remit and passes through to D-05/D-06/D-14's
+    # graceful-degradation path. Gating it away instead would make 04-04's `unsupportedCompanions`
+    # observation unreachable in production -- the backend would never send the kind whose
+    # arrival is the only thing that populates that field.
+    decision = _gate_companion_kinds([UNGATED_KIND, "unregistered"], _reported("1.0.0"))
+
+    assert set(decision.admitted) == {UNGATED_KIND, "unregistered"}
+    assert decision.omissions == ()
+
+
+def test_every_omission_cause_is_named_by_the_vocabulary_docstring() -> None:
+    # An operator reads the cause, then the docstring, to learn what it means. A cause added
+    # without an explanation there is a cause nobody can act on; the count sentence is pinned so
+    # the prose cannot quietly drift from the members (plan 06-10 added the seventh).
+    doc = CompanionEmitOmission.__doc__ or ""
+    assert len(CompanionEmitOmission) == 7
+    assert "Seven named causes" in doc
+    for cause in CompanionEmitOmission:
+        assert f"``{cause.name}``" in doc, f"{cause.name} is not explained"
+
+
+@pytest.mark.parametrize(
+    "diagnostics",
+    [None, [], "a string", 7, {}, {"schemaVersion": None}, {"activeCliVersion": {"nested": 1}}],
+)
+def test_gate_never_raises_for_any_diagnostics_shape(
+    monkeypatch: pytest.MonkeyPatch, diagnostics: object
+) -> None:
+    _with_gated_kind(monkeypatch)
+
+    decision = _gate_companion_kinds([UNGATED_KIND, GATED_KIND], _observation(diagnostics))
+
+    assert decision.admitted == (UNGATED_KIND,)
+    assert len(decision.omissions) == 1
+
+
+def test_gate_omission_records_carry_no_companion_entry_value(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # T-4-07: a companion entry embeds a live HS256 secret. The gate's parameter is a collection
+    # of KEYS, so an entry value is structurally unavailable to it -- the same discipline
+    # `collectUnsupportedCompanions` uses on the CLI side.
+    _with_gated_kind(monkeypatch)
+
+    decision = _gate_companion_kinds([UNGATED_KIND, GATED_KIND], _reported("1.0.0"))
+
+    rendered = repr(decision.omissions)
+    assert "s" * 43 not in rendered
+    assert rendered.count(GATED_KIND) == 1
+
+
+# --- The gate wired into `render_runtime_source` -------------------------------------------
+#
+# The pre-change render condition was `companions is not None and companions.filebrowser is not
+# None`. 04-02-SUMMARY.md recorded it as deliberately left standing and handed here. It has two
+# separable problems and this section fixes both: it emits kinds the receiving CLI may not be
+# able to parse (COMP-03), and it DROPS a companions block that carries no filebrowser entry, so
+# an admitted non-filebrowser kind could never be emitted at all (T-4-28, the opposite of
+# COMP-01's intent).
+
+DEPLOYMENT_ID = "dep_test"
+FILEBROWSER_SECRET = "s" * 43
+GATED_ENTRY = {"kind": GATED_KIND, "artifact": {"sha256": "a" * 64}}
+
+
+def _companions_batch(
+    companions: dict[str, object] | None,
+    *,
+    observation: HostedRuntimeConfigObservation | None = None,
+) -> RuntimeSourceBatch:
+    batch = _batch()
+    row = batch.rows[ENV_ID]
+    assert row.state is not None
+    row.state.companions = companions
+    batch.rows[ENV_ID] = RuntimeSourceRow(row.environment, row.state, observation)
+    return batch
+
+
+@pytest.mark.parametrize(
+    ("label", "observation"),
+    [
+        ("never reported", None),
+        ("purged payload", _observation({})),
+        ("explicit null version", _reported(None)),
+        ("unparseable version", _reported("not-a-version")),
+        ("current version", _reported("1.2.3")),
+    ],
+)
+def test_render_leaves_the_filebrowser_companions_block_byte_identical(
+    label: str, observation: HostedRuntimeConfigObservation | None
+) -> None:
+    # COMP-01/D-04 wire parity, asserted at the RENDER site rather than only at the parse site.
+    # The baseline is the exact dump the pre-change line produced on the exact fixture the
+    # manifest suites use, which is what 04-02-SUMMARY.md records as the wire-parity baseline.
+    wire = filebrowser_companion(DEPLOYMENT_ID)
+    baseline = runtime_schemas.HostedRuntimeCompanions.model_validate(wire).model_dump(
+        exclude_none=True, exclude_unset=True, mode="json"
+    )
+
+    source = _render(_companions_batch(dict(wire), observation=observation))
+
+    rendered = json.dumps(source.manifest["companions"], sort_keys=True)
+    assert rendered == json.dumps(baseline, sort_keys=True), label
+    assert rendered == json.dumps(wire, sort_keys=True), label
+    # `filebrowser` is ungated at minCliVersion 0.0.0, so NO observation state withholds it.
+    # This is the "no behaviour change for a current fleet" guarantee, measured.
+    assert source.companion_omissions == (), label
+
+
+def test_render_omits_a_gated_kind_and_keeps_the_rest_of_the_companions_block(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _with_gated_kind(monkeypatch)
+    wire = {**filebrowser_companion(DEPLOYMENT_ID), GATED_KIND: GATED_ENTRY}
+
+    source = _render(_companions_batch(wire, observation=_reported("1.9.9")))
+
+    # The gate omits ONE kind. The stale client still receives the rest of its manifest -- that
+    # is the whole difference between this gate and the 409 a raise would have produced.
+    assert set(source.manifest["companions"]) == {UNGATED_KIND}
+    assert source.manifest["runtimes"]
+
+
+def test_render_emits_a_gated_kind_to_a_runtime_at_its_minimum(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _with_gated_kind(monkeypatch)
+    wire = {**filebrowser_companion(DEPLOYMENT_ID), GATED_KIND: GATED_ENTRY}
+
+    source = _render(_companions_batch(wire, observation=_reported(GATED_MIN_CLI_VERSION)))
+
+    assert set(source.manifest["companions"]) == {UNGATED_KIND, GATED_KIND}
+    assert source.companion_omissions == ()
+
+
+def test_render_omits_the_companions_key_entirely_when_every_kind_is_gated_away(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Absent, not present-and-empty. An empty `companions: {}` is a positive statement that the
+    # runtime should converge to zero companions, which would STOP a running filebrowser -- the
+    # availability regression D-14 rejects, arriving through the emit path instead.
+    _with_gated_kind(monkeypatch)
+
+    source = _render(_companions_batch({GATED_KIND: GATED_ENTRY}, observation=_reported("1.0.0")))
+
+    assert "companions" not in source.manifest
+
+
+def test_render_emits_an_admitted_non_filebrowser_kind(monkeypatch: pytest.MonkeyPatch) -> None:
+    # T-4-28. This case FAILS against the pre-change `companions.filebrowser is not None`
+    # condition, which dropped the whole block when no filebrowser entry was present.
+    _with_gated_kind(monkeypatch, min_cli_version="0.0.0")
+
+    source = _render(_companions_batch({GATED_KIND: GATED_ENTRY}, observation=_reported("1.0.0")))
+
+    assert source.manifest["companions"] == {GATED_KIND: GATED_ENTRY}
+
+
+def test_render_still_raises_for_invalid_stored_companion_state() -> None:
+    # The distinction this plan must preserve: invalid STATE fails closed loudly with a 409;
+    # an unprovable VERSION omits one kind quietly and the rest of the manifest renders.
+    batch = _companions_batch({"filebrowzer": {"nonsense": True}})
+
+    with pytest.raises(RuntimeSourceError):
+        _render(batch)
+
+
+def test_render_records_each_omission_with_its_cause_and_both_versions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _with_gated_kind(monkeypatch)
+    wire = {**filebrowser_companion(DEPLOYMENT_ID), GATED_KIND: GATED_ENTRY}
+
+    source = _render(_companions_batch(wire, observation=_reported("1.9.9")))
+
+    assert len(source.companion_omissions) == 1
+    record = source.companion_omissions[0]
+    assert record.kind == GATED_KIND
+    assert record.cause is CompanionEmitOmission.STALE_REPORTED_VERSION
+    assert record.reported_version == "1.9.9"
+    assert record.required_min_cli_version == GATED_MIN_CLI_VERSION
+
+
+def test_render_records_the_fail_closed_cause_when_the_runtime_has_never_reported(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # D-15 end to end: a first boot receives the legacy filebrowser shape and nothing else.
+    _with_gated_kind(monkeypatch)
+    wire = {**filebrowser_companion(DEPLOYMENT_ID), GATED_KIND: GATED_ENTRY}
+
+    source = _render(_companions_batch(wire, observation=None))
+
+    assert set(source.manifest["companions"]) == {UNGATED_KIND}
+    assert source.companion_omissions[0].cause is CompanionEmitOmission.NO_OBSERVATION
+    assert source.companion_omissions[0].reported_version is None
+
+
+def test_render_omission_records_never_carry_a_companion_entry_value(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # T-4-07, with the real thing rather than a synthetic plant: the filebrowser entry embeds a
+    # live HS256 secret at `auth.secret`. Gate filebrowser itself away and search the record.
+    monkeypatch.setitem(COMPANION_REGISTRY, UNGATED_KIND, _gated_entry("9.9.9"))
+    wire = filebrowser_companion(DEPLOYMENT_ID)
+    assert wire[UNGATED_KIND]["auth"]["secret"] == FILEBROWSER_SECRET
+
+    source = _render(_companions_batch(dict(wire), observation=_reported("1.0.0")))
+
+    assert "companions" not in source.manifest
+    rendered = repr(source.companion_omissions)
+    assert FILEBROWSER_SECRET not in rendered
+    assert "auth" not in rendered
+    assert CompanionEmitOmission.STALE_REPORTED_VERSION.value in rendered
+
+
+def test_runtime_bundle_does_not_carry_companion_omissions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The omission record is a CONTROL-PLANE diagnostic. Putting it on the wire would be a
+    # manifest schema change this phase does not make, and would tell every runtime which kinds
+    # it is being denied.
+    _with_gated_kind(monkeypatch)
+    wire = {**filebrowser_companion(DEPLOYMENT_ID), GATED_KIND: GATED_ENTRY}
+
+    bundle = render_runtime_bundle(_render(_companions_batch(wire, observation=_reported("1.0.0"))))
+
+    assert GATED_KIND not in json.dumps(bundle)
+
+
+@pytest.mark.parametrize("mode", ["custom", "connection"])
+def test_provider_identity_projection_is_explicit_and_reactivation_fences_legacy(mode):
+    from datetime import UTC, datetime
+
+    from app.services.runtime_source import RuntimeSourceCapabilityError
+
+    batch = connection_source_fixture()
+    provider = batch.providers[(USER_ID, "saved-connection")]
+    provider.configuration_mode = mode
+    provider.incarnation_id = uuid4()
+    provider.identity_enabled = False
+    arguments = dict(
+        environment_id=ENV_ID,
+        public_api_url="https://cloud.test/",
+        vault_key_identity="vault-key-generation-1",
+        decrypt_secrets=False,
+    )
+    current = render_runtime_source(batch, **arguments)
+    legacy = render_runtime_source(batch, project_provider_identity=False, **arguments)
+    assert current.manifest == legacy.manifest
+    assert current.source_revision == legacy.source_revision
+    assert "cloudIdentity" not in current.manifest["providers"][provider.provider_id]
+    identity = provider.id, provider.incarnation_id
+    provider.archived_at = datetime.now(UTC)
+    provider.activate()
+    assert provider.id == identity[0] and provider.incarnation_id != identity[1]
+    assert provider.identity_enabled is True
+    strict = render_runtime_source(batch, **arguments)
+    assert strict.manifest["providers"][provider.provider_id]["cloudIdentity"] == {
+        "providerUuid": str(provider.id),
+        "incarnationId": str(provider.incarnation_id),
+    }
+    with pytest.raises(RuntimeSourceCapabilityError):
+        render_runtime_source(batch, project_provider_identity=False, **arguments)
+    provider.identity_enabled = False
+    provider.identity_handoff = {
+        "state": "completed",
+        "provider_uuid": str(provider.id),
+        "incarnation_id": str(provider.incarnation_id),
+    }
+    assert (
+        "cloudIdentity"
+        in render_runtime_source(batch, **arguments).manifest["providers"][provider.provider_id]
+    )
+    with pytest.raises(RuntimeSourceCapabilityError):
+        render_runtime_source(batch, project_provider_identity=False, **arguments)

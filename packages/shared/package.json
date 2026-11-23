@@ -1,0 +1,32 @@
+{
+	"name": "@clawdi/shared",
+	"version": "0.1.0",
+	"private": true,
+	"type": "module",
+	"exports": {
+		".": "./src/index.ts",
+		"./client": "./src/client.ts",
+		"./desktop": "./src/desktop.ts",
+		"./destinations": "./src/destinations.ts",
+		"./consts": "./src/consts/index.ts",
+		"./sharing": "./src/sharing/agent-handoff.ts",
+		"./x402": "./src/x402/index.ts",
+		"./api": "./src/api/index.ts",
+		"./style/theme.css": "./src/style/theme.css"
+	},
+	"scripts": {
+		"typecheck": "tsc --noEmit",
+		"test": "../../scripts/test.sh shared",
+		"test:internal": "bun test src"
+	},
+	"dependencies": {
+		"@x402/core": "2.23.0",
+		"@x402/evm": "2.23.0",
+		"@x402/fetch": "2.23.0",
+		"viem": "2.55.19"
+	},
+	"devDependencies": {
+		"@types/bun": "^1.4.0",
+		"typescript": "catalog:"
+	}
+}

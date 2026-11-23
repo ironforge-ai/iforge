@@ -1,0 +1,180 @@
+import chalk from "chalk";
+import { readJson } from "../lib/api-client";
+import { getClawdiAccessToken } from "../lib/clerk-oauth";
+import { getAuth, getConfig } from "../lib/config";
+import { resolveProjectId } from "../lib/project-resolver";
+import { getEnvIdByAgent } from "../lib/select-adapter";
+import {
+	isVaultProjectNotFoundBody,
+	VAULT_PROJECT_ACCESS_ERROR,
+	VAULT_PROJECT_ACCESS_HINT,
+} from "../lib/vault-errors";
+
+interface VaultResolveHit {
+	key: string;
+	value?: string;
+	source_project_id: string;
+	source_alias: string;
+	vault_slug?: string | null;
+	section?: string;
+	item_name?: string;
+	precedence?: Array<{
+		project_id: string;
+		alias: string;
+		hit: boolean;
+		reason: "match" | "not-found" | "skipped" | "conflict";
+		binding_type?: string;
+		priority?: number;
+	}>;
+	conflicts?: Array<{
+		project_id: string;
+		alias: string;
+		display?: string;
+		binding_type?: string;
+		priority?: number;
+		vault_slug?: string | null;
+	}>;
+}
+
+export async function vaultResolveCommand(
+	key: string,
+	opts: {
+		project?: string;
+		agent?: string;
+		allowConflicts?: boolean;
+		debug?: boolean;
+		json?: boolean;
+		dryRun?: boolean;
+	} = {},
+): Promise<void> {
+	const { apiUrl } = getConfig();
+	const auth = getAuth();
+	if (!auth?.apiKey) {
+		console.error(chalk.red("Not logged in. Run `iforge auth login` first."));
+		process.exitCode = 1;
+		return;
+	}
+	const accessToken = await getClawdiAccessToken(apiUrl);
+	if (opts.project && opts.agent) {
+		console.error(chalk.red("Pass either --project or --agent, not both."));
+		process.exitCode = 1;
+		return;
+	}
+
+	const params = new URLSearchParams({
+		key,
+	});
+	if (opts.project) {
+		const projectId = await resolveProjectId(apiUrl, accessToken, opts.project);
+		params.set("project_id", projectId);
+	}
+	if (opts.agent) {
+		params.set("agent_id", resolveAgentId(opts.agent));
+	}
+	if (opts.allowConflicts) params.set("allow_conflicts", "true");
+	if (opts.debug) params.set("debug", "true");
+	if (opts.dryRun) params.set("preview", "true");
+
+	const r = await fetch(`${apiUrl}/v1/vault/resolve?${params.toString()}`, {
+		method: "POST",
+		headers: { Authorization: `Bearer ${accessToken}` },
+	});
+	let body: VaultResolveHit | { detail?: unknown };
+	try {
+		body = await readJson<VaultResolveHit | { detail?: unknown }>(r, "/v1/vault/resolve");
+	} catch (e) {
+		if (r.ok) throw e;
+		body = {};
+	}
+
+	if (!r.ok) {
+		if (opts.json) {
+			console.log(JSON.stringify(body, null, 2));
+		} else if (r.status === 404) {
+			if (isVaultProjectNotFoundBody(body)) {
+				console.error(chalk.red(VAULT_PROJECT_ACCESS_ERROR));
+				console.error(chalk.gray(VAULT_PROJECT_ACCESS_HINT));
+			} else {
+				console.error(chalk.red(`No vault value found for ${key}.`));
+			}
+		} else if (r.status === 403) {
+			console.error(chalk.red("vault resolve requires CLI authentication."));
+		} else if (r.status === 409) {
+			const detail = (body as { detail?: { code?: string; message?: string } }).detail;
+			console.error(chalk.red(detail?.message ?? "Vault conflict blocked."));
+			if (detail?.code === "ambiguous_vault_reference_slug") {
+				console.error(
+					chalk.gray(
+						"Repair or rename the conflicting Vault namespace before resolving this reference.",
+					),
+				);
+			} else {
+				console.error(
+					chalk.gray(
+						"Re-run with --allow-conflicts to use the first project by Vault resolution priority.",
+					),
+				);
+			}
+		} else {
+			console.error(chalk.red(`vault resolve failed (${r.status}).`));
+		}
+		process.exitCode = 1;
+		return;
+	}
+
+	if (opts.json) {
+		console.log(JSON.stringify(body, null, 2));
+		return;
+	}
+
+	const hit = body as VaultResolveHit;
+	if (opts.dryRun) {
+		console.log(
+			`${chalk.green("✓")} ${key} resolves from ${hit.source_alias} ${chalk.gray("(redacted)")}`,
+		);
+		if (opts.debug && hit.precedence) {
+			printPrecedence(hit);
+		}
+		return;
+	}
+	if (typeof hit.value !== "string") {
+		console.error(chalk.red("vault resolve returned no value."));
+		process.exitCode = 1;
+		return;
+	}
+	console.log(`${hit.value}  ${chalk.gray(`(from ${hit.source_alias})`)}`);
+
+	if (opts.debug && hit.precedence) {
+		printPrecedence(hit);
+	}
+}
+
+function printPrecedence(hit: VaultResolveHit): void {
+	if (!hit.precedence) return;
+	console.log(chalk.gray("  searched:"));
+	for (const entry of hit.precedence) {
+		const suffix =
+			entry.reason === "match"
+				? chalk.green("match")
+				: entry.reason === "conflict"
+					? chalk.red("conflict")
+					: entry.reason === "skipped"
+						? chalk.yellow("skipped")
+						: chalk.gray("not found");
+		const agentUse = entry.binding_type
+			? chalk.gray(` ${formatAgentUse(entry.binding_type)}:${entry.priority}`)
+			: "";
+		console.log(`    ${entry.alias} ${suffix}${agentUse}`);
+	}
+}
+
+function resolveAgentId(agent: string): string {
+	const localEnvId = getEnvIdByAgent(agent);
+	return localEnvId ?? agent;
+}
+
+function formatAgentUse(value: string): string {
+	if (value === "primary") return "agent-project";
+	if (value === "context") return "attached";
+	return value;
+}

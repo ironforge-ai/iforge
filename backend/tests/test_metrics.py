@@ -1,0 +1,200 @@
+from __future__ import annotations
+
+import base64
+import os
+import re
+import subprocess
+import sys
+import uuid
+from pathlib import Path
+
+import httpx
+from sqlalchemy import text
+
+from app.core.config import settings
+from app.core.database import engine
+from app.services.metrics import render_metrics
+
+
+def _metrics_text() -> str:
+    return render_metrics().decode("utf-8")
+
+
+def _basic(user: str, password: str) -> str:
+    encoded = base64.b64encode(f"{user}:{password}".encode()).decode()
+    return f"Basic {encoded}"
+
+
+def _metric_value(name: str, labels: dict[str, str]) -> float:
+    label_text = ",".join(f'{key}="{value}"' for key, value in labels.items())
+    pattern = rf"^{re.escape(name)}\{{{re.escape(label_text)}\}} ([0-9.]+)$"
+    match = re.search(pattern, _metrics_text(), re.MULTILINE)
+    return float(match.group(1)) if match else 0.0
+
+
+def _unlabeled_metric_value(name: str) -> float:
+    match = re.search(rf"^{re.escape(name)} ([-+0-9.eE]+)$", _metrics_text(), re.MULTILINE)
+    return float(match.group(1)) if match else 0.0
+
+
+def test_metrics_exports_all_expected_metrics() -> None:
+    text = _metrics_text()
+    assert "msg_router_inbound_total" in text
+    assert "msg_router_outbound_total" in text
+    assert "msg_router_outbound_errors_total" in text
+    assert "msg_router_discord_command_fanout_runs_total" in text
+    assert "msg_router_rate_limit_rejects_total" in text
+    assert "msg_router_ingress_errors_total" in text
+    assert "msg_router_proxy_latency_seconds" in text
+    assert "msg_router_active_polls" in text
+    assert "msg_router_webhook_deliveries_total" in text
+    assert "msg_router_webhook_ttl_drops_total" in text
+    assert "msg_router_channel_queue_pending" in text
+    assert "msg_router_channel_queue_stuck_pending" in text
+    assert "msg_router_channel_queue_oldest_pending_age_seconds" in text
+    assert "msg_router_channel_retention_deletions_total" in text
+    assert "msg_router_channel_retention_secret_scrubs_total" in text
+    assert "msg_router_channel_retention_budget_exhaustions_total" in text
+    assert "clawdi_backend_event_loop_lag_seconds" in text
+    assert "clawdi_backend_db_query_duration_seconds" in text
+    assert "clawdi_backend_db_connection_hold_duration_seconds" in text
+    assert "clawdi_backend_db_pool_checked_out" in text
+    assert "clawdi_backend_db_pool_timeouts_total" in text
+    assert "clawdi_backend_embedding_in_flight" in text
+    assert "clawdi_backend_embedding_duration_seconds" in text
+    assert "clawdi_backend_embedding_rejections_total" in text
+
+
+async def test_database_metrics_follow_connection_lifecycle() -> None:
+    query_count_before = _unlabeled_metric_value("clawdi_backend_db_query_duration_seconds_count")
+    hold_count_before = _unlabeled_metric_value(
+        "clawdi_backend_db_connection_hold_duration_seconds_count"
+    )
+    checked_out_before = _unlabeled_metric_value("clawdi_backend_db_pool_checked_out")
+
+    async with engine.connect() as connection:
+        await connection.execute(text("SELECT 1"))
+        assert _unlabeled_metric_value("clawdi_backend_db_pool_checked_out") == (
+            checked_out_before + 1
+        )
+
+    assert (
+        _unlabeled_metric_value("clawdi_backend_db_query_duration_seconds_count")
+        == query_count_before + 1
+    )
+    assert (
+        _unlabeled_metric_value("clawdi_backend_db_connection_hold_duration_seconds_count")
+        == hold_count_before + 1
+    )
+    assert _unlabeled_metric_value("clawdi_backend_db_pool_checked_out") == checked_out_before
+
+
+def test_metrics_aggregate_counters_across_processes(tmp_path: Path) -> None:
+    env = os.environ.copy()
+    env["PROMETHEUS_MULTIPROC_DIR"] = str(tmp_path)
+    backend_root = Path(__file__).parents[1]
+    increment = (
+        "from app.services.metrics import inbound_messages; "
+        'inbound_messages.labels(channel="multiprocess-test").inc()'
+    )
+    for _ in range(2):
+        subprocess.run([sys.executable, "-c", increment], cwd=backend_root, env=env, check=True)
+    rendered = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "from app.services.metrics import render_metrics; "
+            "print(render_metrics().decode(), end='')",
+        ],
+        cwd=backend_root,
+        env=env,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+
+    assert 'msg_router_inbound_total{channel="multiprocess-test"} 2.0' in rendered
+
+
+async def test_metrics_route_allows_when_no_auth_is_configured(
+    client: httpx.AsyncClient,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(settings, "metrics_bearer_token", "")
+    monkeypatch.setattr(settings, "metrics_basic_auth_password", "")
+
+    response = await client.get("/metrics")
+
+    assert response.status_code == 200
+    assert "msg_router_inbound_total" in response.text
+
+
+async def test_metrics_route_supports_bearer_auth(
+    client: httpx.AsyncClient,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(settings, "metrics_bearer_token", "secret-token")
+    monkeypatch.setattr(settings, "metrics_basic_auth_password", "")
+
+    unauthorized = await client.get("/metrics", headers={"Authorization": "Bearer wrong"})
+    authorized = await client.get("/metrics", headers={"Authorization": "Bearer secret-token"})
+
+    assert unauthorized.status_code == 401
+    assert unauthorized.headers["www-authenticate"] == "Bearer"
+    assert authorized.status_code == 200
+
+
+async def test_metrics_route_supports_basic_auth(
+    client: httpx.AsyncClient,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(settings, "metrics_bearer_token", "")
+    monkeypatch.setattr(settings, "metrics_basic_auth_user", "prometheus")
+    monkeypatch.setattr(settings, "metrics_basic_auth_password", "secret-password")
+
+    unauthorized = await client.get(
+        "/metrics",
+        headers={"Authorization": _basic("prometheus", "wrong")},
+    )
+    authorized = await client.get(
+        "/metrics",
+        headers={"Authorization": _basic("prometheus", "secret-password")},
+    )
+
+    assert unauthorized.status_code == 401
+    assert authorized.status_code == 200
+
+
+async def test_telegram_webhook_increments_inbound_metric(
+    client: httpx.AsyncClient,
+    channel_agent,
+) -> None:
+    before = _metric_value("msg_router_inbound_total", {"channel": "telegram"})
+    created = (
+        await client.post(
+            "/v1/channels",
+            json={"provider": "telegram", "name": f"metrics-{uuid.uuid4().hex}"},
+        )
+    ).json()
+    pair = (
+        await client.post(
+            f"/v1/channels/{created['id']}/pair-codes",
+            json={"ttl_seconds": 900},
+        )
+    ).json()
+
+    response = await client.post(
+        f"/v1/channels/telegram/{created['id']}/webhook",
+        headers={"x-telegram-bot-api-secret-token": created["webhook_secret"]},
+        json={
+            "update_id": int(uuid.uuid4().int % 1_000_000_000),
+            "message": {
+                "message_id": 1,
+                "chat": {"id": 42, "type": "private", "first_name": "Metrics"},
+                "text": f"/clawdi_pair {pair['code']}",
+            },
+        },
+    )
+
+    assert response.status_code == 200
+    assert _metric_value("msg_router_inbound_total", {"channel": "telegram"}) == before + 1.0

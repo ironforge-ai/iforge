@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  iforge wordmark candidate
+  The full name in a squared geometric alphabet drawn as outlines.
+
+  Authored from scratch for iforge. Not traced from, derived from, or
+  recoloured from any pre-existing artwork (MIGR-04).
+
+  Colour lives in exactly one place: the fill attribute on the root element.
+  Do not switch this to currentColor. The rasteriser available on this host
+  (ImageMagick MSVG fallback, rsvg-convert absent) renders currentColor as
+  nothing at all, which would silently generate empty PNGs downstream.
+  Light accent #c96442, dark accent #d97757.
+
+  Pairs with wordmark-monogram.svg. This file is for the in-app logo only;
+  a wordmark cannot survive a 16px square, so the companion carries the
+  icon sizes. The two must be regenerated together or the pair drifts.
+-->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 341 126" width="341" height="126" fill="#c96442" role="img" aria-label="iforge wordmark candidate">
+  <path fill-rule="evenodd" d="M10 21 L21 21 L21 10 L10 10 Z M10 90 L21 90 L21 34 L10 34 Z M45 34 L36 34 L36 45 L45 45 L45 90 L56 90 L56 45 L75 45 L75 34 L56 34 L56 21 L75 21 L75 10 L45 10 Z M84 46 L84 78 L96 90 L134 90 L146 78 L146 46 L134 34 L96 34 Z M100 45 L130 45 L135 50 L135 74 L130 79 L100 79 L95 74 L95 50 Z M155 90 L166 90 L166 45 L189 45 L189 34 L155 34 Z M198 46 L198 78 L210 90 L249 90 L249 105 L201 105 L212 116 L260 116 L260 46 L248 34 L210 34 Z M214 45 L244 45 L249 50 L249 74 L244 79 L214 79 L209 74 L209 50 Z M269 46 L269 78 L281 90 L319 90 L319 79 L280 79 L280 68 L331 68 L331 46 L319 34 L281 34 Z M284 45 L316 45 L320 49 L320 53 L316 57 L284 57 L280 53 L280 49 Z"/>
+</svg>

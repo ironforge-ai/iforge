@@ -1,0 +1,116 @@
+import type { paths } from "@clawdi/shared/api";
+import createClient from "openapi-fetch";
+import { env } from "@/lib/env";
+
+/**
+ * Agent-friendly format proxies for shared sessions.
+ *
+ * Visitor-facing URL is `/s/{id}.md` (and `.json`); TanStack Start routes
+ * those extension paths directly to this handler.
+ *
+ * `id` is a frozen share UUID. A 404 falls back to the legacy Session UUID
+ * route so links created before immutable shares remain valid.
+ *
+ * **Anonymous-only proxy**: no Clerk token is forwarded to the backend.
+ * TanStack Start may still run Clerk request middleware for browser state,
+ * but this handler intentionally avoids `auth()`. The target consumer is
+ * unauthenticated agents (ChatGPT / Claude WebFetch / curl); the owner-private
+ * "export my session" path goes through the dashboard's owner-auth
+ * `/v1/sessions/{id}/export.md` instead.
+ *
+ * Backend status codes pass through verbatim, including 410 for revoked
+ * frozen links and the legacy route's authorization responses.
+ */
+
+const ALLOWED_FORMATS = new Set(["md", "json"]);
+
+const FORMAT_MEDIA_TYPE: Record<string, string> = {
+	md: "text/markdown; charset=utf-8",
+	json: "application/json; charset=utf-8",
+};
+
+const NO_STORE_HEADERS = { "cache-control": "no-store" };
+
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+export function publicSessionExportErrorMessage(status: number): string {
+	switch (status) {
+		case 401:
+			return "Authentication required.";
+		case 403:
+			return "You do not have access to this shared session.";
+		case 404:
+			return "Not found";
+		case 410:
+			return "This shared session link has expired.";
+		default:
+			if (status >= 500) {
+				return "The service is having trouble right now. Please try again in a moment.";
+			}
+			return "Unable to export this shared session.";
+	}
+}
+
+export async function GET(
+	_request: Request,
+	{ id, format }: { id: string; format: string },
+): Promise<Response> {
+	if (!ALLOWED_FORMATS.has(format)) {
+		return new Response("Not found", {
+			status: 404,
+			headers: NO_STORE_HEADERS,
+		});
+	}
+	if (!UUID_RE.test(id)) {
+		return new Response("Not found", {
+			status: 404,
+			headers: NO_STORE_HEADERS,
+		});
+	}
+
+	const api = createClient<paths>({ baseUrl: env.VITE_IFORGE_API_URL });
+	const frozen =
+		format === "md"
+			? await api.GET("/v1/public/session-shares/{share_id}/export.md", {
+					params: { path: { share_id: id } },
+					parseAs: "text",
+					cache: "no-store",
+				})
+			: await api.GET("/v1/public/session-shares/{share_id}/export.json", {
+					params: { path: { share_id: id } },
+					parseAs: "text",
+					cache: "no-store",
+				});
+	const result =
+		frozen.error === undefined || frozen.response.status !== 404
+			? frozen
+			: format === "md"
+				? await api.GET("/v1/public/sessions/{session_id}/export.md", {
+						params: { path: { session_id: id } },
+						parseAs: "text",
+						cache: "no-store",
+					})
+				: await api.GET("/v1/public/sessions/{session_id}/export.json", {
+						params: { path: { session_id: id } },
+						parseAs: "text",
+						cache: "no-store",
+					});
+
+	if (result.error !== undefined) {
+		return new Response(publicSessionExportErrorMessage(result.response.status), {
+			status: result.response.status,
+			headers: {
+				...NO_STORE_HEADERS,
+				"content-type": "text/plain; charset=utf-8",
+			},
+		});
+	}
+
+	return new Response(result.data, {
+		status: 200,
+		headers: {
+			...NO_STORE_HEADERS,
+			"content-type": FORMAT_MEDIA_TYPE[format],
+		},
+	});
+}

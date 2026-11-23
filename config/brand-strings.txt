@@ -1,0 +1,50 @@
+# The brand-string authority -- phase 03.3, plan 09 (MIGR-03).
+#
+# GENERATED from the naming rules in the phase UI-SPEC's Copywriting Contract (N1-N6) and
+# from a measurement of the compounds the tree actually uses:
+#
+#   git grep -ohE '(<legacy>|iforge) [A-Z][A-Za-z]+' -- packages/cli/src apps/web/src \
+#     packages/shared/src | sort | uniq -c
+#
+# which returned exactly the eleven qualifiers listed below and no twelfth. The measurement is
+# recorded rather than the command being trusted: a qualifier added later has to be added here
+# deliberately, which is the point of an authority file.
+#
+# ASSERTED EQUAL TO the bundled record `BRAND` in packages/cli/src/lib/brand.ts, by
+# packages/cli/src/lib/brand.test.ts, in BOTH directions -- neither side may carry an entry the
+# other does not. The module writes its entries out verbatim rather than reading this file at
+# runtime because it is bundled into a native binary that has no repository beside it; that
+# test is the only thing stopping the two drifting. Same idiom, same reason, as
+# config/rebrand-env-contract.txt and packages/cli/src/lib/brand-env.ts.
+#
+# READ BY scripts/rewrite_brand_strings.py as its substitution source of truth. That script
+# rewrites user-visible strings across upstream-aligned source, so every value here is a
+# string the sweep can WRITE INTO the tree. Nothing else belongs in this file.
+#
+# GRAMMAR: one `<key>=<value>` pair per line, sorted. Blank lines and lines whose first
+# character is `#` are skipped. A line with no `=` is malformed and makes the parser throw --
+# it is not skipped, because a silently skipped entry is an entry the record can then drop.
+#
+# NOT IN THIS FILE, deliberately: URLs, email addresses, domains and any other destination.
+# The destinations authority in packages/shared owns those. The two are separate because this
+# file is a substitution source: a destination listed here would become a destination the
+# rewrite script writes into source it was never asked to touch.
+#
+# CASING (N1 / D-04): the product name is lowercase everywhere, including sentence-initially.
+# A compound keeps the QUALIFIER's case and lowercases only the product name (N2). The single
+# uppercase spelling in this file is `IFORGE_`, the public environment-register prefix, which
+# is SCREAMING_SNAKE by the convention every shell shares (N5 / D-05a).
+compoundAI=iforge AI
+compoundAPI=iforge API
+compoundCLI=iforge CLI
+compoundChannels=iforge Channels
+compoundCloud=iforge Cloud
+compoundMCP=iforge MCP
+compoundOAuth=iforge OAuth
+compoundProject=iforge Project
+compoundVault=iforge Vault
+compoundWallet=iforge Wallet
+compoundWhatsApp=iforge WhatsApp
+environmentPrefix=IFORGE_
+invocation=iforge
+productName=iforge

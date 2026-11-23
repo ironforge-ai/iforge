@@ -1,0 +1,589 @@
+import { afterEach, describe, expect, it } from "bun:test";
+import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import type { AgentType } from "../../src/adapters/agent-types";
+import { pull } from "../../src/commands/pull";
+import {
+	readProjectSkillMaterialization,
+	readSkillProjectionClaimsForAgent,
+	recordSkillProjectionClaim,
+	skillCacheKey,
+} from "../../src/lib/skills-lock";
+import { stateRootFor } from "../../src/lib/state-root";
+import { tarSkillDir } from "../../src/lib/tar";
+import { cleanupTmp, copyFixtureToTmp } from "../adapters/helpers";
+import {
+	type AgentHomeOverrideSnapshot,
+	jsonResponse,
+	mockFetch,
+	restoreAgentHomeOverrides,
+	seedAuthAndEnv,
+	snapshotAndClearAgentHomeOverrides,
+} from "./helpers";
+
+const TEST_PROJECT_ID = "00000000-0000-0000-0000-000000000099";
+
+let tmpHome: string;
+let origHome: string | undefined;
+let origHomeOverrides: AgentHomeOverrideSnapshot = {};
+let origPath: string | undefined;
+
+function setup(agent: AgentType) {
+	origHome = process.env.HOME;
+	origHomeOverrides = snapshotAndClearAgentHomeOverrides();
+	tmpHome = copyFixtureToTmp(agent);
+	process.env.HOME = tmpHome;
+	seedAuthAndEnv(tmpHome, agent);
+	if (agent === "openclaw") {
+		origPath = process.env.PATH;
+		const bin = join(tmpHome, "bin");
+		mkdirSync(bin, { recursive: true });
+		const command = join(bin, "openclaw");
+		writeFileSync(
+			command,
+			`#!/bin/sh
+if [ "$*" = "agents list --json" ]; then printf '[{"id":"main","workspace":"%s/.openclaw/agents/main"}]\n' "$HOME"; exit 0; fi
+if [ "$1 $2" = "skills install" ]; then
+  source="$3"; shift 3; slug=""
+  while [ "$#" -gt 0 ]; do [ "$1" = "--as" ] && slug="$2" && shift; shift; done
+  rm -rf "$HOME/.openclaw/agents/main/skills/$slug"
+  mkdir -p "$HOME/.openclaw/agents/main/skills/$slug"
+  cp -R "$source/." "$HOME/.openclaw/agents/main/skills/$slug/"
+  exit 0
+fi
+exit 1
+`,
+		);
+		chmodSync(command, 0o755);
+		process.env.PATH = `${bin}:${origPath ?? ""}`;
+	}
+}
+
+afterEach(() => {
+	if (origHome) process.env.HOME = origHome;
+	else delete process.env.HOME;
+	restoreAgentHomeOverrides(origHomeOverrides);
+	if (origPath !== undefined) process.env.PATH = origPath;
+	origPath = undefined;
+	origHomeOverrides = {};
+	process.exitCode = 0;
+	if (tmpHome) cleanupTmp(tmpHome);
+});
+
+/** Build a minimal tar.gz of a skill in a tmpdir, return the bytes. */
+async function buildSkillTar(skillKey: string, skillMdContent: string): Promise<Buffer> {
+	const tmp = join(tmpdir(), `skill-tar-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+	mkdirSync(join(tmp, skillKey), { recursive: true });
+	writeFileSync(join(tmp, skillKey, "SKILL.md"), skillMdContent);
+	const bytes = await tarSkillDir(join(tmp, skillKey));
+	rmSync(tmp, { recursive: true, force: true });
+	return bytes;
+}
+
+function cloudProjectList(kind: "workspace" | "personal" | "environment" = "workspace") {
+	return {
+		method: "GET",
+		path: /^\/v1\/projects(?:\?.*)?$/,
+		response: () =>
+			jsonResponse([
+				{
+					id: TEST_PROJECT_ID,
+					name: "Import Source",
+					slug: "import-source",
+					kind,
+					is_owner: true,
+				},
+			]),
+	};
+}
+
+describe("pull — Hermes fixture", () => {
+	it("uses the event head for repeat pulls while reading legacy snapshot sidecars", async () => {
+		setup("hermes");
+		const mirrorDir = join(tmpHome, ".iforge", "sessions", "hermes");
+		mkdirSync(mirrorDir, { recursive: true });
+		writeFileSync(
+			join(mirrorDir, "legacy-snapshot.meta.json"),
+			JSON.stringify({ content_hash: "snapshot-hash" }),
+		);
+		writeFileSync(join(mirrorDir, "legacy-snapshot.json"), "[]\n");
+		const sessions = [
+			{
+				id: "event-session-id",
+				local_session_id: "event-session",
+				agent_type: "hermes",
+				machine_name: "Test Mac",
+				project_path: "/tmp/project",
+				started_at: "2026-08-25T00:00:00.000Z",
+				ended_at: null,
+				message_count: 1,
+				model: null,
+				summary: null,
+				content_hash: null,
+				content_protocol: "events-v1",
+				event_head_hash: "e".repeat(64),
+			},
+			{
+				id: "snapshot-session-id",
+				local_session_id: "legacy-snapshot",
+				agent_type: "hermes",
+				machine_name: "Test Mac",
+				project_path: "/tmp/project",
+				started_at: "2026-08-25T00:00:00.000Z",
+				ended_at: null,
+				message_count: 1,
+				model: null,
+				summary: null,
+				content_hash: "snapshot-hash",
+				content_protocol: "snapshot-v1",
+				event_head_hash: null,
+			},
+		];
+		const { captured, restore } = mockFetch([
+			{
+				method: "GET",
+				path: "/v1/sessions",
+				response: () => jsonResponse({ items: sessions, total: sessions.length }),
+			},
+			{
+				method: "GET",
+				path: "/v1/sessions/event-session-id/content",
+				response: () => jsonResponse([{ role: "user", content: "safe projection" }]),
+			},
+		]);
+		try {
+			await pull({ agent: "hermes", modules: "sessions" });
+			await pull({ agent: "hermes", modules: "sessions" });
+		} finally {
+			restore();
+		}
+
+		expect(
+			captured.filter((request) => request.path === "/v1/sessions/event-session-id/content"),
+		).toHaveLength(1);
+		expect(
+			JSON.parse(readFileSync(join(mirrorDir, "event-session.meta.json"), "utf-8")),
+		).toMatchObject({
+			content_protocol: "events-v1",
+			sync_hash: "e".repeat(64),
+		});
+	});
+
+	it("bounds cloud session pagination if the backend keeps returning full pages", async () => {
+		setup("hermes");
+		const page = Array.from({ length: 200 }, (_, index) => ({
+			id: `session-${index}`,
+			local_session_id: `local-${index}`,
+			agent_type: "hermes",
+			machine_name: "Test Mac",
+			project_path: "/tmp/project",
+			started_at: "2026-06-01T00:00:00.000Z",
+			ended_at: null,
+			message_count: 1,
+			model: null,
+			summary: null,
+			content_hash: `hash-${index}`,
+		}));
+		const { captured, restore } = mockFetch([
+			{
+				method: "GET",
+				path: "/v1/sessions",
+				response: () => jsonResponse({ items: page, total: 100_000 }),
+			},
+		]);
+		try {
+			await expect(pull({ agent: "hermes", modules: "sessions" })).rejects.toThrow(
+				"Too many session pages to pull safely.",
+			);
+		} finally {
+			restore();
+		}
+		expect(captured.filter((request) => request.path.startsWith("/v1/sessions"))).toHaveLength(50);
+	});
+
+	it("imports an explicit workspace Skill into $HOME/.hermes/skills/<key>/", async () => {
+		setup("hermes");
+
+		const tarBytes = await buildSkillTar(
+			"demo",
+			`---
+name: demo
+description: pulled from cloud
+---
+# demo
+content
+`,
+		);
+
+		const { captured, restore } = mockFetch([
+			cloudProjectList(),
+			{
+				method: "GET",
+				path: `/v1/projects/${TEST_PROJECT_ID}/skills/demo/download`,
+				response: () => new Response(new Uint8Array(tarBytes), { status: 200 }),
+			},
+			{
+				method: "GET",
+				path: "/v1/skills",
+				response: () =>
+					jsonResponse({ items: [{ skill_key: "demo", name: "demo", content_hash: "demo-hash" }] }),
+			},
+		]);
+
+		try {
+			await pull({ agent: "hermes", modules: "skills", project: TEST_PROJECT_ID });
+		} finally {
+			restore();
+		}
+
+		const skillMd = join(tmpHome, ".hermes", "skills", "demo", "SKILL.md");
+		expect(existsSync(skillMd)).toBe(true);
+		expect(readFileSync(skillMd, "utf-8")).toContain("description: pulled from cloud");
+
+		// Both list + project-explicit download should have been called
+		expect(captured.some((c) => c.path.startsWith("/v1/skills") && c.method === "GET")).toBe(true);
+		expect(
+			captured.some((c) => c.path === `/v1/projects/${TEST_PROJECT_ID}/skills/demo/download`),
+		).toBe(true);
+	});
+
+	it("rebuilds a missing materialization fence instead of trusting a pre-v4 cache hit", async () => {
+		setup("hermes");
+		const local = join(tmpHome, ".hermes", "skills", "legacy");
+		mkdirSync(local, { recursive: true });
+		writeFileSync(join(local, "SKILL.md"), "# Previously pulled without an authority fence\n");
+		writeFileSync(
+			join(stateRootFor(tmpHome), "skills-lock.json"),
+			`${JSON.stringify({
+				version: 3,
+				skills: {
+					[skillCacheKey("hermes", `${TEST_PROJECT_ID}:legacy`)]: { hash: "remote-hash" },
+				},
+				claims: {},
+			})}\n`,
+		);
+		const tarBytes = await buildSkillTar("legacy", "# Downloaded again to establish authority\n");
+		const { captured, restore } = mockFetch([
+			cloudProjectList(),
+			{
+				method: "GET",
+				path: `/v1/projects/${TEST_PROJECT_ID}/skills/legacy/download`,
+				response: () => new Response(new Uint8Array(tarBytes), { status: 200 }),
+			},
+			{
+				method: "GET",
+				path: "/v1/skills",
+				response: () =>
+					jsonResponse({
+						items: [
+							{
+								skill_key: "legacy",
+								name: "legacy",
+								content_hash: "remote-hash",
+							},
+						],
+					}),
+			},
+		]);
+		try {
+			await pull({ agent: "hermes", modules: "skills", project: TEST_PROJECT_ID });
+		} finally {
+			restore();
+		}
+
+		expect(
+			captured.some(
+				(request) => request.path === `/v1/projects/${TEST_PROJECT_ID}/skills/legacy/download`,
+			),
+		).toBe(true);
+		expect(
+			readProjectSkillMaterialization({ agentType: "hermes", localSkillKey: "legacy" }),
+		).toMatchObject({
+			source_project_id: TEST_PROJECT_ID,
+			source_skill_key: "legacy",
+			content_hash: "remote-hash",
+		});
+	});
+
+	it("retires an exact Agent projection claim when a Project Skill takes the local key", async () => {
+		setup("hermes");
+		const priorProjectId = "00000000-0000-0000-0000-000000000098";
+		const local = join(tmpHome, ".hermes", "skills", "handoff");
+		mkdirSync(local, { recursive: true });
+		writeFileSync(join(local, "SKILL.md"), "# Previously Agent-owned\n");
+		recordSkillProjectionClaim({
+			agentType: "hermes",
+			agentId: "env-test",
+			projectId: priorProjectId,
+			skillKey: "handoff",
+			hash: "agent-hash",
+		});
+		const tarBytes = await buildSkillTar("handoff", "# Project-owned replacement\n");
+		const { captured, restore } = mockFetch([
+			cloudProjectList(),
+			{
+				method: "GET",
+				path: `/v1/projects/${TEST_PROJECT_ID}/skills/handoff/download`,
+				response: () => new Response(new Uint8Array(tarBytes), { status: 200 }),
+			},
+			{
+				method: "GET",
+				path: "/v1/skills",
+				response: () =>
+					jsonResponse({
+						items: [{ skill_key: "handoff", name: "handoff", content_hash: "project-hash" }],
+					}),
+			},
+			{
+				method: "DELETE",
+				path: "/v1/agents/env-test/skills/sync/handoff",
+				response: () => new Response(null, { status: 204 }),
+			},
+		]);
+		try {
+			await pull({ agent: "hermes", modules: "skills", project: TEST_PROJECT_ID });
+		} finally {
+			restore();
+		}
+
+		const deletion = captured.find(
+			(request) =>
+				request.method === "DELETE" &&
+				request.path.startsWith("/v1/agents/env-test/skills/sync/handoff"),
+		);
+		expect(deletion).toBeDefined();
+		expect(new URL(deletion?.url ?? "http://invalid").searchParams.get("project_id")).toBe(
+			priorProjectId,
+		);
+		expect(readSkillProjectionClaimsForAgent("hermes", "env-test")).toEqual([]);
+		expect(
+			readProjectSkillMaterialization({ agentType: "hermes", localSkillKey: "handoff" }),
+		).toMatchObject({
+			source_project_id: TEST_PROJECT_ID,
+			source_skill_key: "handoff",
+			content_hash: "project-hash",
+		});
+		expect(readFileSync(join(local, "SKILL.md"), "utf8")).toContain("Project-owned replacement");
+	});
+
+	it("--dry-run fetches listing but does not download", async () => {
+		setup("hermes");
+		const { captured, restore } = mockFetch([
+			cloudProjectList(),
+			{
+				method: "GET",
+				path: `/v1/projects/${TEST_PROJECT_ID}/skills/demo/download`,
+				response: () => jsonResponse({}),
+			},
+			{
+				method: "GET",
+				path: "/v1/skills",
+				response: () =>
+					jsonResponse({ items: [{ skill_key: "demo", name: "demo", content_hash: "demo-hash" }] }),
+			},
+		]);
+		try {
+			await pull({
+				agent: "hermes",
+				modules: "skills",
+				project: TEST_PROJECT_ID,
+				dryRun: true,
+			});
+		} finally {
+			restore();
+		}
+
+		// The list is needed to show the summary; the download must not fire.
+		expect(captured.some((c) => c.path.startsWith("/v1/skills") && c.method === "GET")).toBe(true);
+		expect(captured.some((c) => c.path.endsWith("/download"))).toBe(false);
+		// Nothing written locally
+		expect(existsSync(join(tmpHome, ".hermes", "skills", "demo", "SKILL.md"))).toBe(
+			// Fixture already has core/demo/SKILL.md, not demo/SKILL.md — so false.
+			false,
+		);
+	});
+
+	it("cloud returns empty list → short-circuit", async () => {
+		setup("hermes");
+		const { captured, restore } = mockFetch([
+			cloudProjectList(),
+			{ method: "GET", path: "/v1/skills", response: () => jsonResponse({ items: [] }) },
+		]);
+		try {
+			await pull({ agent: "hermes", modules: "skills", project: TEST_PROJECT_ID });
+		} finally {
+			restore();
+		}
+		expect(captured.some((c) => c.path.endsWith("/download"))).toBe(false);
+	});
+
+	it("fails closed when a Skill pull omits an explicit Cloud-owned Project", async () => {
+		setup("hermes");
+		const { captured, restore } = mockFetch([]);
+		try {
+			await pull({ agent: "hermes", modules: "skills" });
+		} finally {
+			restore();
+		}
+		expect(process.exitCode).toBe(1);
+		expect(captured).toHaveLength(0);
+	});
+
+	it("multi-agent pull skips unsupported modules without aborting supported agents", async () => {
+		setup("claude_code");
+		writeFileSync(
+			join(tmpHome, ".iforge", "environments", "pi.json"),
+			JSON.stringify({ id: "env-pi", agentType: "pi" }),
+		);
+		const { captured, restore } = mockFetch([
+			cloudProjectList(),
+			{ method: "GET", path: "/v1/skills", response: () => jsonResponse({ items: [] }) },
+		]);
+		try {
+			await pull({ modules: "skills", project: TEST_PROJECT_ID, all: true });
+		} finally {
+			restore();
+		}
+
+		expect(captured.some((call) => call.path.startsWith("/v1/projects"))).toBe(true);
+		expect(process.exitCode).toBe(0);
+	});
+
+	it("rejects an explicit Agent Project as a Skill import source", async () => {
+		setup("hermes");
+		const { captured, restore } = mockFetch([cloudProjectList("environment")]);
+		try {
+			await expect(
+				pull({ agent: "hermes", modules: "skills", project: TEST_PROJECT_ID }),
+			).rejects.toThrow(/Agent Workspaces are filesystem-authoritative/);
+		} finally {
+			restore();
+		}
+		expect(captured.some((request) => request.path.startsWith("/v1/skills"))).toBe(false);
+		expect(captured.some((request) => request.path.endsWith("/download"))).toBe(false);
+	});
+
+	it("aborts with exitCode=1 when not logged in (no fetch)", async () => {
+		setup("hermes");
+		rmSync(join(stateRootFor(tmpHome), "auth.json"));
+		const { captured, restore } = mockFetch([]);
+		try {
+			await pull({ agent: "hermes", modules: "skills" });
+		} finally {
+			restore();
+		}
+		expect(captured).toHaveLength(0);
+		expect(process.exitCode).toBe(1);
+	});
+});
+
+describe("pull — Claude Code fixture", () => {
+	it("imports an explicit workspace Skill into $HOME/.claude/skills/<key>/", async () => {
+		setup("claude_code");
+		const tarBytes = await buildSkillTar(
+			"fresh",
+			`---
+name: fresh
+description: new
+---
+# fresh`,
+		);
+		const { restore } = mockFetch([
+			cloudProjectList(),
+			{
+				method: "GET",
+				path: `/v1/projects/${TEST_PROJECT_ID}/skills/fresh/download`,
+				response: () => new Response(new Uint8Array(tarBytes), { status: 200 }),
+			},
+			{
+				method: "GET",
+				path: "/v1/skills",
+				response: () =>
+					jsonResponse({
+						items: [{ skill_key: "fresh", name: "fresh", content_hash: "fresh-hash" }],
+					}),
+			},
+		]);
+		try {
+			await pull({ agent: "claude_code", modules: "skills", project: TEST_PROJECT_ID });
+		} finally {
+			restore();
+		}
+		expect(existsSync(join(tmpHome, ".claude", "skills", "fresh", "SKILL.md"))).toBe(true);
+	});
+});
+
+describe("pull — Codex fixture", () => {
+	it("imports an explicit workspace Skill into $HOME/.codex/skills/<key>/", async () => {
+		setup("codex");
+		const tarBytes = await buildSkillTar(
+			"fresh",
+			`---
+name: fresh
+description: new
+---
+# fresh`,
+		);
+		const { restore } = mockFetch([
+			cloudProjectList(),
+			{
+				method: "GET",
+				path: `/v1/projects/${TEST_PROJECT_ID}/skills/fresh/download`,
+				response: () => new Response(new Uint8Array(tarBytes), { status: 200 }),
+			},
+			{
+				method: "GET",
+				path: "/v1/skills",
+				response: () =>
+					jsonResponse({
+						items: [{ skill_key: "fresh", name: "fresh", content_hash: "fresh-hash" }],
+					}),
+			},
+		]);
+		try {
+			await pull({ agent: "codex", modules: "skills", project: TEST_PROJECT_ID });
+		} finally {
+			restore();
+		}
+		expect(existsSync(join(tmpHome, ".codex", "skills", "fresh", "SKILL.md"))).toBe(true);
+	});
+});
+
+describe("pull — OpenClaw fixture", () => {
+	it("imports an explicit workspace Skill into $HOME/.openclaw/agents/main/skills/<key>/", async () => {
+		setup("openclaw");
+		const tarBytes = await buildSkillTar(
+			"fresh",
+			`---
+name: fresh
+description: new
+---
+# fresh`,
+		);
+		const { restore } = mockFetch([
+			cloudProjectList(),
+			{
+				method: "GET",
+				path: `/v1/projects/${TEST_PROJECT_ID}/skills/fresh/download`,
+				response: () => new Response(new Uint8Array(tarBytes), { status: 200 }),
+			},
+			{
+				method: "GET",
+				path: "/v1/skills",
+				response: () =>
+					jsonResponse({
+						items: [{ skill_key: "fresh", name: "fresh", content_hash: "fresh-hash" }],
+					}),
+			},
+		]);
+		try {
+			await pull({ agent: "openclaw", modules: "skills", project: TEST_PROJECT_ID });
+		} finally {
+			restore();
+		}
+		expect(
+			existsSync(join(tmpHome, ".openclaw", "agents", "main", "skills", "fresh", "SKILL.md")),
+		).toBe(true);
+	});
+});

@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  iforge wordmark companion monogram
+  Squared F for forge, the icon half of the wordmark pairing.
+
+  Authored from scratch for iforge. Not traced from, derived from, or
+  recoloured from any pre-existing artwork (MIGR-04).
+
+  Colour lives in exactly one place: the fill attribute on the root element.
+  Do not switch this to currentColor. The rasteriser available on this host
+  (ImageMagick MSVG fallback, rsvg-convert absent) renders currentColor as
+  nothing at all, which would silently generate empty PNGs downstream.
+  Light accent #c96442, dark accent #d97757.
+
+  Pairs with wordmark.svg. This file carries every square icon size;
+  the wordmark carries the in-app logo. Regenerate the two together.
+-->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512" fill="#c96442" role="img" aria-label="iforge wordmark companion monogram">
+  <path fill-rule="evenodd" d="M131 460 L227 460 L227 304 L307 304 L341 270 L341 208 L227 208 L227 148 L347 148 L381 114 L381 52 L131 52 Z"/>
+</svg>

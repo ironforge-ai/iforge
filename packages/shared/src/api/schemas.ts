@@ -1,0 +1,59 @@
+/**
+ * Ergonomic re-exports of the auto-generated OpenAPI types.
+ *
+ * The raw generated file (`api.generated.ts`) models every endpoint as
+ * `paths["/v1/..."]["get"]["responses"]["200"]["content"]["application/json"]`
+ * which is unreadable at call sites. This module hoists the common response
+ * and request shapes to top-level aliases that pages actually want.
+ *
+ * Regenerate after backend changes with: `bun run generate-api`.
+ */
+
+import type { components } from "./api.generated";
+
+type Schemas = components["schemas"];
+
+// ── Auth ─────────────────────────────────────────────────────────────────
+export type CurrentUser = Schemas["CurrentUserResponse"];
+export type AccountSuspendedProblem = Schemas["AccountSuspendedProblem"];
+export type ApiKey = Schemas["ApiKeyResponse"];
+export type ApiKeyCreated = Schemas["ApiKeyCreated"];
+export type ApiKeyCreate = Schemas["ApiKeyCreate"];
+export type DeviceLookupResponse = Schemas["DeviceLookupResponse"];
+
+// ── Dashboard ────────────────────────────────────────────────────────────
+export type DashboardStats = Schemas["DashboardStatsResponse"];
+export type ContributionDay = Schemas["ContributionDayResponse"];
+
+// ── Sessions ─────────────────────────────────────────────────────────────
+export type SessionListItem = Schemas["SessionListItemResponse"];
+export type SessionDetail = Schemas["SessionDetailResponse"];
+export type SessionMessage = Schemas["SessionMessageResponse"];
+export type SessionMessagesPage = Schemas["SessionMessagesPage"];
+export type SessionTimelineItem = Schemas["SessionTimelinePage"]["items"][number];
+export type SessionTimelinePage = Schemas["SessionTimelinePage"];
+export type SessionToolCall = Schemas["SessionToolCallResponse"];
+export type SessionToolResult = Schemas["SessionToolResultResponse"];
+export type Environment = Schemas["EnvironmentResponse"];
+
+// ── Memories ─────────────────────────────────────────────────────────────
+export type Memory = Schemas["MemoryResponse"];
+export type MemoryCreate = Schemas["MemoryCreate"];
+
+// ── Skills ───────────────────────────────────────────────────────────────
+export type SkillSummary = Schemas["SkillSummaryResponse"];
+export type SkillInstallRequest = Schemas["SkillInstallRequest"];
+
+// ── Vault ────────────────────────────────────────────────────────────────
+export type Vault = Schemas["VaultResponse"];
+export type VaultItems = Schemas["VaultSectionsResponse"];
+export type VaultItemUpsert = Schemas["VaultItemUpsert"];
+export type VaultResolved = Schemas["VaultResolveResponse"];
+
+// ── Connectors ───────────────────────────────────────────────────────────
+export type ConnectorConnection = Schemas["ConnectorConnectionResponse"];
+export type ConnectorTool = Schemas["ConnectorToolResponse"];
+
+// ── Pagination + global search ───────────────────────────────────────────
+export type SearchResponse = Schemas["SearchResponse"];
+export type SearchHit = Schemas["SearchHit"];

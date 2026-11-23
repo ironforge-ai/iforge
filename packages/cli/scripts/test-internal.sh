@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+package_root="$(cd -- "$script_dir/.." && pwd)"
+cd "$package_root"
+
+test_args=(--isolate --max-concurrency=1 --timeout=30000)
+
+hermes_fixture_needed=false
+if [[ $# -eq 0 ]]; then hermes_fixture_needed=true; fi
+for test_arg in "$@"; do
+	case "$test_arg" in
+		src|src/|src/runtime|src/runtime/|*hosted-hermes-skill*|*hosted-skill-observation*|*manifest-reconciliation*|--test-name-pattern*|-t)
+			hermes_fixture_needed=true
+			;;
+	esac
+done
+if [[ "$hermes_fixture_needed" == true && -z "${CLAWDI_TEST_HERMES_VENV:-}" ]]; then
+	source "$script_dir/prepare-hermes-native-fixture.sh"
+fi
+
+if [[ $# -gt 0 ]]; then
+	bun test "${test_args[@]}" "$@"
+	exit $?
+fi
+
+# Bun 1.4.0 can leave an otherwise completed multi-file suite idle after a
+# test launches child work, including through production helpers. Use each test
+# file as the process boundary. The clean-runner contract has its own CI gate.
+started_at=$SECONDS
+test_count=0
+
+while IFS= read -r test_file; do
+	test_count=$((test_count + 1))
+	printf '\n--> %s\n' "$test_file"
+	bun test "${test_args[@]}" "$test_file" </dev/null
+done < <(
+	find src tests -type f \
+		\( -name '*.test.ts' -o -name '*.test.tsx' -o -name '*.spec.ts' -o -name '*.spec.tsx' \) \
+		! -path 'tests/clean-test-runner.test.ts' \
+		-print | LC_ALL=C sort
+)
+
+if (( test_count == 0 )); then
+	echo "CLI test suite has no files" >&2
+	exit 2
+fi
+
+printf '\n<== CLI tests: %d files, %ds\n' "$test_count" "$((SECONDS - started_at))"

@@ -1,0 +1,58 @@
+services:
+  test-runner:
+    image: ${TEST_RUNNER_IMAGE:-clawdi-test-runner:local}
+    build:
+      context: .
+      dockerfile: docker/test-runner.Dockerfile
+    user: "1000:1000"
+    cpus: ${IFORGE_TEST_RUNNER_CPUS:-8}
+    mem_limit: ${IFORGE_TEST_RUNNER_MEMORY_LIMIT:-4g}
+    memswap_limit: ${IFORGE_TEST_RUNNER_MEMORY_LIMIT:-4g}
+    mem_swappiness: 0
+    pids_limit: ${IFORGE_TEST_RUNNER_PIDS_LIMIT:-512}
+    environment:
+      HOME: /tmp/clawdi-home
+      USER: clawdi-test
+      LOGNAME: clawdi-test
+      IFORGE_NO_AUTO_UPDATE: "1"
+      IFORGE_NO_UPDATE_CHECK: "1"
+      BUN_INSTALL_CACHE_DIR: /var/cache/bun
+      BUN_TMPDIR: /tmp/bun
+      # Parallel native TypeScript checks share the container PID budget.
+      GOMAXPROCS: "2"
+      TMPDIR: /tmp
+      UV_CACHE_DIR: /var/cache/uv
+      UV_LINK_MODE: copy
+      UV_PYTHON_DOWNLOADS: never
+      DATABASE_URL: postgresql+asyncpg://iforge:iforge_test@postgres:5432/iforge_test
+    volumes:
+      - .:/repo:ro
+    tmpfs:
+      - /tmp:rw,exec,nosuid,nodev,size=2g,mode=1777,uid=1000,gid=1000
+      - /var/cache/bun:rw,nosuid,nodev,noexec,size=2g,mode=1777,uid=1000,gid=1000
+      - /var/cache/uv:rw,nosuid,nodev,noexec,size=2g,mode=1777,uid=1000,gid=1000
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  postgres:
+    # Compose cannot import config/postgres-image.txt; the parity contract
+    # keeps this required literal copy equal to that authority.
+    image: ghcr.io/clawdi-ai/postgres-pgbackrest:pg18@sha256:db8d1af12ebac7fe10c57730502a31e9b34586ac1ed32852639007dd77eda449
+    cpus: ${IFORGE_TEST_POSTGRES_CPUS:-2}
+    mem_limit: ${IFORGE_TEST_POSTGRES_MEMORY_LIMIT:-1g}
+    memswap_limit: ${IFORGE_TEST_POSTGRES_MEMORY_LIMIT:-1g}
+    mem_swappiness: 0
+    pids_limit: ${IFORGE_TEST_POSTGRES_PIDS_LIMIT:-256}
+    environment:
+      POSTGRES_DB: iforge_test
+      POSTGRES_USER: iforge
+      POSTGRES_PASSWORD: iforge_test
+    tmpfs:
+      - /var/lib/postgresql:rw,nosuid,nodev,noexec,size=1g
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U iforge -d iforge_test"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+      start_period: 5s

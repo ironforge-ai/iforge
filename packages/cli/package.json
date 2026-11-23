@@ -1,0 +1,80 @@
+{
+	"name": "@iforge/cli",
+	"version": "0.13.47",
+	"description": "iCloud for AI Agents — cross-agent sessions, skills, memory, and vault.",
+	"license": "MIT",
+	"type": "module",
+	"sideEffects": false,
+	"bin": {
+		"iforge": "bin/iforge.mjs"
+	},
+	"files": [
+		"bin",
+		"dist",
+		"egress-addon/clawdi_egress_addon.py",
+		"skills",
+		"LICENSE",
+		"README.md"
+	],
+	"engines": {
+		"node": ">=24"
+	},
+	"publishConfig": {
+		"access": "public"
+	},
+	"scripts": {
+		"dev": "bun run src/index.ts",
+		"build": "rm -rf dist && bun build src/index.ts --outdir dist --target node --minify --define 'process.env.CLAWDI_DEFAULT_API_URL=\"https://cloud-api.iforge.dev\"' --define 'process.env.CLAWDI_DEFAULT_DEPLOY_API_URL=\"https://api.iforge.dev\"'",
+		"build:native": "bun run scripts/build-native.mjs",
+		"build:native-release": "bun run scripts/build-native-release.mjs",
+		"package:native-release": "bun run scripts/package-native-release.mjs",
+		"build:dev": "rm -rf dist && bun build src/index.ts --outdir dist --target node",
+		"check:publish-manifest": "node scripts/check-publish-manifest.mjs",
+		"check:native-release": "bun run scripts/check-native-release.mjs",
+		"typecheck": "tsc --noEmit",
+		"test": "../../scripts/test.sh cli",
+		"test:internal": "bash scripts/test-internal.sh",
+		"test:e2e": "../../scripts/test.sh cli tests/e2e",
+		"test:native-linux-lifecycle:internal": "CLAWDI_NATIVE_BINARY=${CLAWDI_NATIVE_BINARY:-dist-native/linux-x64/iforge} bun test tests/e2e/native-installer.e2e.test.ts tests/e2e/native-daemon.e2e.test.ts",
+		"test:watch:local": "bun test --watch",
+		"prepublishOnly": "python3 ../../scripts/check_production_origins.py && bun run check:publish-manifest && bun run build"
+	},
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/ironforge-ai/iforge.git",
+		"directory": "packages/cli"
+	},
+	"bugs": {
+		"url": "https://github.com/ironforge-ai/iforge/issues"
+	},
+	"homepage": "https://github.com/ironforge-ai/iforge#readme",
+	"keywords": [
+		"cli",
+		"claude-code",
+		"codex",
+		"openclaw",
+		"hermes",
+		"opencode",
+		"ai-agents",
+		"skills",
+		"memory",
+		"vault",
+		"mcp"
+	],
+	"devDependencies": {
+		"@clack/prompts": "^1.7.0",
+		"@clawdi/shared": "workspace:*",
+		"@modelcontextprotocol/sdk": "^1.30.0",
+		"@types/bun": "^1.4.0",
+		"@types/node": "^24.13.3",
+		"chalk": "^6.0.0",
+		"commander": "^15.0.0",
+		"eventsource-parser": "^4.1.0",
+		"json5": "2.2.3",
+		"openapi-fetch": "^0.17.0",
+		"tar": "^7.5.22",
+		"typescript": "catalog:",
+		"yaml": "^2.9.0",
+		"zod": "catalog:"
+	}
+}

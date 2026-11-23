@@ -1,0 +1,137 @@
+{
+	"channelBindings": [
+		{
+			"accountKey": "clawdi_50000000000000000000000000000005",
+			"agentTokenSecretRef": "secret://channels/telegram/clawdi_50000000000000000000000000000005/agent-token",
+			"placeholderTokenSecretRef": "secret://channels/telegram/clawdi_50000000000000000000000000000005/placeholder-token",
+			"provider": "telegram"
+		}
+	],
+	"applyGeneration": 1,
+	"manifest": {
+		"clawdiCli": {
+			"packageSpec": "clawdi@1.2.3-test",
+			"registry": "https://registry.npmjs.org",
+			"source": "npm:clawdi"
+		},
+		"controlPlane": {
+			"cloudApiUrl": "https://cloud.test"
+		},
+		"deploymentId": "dep_test",
+		"environmentId": "20000000-0000-0000-0000-000000000002",
+		"egressEngine": {
+			"sha256": "2e95286b618fa6fd33e5e62a78c2e5112571d85f42ec2bac29b97ee242bdb5c5",
+			"type": "mitmproxy",
+			"url": "https://downloads.mitmproxy.org/12.2.3/mitmproxy-12.2.3-linux-x86_64.tar.gz",
+			"version": "12.2.3"
+		},
+		"generation": 2,
+		"instanceId": "hri_test",
+		"issuedAt": "2026-07-13T00:00:00+00:00",
+		"liveSync": {
+			"agents": [
+				{
+					"agentType": "openclaw",
+					"environmentId": "20000000-0000-0000-0000-000000000002"
+				}
+			],
+			"enabled": true
+		},
+		"locale": {
+			"language": "en",
+			"timezone": "UTC"
+		},
+		"providers": {
+			"clawdi": {
+				"apiKeySecretRef": "secret://tool.codex.apiKey",
+				"apiMode": "openai_responses",
+				"baseUrl": "https://provider.test/v1",
+				"kind": "openai-compatible",
+				"managed_by": "clawdi",
+				"models": [
+					{
+						"id": "gpt-test"
+					}
+				],
+				"runtimeEnvName": "CLAWDI_AI_API_KEY",
+				"type": "custom_openai_compatible"
+			}
+		},
+		"recovery": {
+			"allowOfflineBoot": true,
+			"cacheManifest": true
+		},
+		"runtime": "openclaw",
+		"runtimes": {
+			"openclaw": {
+				"enabled": true,
+				"install": {
+					"source": "official"
+				},
+				"providerMode": "configured",
+				"primary_model": {
+					"model": "gpt-test",
+					"provider_id": "clawdi"
+				},
+				"provider_ids": ["clawdi"],
+				"run": {
+					"args": ["gateway", "run"],
+					"secretEnv": {
+						"OPENCLAW_GATEWAY_TOKEN": "secret://runtime/openclaw/gateway-token"
+					}
+				},
+				"services": {}
+			}
+		},
+		"schemaVersion": "clawdi.hosted-runtime.manifest.v1",
+		"skills": {
+			"entries": {
+				"clawdi": {
+					"enabled": true,
+					"version": 1
+				}
+			}
+		},
+		"system": {
+			"openclawControlUiAllowedOrigins": ["https://agent.example.test"],
+			"openclawGatewayTrustedProxies": ["10.173.0.1"],
+			"openclawGatewayAuth": {
+				"mode": "token",
+				"tokenRef": "secret://runtime/openclaw/gateway-token",
+				"deviceAuthRequired": false,
+				"activation": {
+					"enabled": true,
+					"capability": "openclaw-native-auth-v1"
+				}
+			}
+		},
+		"terminalTooling": {
+			"codex": {
+				"enabled": true,
+				"primary_model": {
+					"model": "gpt-test",
+					"provider_id": "clawdi"
+				},
+				"provider": {
+					"apiKeySecretRef": "secret://tool.codex.apiKey",
+					"apiMode": "openai_responses",
+					"baseUrl": "https://provider.test/v1",
+					"kind": "openai-compatible",
+					"managed_by": "clawdi",
+					"runtimeEnvName": "CLAWDI_AI_API_KEY",
+					"type": "custom_openai_compatible"
+				},
+				"provider_id": "clawdi"
+			}
+		}
+	},
+	"schemaVersion": "clawdi.hosted-runtime.bundle.v2",
+	"secretValues": {
+		"secret://clawdi/auth-token": "runtime-auth-token-golden",
+		"secret://runtime/openclaw/gateway-token": "openclaw-gateway-token-golden",
+		"secret://tool.codex.apiKey": "sk-provider-golden",
+		"secret://channels/telegram/clawdi_50000000000000000000000000000005/agent-token": "123456789:telegram-agent-golden",
+		"secret://channels/telegram/clawdi_50000000000000000000000000000005/placeholder-token": "999999999:9ded1453047ec0a48ec3b735075f7448"
+	},
+	"sourceRevision": "a477a6cf87a5632571f9127123288031e366c291fb7b87df29732544e5a885d1"
+}

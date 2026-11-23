@@ -1,0 +1,1570 @@
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
+import type {
+	DesktopAgentConnection,
+	DesktopAgentType,
+	DesktopBootstrapState,
+	DesktopInstallationState,
+	DesktopMoveToApplicationsResult,
+} from "@clawdi/shared/desktop";
+import { isDesktopAgentType } from "@clawdi/shared/desktop";
+import { DESTINATIONS } from "@clawdi/shared/destinations";
+import {
+	app,
+	BrowserWindow,
+	dialog,
+	type IpcMainInvokeEvent,
+	ipcMain,
+	Menu,
+	type MenuItemConstructorOptions,
+	type MessageBoxOptions,
+	nativeImage,
+	net,
+	protocol,
+	type Session,
+	session,
+	shell,
+	Tray,
+} from "electron";
+import {
+	authenticateDesktopAccount,
+	type DesktopAuthenticationFlowResult,
+	DesktopAuthenticationTransitionError,
+	prepareDesktopStartup,
+	reconcileDesktopStartupSync,
+} from "./auth-orchestrator";
+import {
+	allowsChildClipboard,
+	allowsChildDownload,
+	type DashboardChildKind,
+	type DashboardChildState,
+	dashboardChildUrl,
+	evaluateChildNavigation,
+} from "./child-window-policy";
+import { type DesktopCliCommandOptions, installDesktopCliCommand } from "./cli-command";
+import { DESKTOP_IPC } from "./ipc";
+import { DesktopCliError, DesktopCliService } from "./native-cli";
+import { requireDesktopPlatform } from "./platform";
+import { DesktopUpdateController } from "./update-controller";
+import { evaluateDesktopUpdatePolicy } from "./update-policy";
+import { readMacCodeSignature } from "./update-signature";
+import { type DesktopUpdateState, desktopUpdateStatusLabel } from "./update-state";
+
+const APP_SCHEME = "iforge-app";
+const APP_HOST = "connect";
+const DASHBOARD_ORIGIN = DESTINATIONS.dashboardOrigin;
+// Chromium retains Clerk's browser session; CLI remains the account authority.
+const DASHBOARD_PARTITION = "persist:iforge-dashboard";
+const DASHBOARD_ACCOUNT_COOKIE = "__Host-iforge_desktop_account";
+const CONNECT_URL = `${APP_SCHEME}://${APP_HOST}/renderer.html`;
+const DASHBOARD_FAILURE_URL = `${CONNECT_URL}?surface=dashboard-failure`;
+const DASHBOARD_LOAD_TIMEOUT_MS = 30_000;
+const ERR_ABORTED = -3;
+const APP_ASSETS = new Map([
+	["/renderer.html", "renderer.html"],
+	["/connect-renderer.js", "connect-renderer.js"],
+	["/connect-renderer.css", "connect-renderer.css"],
+	["/iforge-logo.png", "iforge-logo.png"],
+]);
+const cli = new DesktopCliService(app);
+let mainWindow: BrowserWindow | null = null;
+let connectWindow: BrowserWindow | null = null;
+let tray: Tray | null = null;
+let trayState: DesktopBootstrapState | null = null;
+let trayStateChecking = true;
+let trayStateRefresh: Promise<void> | null = null;
+let availableWindowOpening: Promise<void> | null = null;
+let dashboardWindowOpening: Promise<DashboardLoadResult> | null = null;
+let cancelDashboardReady: (() => void) | null = null;
+let dashboardFailureOpening: Promise<void> | null = null;
+let dashboardSession: Session | null = null;
+let dashboardAccountId: string | null = null;
+const dashboardChildWindows = new Map<BrowserWindow, DashboardChildState>();
+let restoreMainWindowAfterConnect = false;
+let updateController: DesktopUpdateController | null = null;
+let updateState: DesktopUpdateState = { status: "disabled", reason: "development" };
+let updatePromptedVersion: string | null = null;
+let activeCriticalOperations = 0;
+let quitting = false;
+
+class DesktopConnectError extends Error {}
+class DashboardLoadCancelled extends Error {}
+
+type DashboardLoadResult = "opened" | "connect-required" | "failed";
+function runAsync(label: string, operation: Promise<unknown>): void {
+	void operation.catch((error) => console.error(`Could not ${label}`, error));
+}
+
+function activeDialogParent(preferred?: BrowserWindow | null): BrowserWindow | null {
+	if (preferred && !preferred.isDestroyed()) return preferred;
+	return (
+		[mainWindow, connectWindow, ...dashboardChildWindows.keys()].find(
+			(window) => window && !window.isDestroyed() && window.isVisible(),
+		) ?? null
+	);
+}
+
+function showMessageBox(
+	options: MessageBoxOptions,
+	preferred?: BrowserWindow | null,
+): ReturnType<typeof dialog.showMessageBox> {
+	const parent = activeDialogParent(preferred);
+	return parent ? dialog.showMessageBox(parent, options) : dialog.showMessageBox(options);
+}
+
+function showMessageBoxSync(options: MessageBoxOptions, preferred?: BrowserWindow | null): number {
+	const parent = activeDialogParent(preferred);
+	return parent ? dialog.showMessageBoxSync(parent, options) : dialog.showMessageBoxSync(options);
+}
+
+app.enableSandbox();
+protocol.registerSchemesAsPrivileged([
+	{
+		scheme: APP_SCHEME,
+		privileges: { standard: true, secure: true, supportFetchAPI: true },
+	},
+]);
+
+if (process.platform === "win32") app.setAppUserModelId("dev.iforge.desktop");
+
+if (!app.requestSingleInstanceLock()) {
+	app.quit();
+} else {
+	const applicationStarted = app.whenReady().then(startApplication);
+	app.on("window-all-closed", () => undefined);
+	app.on("second-instance", () =>
+		runAsync("show the existing window", applicationStarted.then(showAvailableWindow)),
+	);
+	void applicationStarted.catch((error) => {
+		console.error("Could not start iforge", error);
+		dialog.showErrorBox("iforge couldn't start", "Reinstall iforge and try again.");
+		app.quit();
+	});
+}
+
+async function startApplication(): Promise<void> {
+	app.setName("iforge");
+	const startHidden = wasOpenedAtLogin();
+	if (startHidden && process.platform === "darwin") app.dock?.hide();
+	dashboardSession = session.fromPartition(DASHBOARD_PARTITION);
+	registerAppProtocol(session.defaultSession);
+	registerAppProtocol(dashboardSession);
+	registerIpc();
+	configurePermissions(dashboardSession);
+	createApplicationMenu();
+	createTray();
+	app.on("before-quit", () => {
+		quitting = true;
+		updateController?.stop();
+		runAsync("cancel sign-in", cli.cancelAuthentication());
+	});
+
+	if (installationState().requiresMove) {
+		setTrayState(null);
+		if (!startHidden) await showConnectWindow();
+	} else {
+		const startup = await prepareDesktopStartup(cli);
+		setTrayState(startup.state);
+		if (!startHidden) {
+			if (startup.requiresWizard) await showConnectWindow();
+			else await loadDashboardWithRecovery();
+		}
+		if (!startup.requiresWizard) {
+			runAsync("reconcile sync after startup", reconcileBackgroundSyncAfterStartup());
+		}
+		setImmediate(() =>
+			runAsync(
+				"reconcile the CLI command",
+				reconcileDesktopCliCommand(startup.state.daemon.installed),
+			),
+		);
+	}
+	runAsync("initialize Desktop updates", initializeUpdates());
+
+	app.on("activate", () => runAsync("show the active window", showAvailableWindow()));
+}
+
+function registerAppProtocol(targetSession: Session): void {
+	targetSession.protocol.handle(APP_SCHEME, (request) => {
+		const url = new URL(request.url);
+		const asset = url.host === APP_HOST ? APP_ASSETS.get(url.pathname) : null;
+		if (request.method !== "GET" || !asset) return new Response(null, { status: 404 });
+		return net.fetch(pathToFileURL(join(app.getAppPath(), "dist", asset)).toString());
+	});
+}
+
+async function initializeUpdates(): Promise<void> {
+	const channel = readPackageMetadataField("clawdiUpdateChannel");
+	const shouldInspectSignature =
+		app.isPackaged &&
+		process.platform === "darwin" &&
+		process.mas !== true &&
+		(channel === "stable" || channel === "beta");
+	const signature = shouldInspectSignature ? await readMacCodeSignature(process.execPath) : null;
+	const policy = evaluateDesktopUpdatePolicy({
+		isPackaged: app.isPackaged,
+		platform: process.platform,
+		isMacAppStore: process.mas === true,
+		channel,
+		signature,
+		isAppImage: Boolean(process.env.APPIMAGE),
+		windowsPublisher: readPackageMetadataField("clawdiWindowsPublisher"),
+	});
+	if (!policy.enabled) console.info(`Desktop updates disabled: ${policy.reason}`);
+	updateController = new DesktopUpdateController({
+		policy,
+		onStateChange: (state) => {
+			updateState = state;
+			renderUpdateMenus();
+		},
+		onUpdateReady: () => runAsync("offer the downloaded update", maybePromptForUpdate()),
+	});
+	updateController.start();
+}
+
+function readPackageMetadataField(name: string): unknown {
+	try {
+		const metadata: unknown = JSON.parse(
+			readFileSync(join(app.getAppPath(), "package.json"), "utf8"),
+		);
+		return isRecord(metadata) ? metadata[name] : undefined;
+	} catch (error) {
+		console.error("Could not read Desktop package metadata", error);
+		return undefined;
+	}
+}
+
+function renderUpdateMenus(): void {
+	if (!app.isReady()) return;
+	createApplicationMenu();
+	renderTrayMenu();
+}
+
+function updateMenuItems(): MenuItemConstructorOptions[] {
+	const items = updateActionMenuItems();
+	return items.length > 0 ? [{ type: "separator" }, ...items] : [];
+}
+
+function updateActionMenuItems(): MenuItemConstructorOptions[] {
+	if (updateState.status === "disabled") return [];
+	const status = desktopUpdateStatusLabel(updateState);
+	const items: MenuItemConstructorOptions[] = status ? [{ label: status, enabled: false }] : [];
+	if (updateState.status === "ready") {
+		items.push({
+			label: "Restart to Install Update",
+			enabled: activeCriticalOperations === 0,
+			click: restartToInstallUpdate,
+		});
+	} else if (updateState.status === "idle" || updateState.status === "error") {
+		items.push({
+			label: "Check for Updates…",
+			click: () => runAsync("check for updates", checkForUpdatesManually()),
+		});
+	}
+	return items;
+}
+
+async function checkForUpdatesManually(): Promise<void> {
+	if (!updateController || updateState.status === "disabled") return;
+	await updateController.checkForUpdates();
+	if (updateState.status === "idle") {
+		await showMessageBox({
+			type: "info",
+			message: "iforge is up to date",
+			detail: `You are running iforge ${app.getVersion()}.`,
+		});
+	} else if (updateState.status === "error") {
+		await showMessageBox({
+			type: "warning",
+			message: "iforge couldn't check for updates",
+			detail: "Check your connection and try again later.",
+		});
+	}
+}
+
+async function maybePromptForUpdate(): Promise<void> {
+	if (
+		updateState.status !== "ready" ||
+		activeCriticalOperations > 0 ||
+		updatePromptedVersion === updateState.version
+	) {
+		return;
+	}
+	const parent = [mainWindow, connectWindow].find(
+		(window) => window && !window.isDestroyed() && window.isVisible(),
+	);
+	if (!parent) return;
+	updatePromptedVersion = updateState.version;
+	const choice = await showMessageBox(
+		{
+			type: "info",
+			message: `iforge ${updateState.version} is ready`,
+			detail:
+				"Choose Later to keep working, then use Restart to Install Update from the iforge menu.",
+			buttons: ["Restart and Install", "Later"],
+			defaultId: 0,
+			cancelId: 1,
+			noLink: true,
+		},
+		parent,
+	);
+	if (choice.response === 0) restartToInstallUpdate();
+}
+
+function restartToInstallUpdate(): void {
+	if (activeCriticalOperations > 0 || !updateController || updateState.status !== "ready") return;
+	runAsync(
+		"prepare the update",
+		withCriticalOperation(async () => {
+			const state = await cli.bootstrapState();
+			// Release Windows executable locks and prevent the old runtime surviving
+			// an update. Keep the installed unit as durable Sync intent.
+			if (state.daemon.installed) await cli.stopDaemon();
+			quitting = true;
+			if (!updateController?.installDownloadedUpdate()) {
+				quitting = false;
+				if (state.daemon.installed) await cli.restartDaemon();
+			}
+		}),
+	);
+}
+
+function registerIpc(): void {
+	ipcMain.handle(DESKTOP_IPC.createDashboardSession, (event) =>
+		safeDashboardAction(event, "restore dashboard sign-in", async () => {
+			if (new URL(event.senderFrame?.url ?? "").pathname !== "/desktop-auth") {
+				throw new Error("Session recovery is only available on the authentication page.");
+			}
+			const auth = await cli.getAuthState();
+			if (!auth.authenticated || !auth.user || auth.user.id !== dashboardAccountId) {
+				throw new Error("The local account changed. Reopen the dashboard.");
+			}
+			return cli.createDashboardSession();
+		}),
+	);
+	ipcMain.handle(DESKTOP_IPC.bootstrapState, (event) =>
+		safeConnectAction(event, "prepare the local runtime", async () => {
+			assertRuntimeLocation();
+			const state = await cli.bootstrapState();
+			setTrayState(state);
+			return state;
+		}),
+	);
+	ipcMain.handle(DESKTOP_IPC.installationState, (event) =>
+		safeConnectAction(event, "check the app location", async () => installationState()),
+	);
+	ipcMain.handle(DESKTOP_IPC.detectAgents, (event) =>
+		safeConnectAction(event, "inspect local Agents", () => {
+			assertRuntimeLocation();
+			return cli.detectAgents();
+		}),
+	);
+	ipcMain.handle(DESKTOP_IPC.listReconnectableAgents, (event) =>
+		safeConnectAction(event, "find reconnectable Agents", () => {
+			assertRuntimeLocation();
+			return cli.listReconnectableAgents();
+		}),
+	);
+	ipcMain.handle(DESKTOP_IPC.authenticate, (event) =>
+		safeConnectAction(event, "sign in", async () => {
+			assertRuntimeLocation();
+			const result = await authenticateAndResumeSync();
+			if (result.status === "cancelled") {
+				return { status: "cancelled" as const };
+			}
+			const state = await cli.bootstrapState();
+			setTrayState(state);
+			return { status: "authenticated" as const, state };
+		}),
+	);
+	ipcMain.handle(DESKTOP_IPC.cancelAuthentication, (event) =>
+		safeConnectAction(event, "cancel sign-in", async () => ({
+			status: await cli.cancelAuthentication(),
+		})),
+	);
+	ipcMain.handle(DESKTOP_IPC.connectAgents, (event, rawConnections: unknown) =>
+		safeConnectAction(event, "connect the selected Agents", async () => {
+			assertSafeDaemonMutation();
+			const result = await withCriticalOperation(() =>
+				cli.connectAgents(readAgentConnections(rawConnections)),
+			);
+			runAsync("refresh sync status", refreshTrayState());
+			return result;
+		}),
+	);
+	ipcMain.handle(DESKTOP_IPC.moveToApplicationsFolder, (event) =>
+		safeConnectAction(event, "move iforge to Applications", async () => moveToApplicationsFolder()),
+	);
+	ipcMain.handle(DESKTOP_IPC.openDashboard, (event) =>
+		safeConnectAction(event, "open the dashboard", async () => {
+			assertRuntimeLocation();
+			const window = connectWindow;
+			const result = await loadDashboardWithRecovery();
+			if (result === "connect-required") return;
+			runAsync("reconcile sync after opening Dashboard", reconcileBackgroundSyncAfterStartup());
+			restoreMainWindowAfterConnect = false;
+			if (window && !window.isDestroyed()) window.destroy();
+		}),
+	);
+	ipcMain.handle(DESKTOP_IPC.signIn, (event) =>
+		safeDashboardAction(event, "sign in", async () => {
+			assertRuntimeLocation();
+			cancelPendingDashboardAuthentication(event);
+			let result: DesktopAuthenticationFlowResult;
+			try {
+				result = await authenticateAndResumeSync(true);
+			} catch (error) {
+				if (error instanceof DesktopAuthenticationTransitionError) {
+					await applyAuthenticationRecovery(error.recovery);
+				}
+				throw error;
+			}
+			if (result.status === "cancelled") {
+				await applyAuthenticationRecovery(result);
+				return { status: "cancelled" as const };
+			}
+			if (result.requiresWizard) {
+				await applyAuthenticationRecovery({
+					restoreDashboard: false,
+					requiresWizard: true,
+					needsAttention: result.needsAttention,
+				});
+				return { status: "authenticated" as const };
+			}
+			if ((await loadDashboardWithRecovery(true)) !== "opened") {
+				throw new Error("Dashboard sign-in did not complete.");
+			}
+			return { status: "authenticated" as const };
+		}),
+	);
+	ipcMain.handle(DESKTOP_IPC.signOut, (event) =>
+		safeDashboardAction(event, "sign out", async () => {
+			await withCriticalOperation(async () => {
+				await cli.cancelAuthentication();
+				await cli.logout();
+			});
+			restoreMainWindowAfterConnect = false;
+			if (connectWindow && !connectWindow.isDestroyed()) connectWindow.destroy();
+			await clearDashboardSession();
+			setTrayState(trayState ? { ...trayState, auth: { authenticated: false, user: null } } : null);
+			if (mainWindow && !mainWindow.isDestroyed()) mainWindow.hide();
+			await showConnectWindow();
+		}),
+	);
+	registerDashboardChildWindowIpc(DESKTOP_IPC.openFilesWindow, "files", "Files");
+	registerDashboardChildWindowIpc(DESKTOP_IPC.openRuntimeWindow, "runtime", "runtime UI");
+	registerDashboardChildWindowIpc(DESKTOP_IPC.openTerminalWindow, "terminal", "Terminal");
+	ipcMain.handle(DESKTOP_IPC.openConnectWizard, (event) =>
+		safeDashboardAction(event, "open Connect an Agent", async () => {
+			const shouldRestore = mainWindow?.isVisible() === true;
+			await showConnectWindow();
+			restoreMainWindowAfterConnect ||= shouldRestore;
+			mainWindow?.hide();
+		}),
+	);
+	ipcMain.handle(DESKTOP_IPC.retryDashboard, (event) =>
+		safeDashboardAction(event, "reconnect the dashboard", async () => {
+			cancelPendingDashboardAuthentication(event);
+			if ((await loadDashboardWithRecovery(true)) === "failed") {
+				throw new Error("Dashboard reconnection failed.");
+			}
+		}),
+	);
+}
+
+function registerDashboardChildWindowIpc(
+	channel: string,
+	kind: DashboardChildKind,
+	label: string,
+): void {
+	ipcMain.handle(channel, (event, rawUrl: unknown) =>
+		safeDashboardAction(event, `open ${label}`, async () => {
+			if (typeof rawUrl !== "string") throw new Error(`Invalid ${label} URL.`);
+			const url = dashboardChildUrl(rawUrl, kind, DASHBOARD_ORIGIN);
+			if (!url) {
+				throw new Error(`Invalid ${label} URL.`);
+			}
+			const child = createDashboardChildWindow({ kind, origin: url.origin });
+			try {
+				await child.loadURL(url.href);
+				return true;
+			} catch (error) {
+				if (!child.isDestroyed()) child.destroy();
+				throw error;
+			}
+		}),
+	);
+}
+
+async function authenticateAndResumeSync(force = false): Promise<DesktopAuthenticationFlowResult> {
+	return authenticateDesktopAccount(
+		{
+			bootstrapState: () => cli.bootstrapState(),
+			getAuthState: () => cli.getAuthState(),
+			authenticate: (forceAuthentication) => cli.authenticate(forceAuthentication),
+			stopDaemon: () => withCriticalOperation(() => cli.stopDaemon()),
+			restartDaemon: () => withCriticalOperation(() => cli.restartDaemon()),
+		},
+		{
+			force,
+			beforeAuthentication: force
+				? async () => {
+						await waitForDashboardOpening();
+						await clearDashboardSession();
+						mainWindow?.hide();
+					}
+				: undefined,
+		},
+	);
+}
+
+async function applyAuthenticationRecovery(recovery: {
+	restoreDashboard: boolean;
+	requiresWizard: boolean;
+	needsAttention: boolean;
+}): Promise<void> {
+	try {
+		setTrayState(await cli.bootstrapState());
+	} catch (error) {
+		console.error("Could not refresh state after sign-in recovery", error);
+		setTrayState(null);
+	}
+	if (recovery.requiresWizard) {
+		await showConnectRequired();
+		return;
+	}
+	if (recovery.restoreDashboard) await loadDashboardWithRecovery(true);
+}
+
+async function withCriticalOperation<T>(action: () => Promise<T>): Promise<T> {
+	activeCriticalOperations += 1;
+	renderUpdateMenus();
+	try {
+		return await action();
+	} finally {
+		activeCriticalOperations -= 1;
+		renderUpdateMenus();
+		if (activeCriticalOperations === 0)
+			runAsync("offer the downloaded update", maybePromptForUpdate());
+	}
+}
+
+async function safeConnectAction<T>(
+	event: IpcMainInvokeEvent,
+	label: string,
+	action: () => Promise<T>,
+): Promise<T> {
+	try {
+		assertConnectSender(event);
+		return await action();
+	} catch (error) {
+		console.error(`Could not ${label}`, error);
+		if (error instanceof DesktopCliError || error instanceof DesktopConnectError) throw error;
+		throw new Error(`Could not ${label}. Try again.`);
+	}
+}
+
+async function safeDashboardAction<T>(
+	event: IpcMainInvokeEvent,
+	label: string,
+	action: () => Promise<T>,
+): Promise<T> {
+	try {
+		assertDashboardSender(event);
+		return await action();
+	} catch (error) {
+		console.error(`Could not ${label}`, error);
+		throw new Error(`Could not ${label}. Try again.`);
+	}
+}
+
+function assertDashboardSender(event: IpcMainInvokeEvent): void {
+	if (event.sender !== mainWindow?.webContents) throw new Error("Unexpected desktop client.");
+	const senderFrame = event.senderFrame;
+	if (!senderFrame || senderFrame !== event.sender.mainFrame)
+		throw new Error("Unexpected desktop client frame.");
+	if (
+		senderFrame.url !== DASHBOARD_FAILURE_URL &&
+		urlOrigin(senderFrame.url) !== DASHBOARD_ORIGIN
+	) {
+		throw new Error("Unexpected desktop client origin.");
+	}
+}
+
+function assertConnectSender(event: IpcMainInvokeEvent): void {
+	if (event.sender !== connectWindow?.webContents)
+		throw new Error("Unexpected Connect an Agent client.");
+	const senderFrame = event.senderFrame;
+	if (!senderFrame || senderFrame !== event.sender.mainFrame)
+		throw new Error("Unexpected Connect an Agent frame.");
+	const senderUrl = senderFrame.url;
+	if (senderUrl !== CONNECT_URL) {
+		throw new Error("Unexpected Connect an Agent URL.");
+	}
+}
+
+function readAgentConnections(value: unknown): DesktopAgentConnection[] {
+	if (!Array.isArray(value) || value.length === 0) {
+		throw new Error("Choose at least one supported Agent.");
+	}
+	const connections: DesktopAgentConnection[] = [];
+	const types = new Set<DesktopAgentType>();
+	for (const item of value) {
+		if (!isRecord(item) || !isDesktopAgentType(item.type) || types.has(item.type)) {
+			throw new Error("Choose each supported Agent once.");
+		}
+		const reconnectAgentId = item.reconnectAgentId;
+		const confirmTakeover = item.confirmTakeover;
+		if (
+			reconnectAgentId !== undefined &&
+			(typeof reconnectAgentId !== "string" ||
+				!reconnectAgentId.trim() ||
+				reconnectAgentId.length > 256)
+		) {
+			throw new Error("Choose a valid Agent to reconnect.");
+		}
+		if (confirmTakeover !== undefined && typeof confirmTakeover !== "boolean") {
+			throw new Error("Choose a valid Agent takeover confirmation.");
+		}
+		if (confirmTakeover === true && typeof reconnectAgentId !== "string") {
+			throw new Error("Agent takeover confirmation requires a reconnect target.");
+		}
+		types.add(item.type);
+		connections.push({
+			type: item.type,
+			...(typeof reconnectAgentId === "string"
+				? { reconnectAgentId: reconnectAgentId.trim() }
+				: {}),
+			...(confirmTakeover === true ? { confirmTakeover: true } : {}),
+		});
+	}
+	return connections;
+}
+
+function configurePermissions(dashboardSession: Session): void {
+	session.defaultSession.setPermissionCheckHandler(() => false);
+	session.defaultSession.setPermissionRequestHandler((_webContents, _permission, callback) => {
+		callback(false);
+	});
+	session.defaultSession.on("will-download", (event) => event.preventDefault());
+
+	const allowsClipboardWrite = (
+		webContents: Electron.WebContents | null,
+		permission: string,
+		requestingUrl: string,
+		embeddingUrl: string,
+	) => {
+		if (permission !== "clipboard-sanitized-write" || !webContents) return false;
+		if (webContents === mainWindow?.webContents) {
+			return (
+				urlOrigin(requestingUrl) === DASHBOARD_ORIGIN &&
+				urlOrigin(embeddingUrl) === DASHBOARD_ORIGIN
+			);
+		}
+		const owner = BrowserWindow.fromWebContents(webContents);
+		const state = owner ? dashboardChildWindows.get(owner) : undefined;
+		return Boolean(
+			state && allowsChildClipboard(state, webContents.getURL(), requestingUrl, embeddingUrl),
+		);
+	};
+	dashboardSession.setPermissionCheckHandler((webContents, permission, requestingOrigin, details) =>
+		allowsClipboardWrite(
+			webContents,
+			permission,
+			requestingOrigin,
+			details.embeddingOrigin ?? requestingOrigin,
+		),
+	);
+	dashboardSession.setPermissionRequestHandler((webContents, permission, callback, details) => {
+		callback(
+			allowsClipboardWrite(webContents, permission, details.requestingUrl, webContents.getURL()),
+		);
+	});
+	dashboardSession.on("will-download", (event, item, webContents) => {
+		const owner = BrowserWindow.fromWebContents(webContents);
+		const state = owner ? dashboardChildWindows.get(owner) : undefined;
+		if (!state || !allowsChildDownload(state, webContents.getURL(), item.getURL())) {
+			event.preventDefault();
+		}
+	});
+}
+
+function createApplicationMenu(): void {
+	const editMenu: MenuItemConstructorOptions = {
+		label: "Edit",
+		submenu: [
+			{ role: "undo" },
+			{ role: "redo" },
+			{ type: "separator" },
+			{ role: "cut" },
+			{ role: "copy" },
+			{ role: "paste" },
+			{ role: "selectAll" },
+		],
+	};
+	const windowMenu: MenuItemConstructorOptions = {
+		label: "Window",
+		submenu: [
+			{ role: "close" },
+			{ role: "minimize" },
+			{ role: "zoom" },
+			...(process.platform === "darwin"
+				? ([{ type: "separator" }, { role: "front" }] satisfies MenuItemConstructorOptions[])
+				: []),
+		],
+	};
+	const viewMenu: MenuItemConstructorOptions = {
+		label: "View",
+		submenu: [
+			{
+				label: "Reload Dashboard",
+				accelerator: "CmdOrCtrl+R",
+				click: () => runAsync("reload Dashboard", loadDashboardWithRecovery(true)),
+			},
+			{ type: "separator" },
+			{ role: "resetZoom" },
+			{ role: "zoomIn" },
+			{ role: "zoomOut" },
+			{ type: "separator" },
+			{ role: "togglefullscreen" },
+		],
+	};
+	const template: MenuItemConstructorOptions[] = [editMenu, viewMenu, windowMenu];
+	if (process.platform === "darwin") {
+		template.unshift({
+			label: app.name,
+			submenu: [
+				{ role: "about" },
+				...updateMenuItems(),
+				{ type: "separator" },
+				{ role: "services" },
+				{ type: "separator" },
+				{ role: "hide" },
+				{ role: "hideOthers" },
+				{ role: "unhide" },
+				{ type: "separator" },
+				{ role: "quit", enabled: activeCriticalOperations === 0 },
+			],
+		});
+	}
+	if (process.platform !== "darwin")
+		template.unshift({
+			label: "File",
+			submenu: [
+				...updateActionMenuItems(),
+				{ role: "quit", enabled: activeCriticalOperations === 0 },
+			],
+		});
+	Menu.setApplicationMenu(Menu.buildFromTemplate(template));
+}
+
+async function reconcileDesktopCliCommand(daemonInstalled: boolean): Promise<void> {
+	if (!app.isPackaged) return;
+	const result = await installDesktopCliCommand(
+		desktopCliCommandOptions(await cli.shellCommandTarget()),
+	);
+	if (!daemonInstalled) await cli.pruneUnusedAppImageRuntimes();
+	if (result.status === "installed" && !result.pathReady) {
+		console.warn(`The iforge command is installed outside PATH: ${result.path}`);
+	}
+}
+
+function desktopCliCommandOptions(target: string): DesktopCliCommandOptions {
+	return {
+		platform: requireDesktopPlatform(),
+		target,
+		home: app.getPath("home"),
+		userData: app.getPath("userData"),
+		localAppData: process.env.LOCALAPPDATA,
+		environmentPath: process.env.PATH,
+		windowsPathScript: join(process.resourcesPath, "support", "windows-cli-path.ps1"),
+	};
+}
+
+async function createMainWindow(initialUrl: string): Promise<void> {
+	const preload = join(fileURLToPath(new URL(".", import.meta.url)), "shell-preload.cjs");
+	const icon = desktopIcon();
+	const window = new BrowserWindow({
+		width: 1320,
+		height: 860,
+		minWidth: 960,
+		minHeight: 640,
+		show: false,
+		backgroundColor: "#ffffff",
+		...(process.platform === "darwin" ? { titleBarStyle: "hiddenInset" as const } : {}),
+		...(icon.isEmpty() ? {} : { icon }),
+		webPreferences: {
+			preload,
+			partition: DASHBOARD_PARTITION,
+			contextIsolation: true,
+			nodeIntegration: false,
+			sandbox: true,
+			spellcheck: false,
+		},
+	});
+	mainWindow = window;
+
+	window.webContents.setWindowOpenHandler((details) => {
+		if (isSafeExternalUrl(details.url)) {
+			runAsync("open the external link", shell.openExternal(details.url));
+		}
+		return { action: "deny" };
+	});
+	const preventUntrustedNavigation = (event: Electron.Event, url: string) => {
+		if (url === DASHBOARD_FAILURE_URL || urlOrigin(url) === DASHBOARD_ORIGIN) return;
+		event.preventDefault();
+		if (isSafeExternalUrl(url)) runAsync("open the external link", shell.openExternal(url));
+	};
+	window.webContents.on("will-navigate", preventUntrustedNavigation);
+	window.webContents.on("will-redirect", preventUntrustedNavigation);
+	window.webContents.on(
+		"did-fail-load",
+		(_event, errorCode, errorDescription, validatedUrl, isMainFrame) => {
+			if (
+				quitting ||
+				!isMainFrame ||
+				errorCode === ERR_ABORTED ||
+				validatedUrl === DASHBOARD_FAILURE_URL ||
+				window.isDestroyed() ||
+				mainWindow !== window
+			) {
+				return;
+			}
+			console.error(`Dashboard failed to load: ${errorDescription} (${errorCode})`);
+			runAsync("show the dashboard failure", showDashboardFailure());
+		},
+	);
+	window.webContents.on("render-process-gone", (_event, details) => {
+		if (quitting || window.isDestroyed() || mainWindow !== window) return;
+		console.error(`Dashboard renderer exited: ${details.reason}`);
+		runAsync("recover the dashboard renderer", showDashboardFailure(true, window.isVisible()));
+	});
+	window.on("close", (event) => {
+		if (quitting) return;
+		event.preventDefault();
+		window.hide();
+	});
+	window.on("closed", () => {
+		closeDashboardChildWindows();
+		if (mainWindow === window) mainWindow = null;
+	});
+
+	await loadWindowUrl(window, initialUrl);
+}
+
+function createDashboardChildWindow(state: DashboardChildState): BrowserWindow {
+	const icon = desktopIcon();
+	const window = new BrowserWindow({
+		show: false,
+		width: 1120,
+		height: 760,
+		minWidth: 720,
+		minHeight: 480,
+		...(icon.isEmpty() ? {} : { icon }),
+		webPreferences: {
+			partition: DASHBOARD_PARTITION,
+			contextIsolation: true,
+			nodeIntegration: false,
+			sandbox: true,
+			spellcheck: false,
+		},
+	});
+	configureDashboardChildWindow(window, state);
+	return window;
+}
+
+function configureDashboardChildWindow(window: BrowserWindow, state: DashboardChildState): void {
+	dashboardChildWindows.set(window, state);
+	window.webContents.setWindowOpenHandler(() => ({ action: "deny" }));
+	const guardNavigation = (event: Electron.Event, url: string) => {
+		const decision = evaluateChildNavigation(url, state);
+		if (decision.action === "allow") return;
+		event.preventDefault();
+		if (decision.action === "external") {
+			runAsync("open the child window link externally", shell.openExternal(url));
+		}
+	};
+	window.webContents.on("will-navigate", guardNavigation);
+	window.webContents.on("will-redirect", guardNavigation);
+	window.once("ready-to-show", () => {
+		if (!window.isDestroyed()) window.show();
+	});
+	window.webContents.on("render-process-gone", (_event, details) => {
+		if (quitting || window.isDestroyed()) return;
+		console.error(`Dashboard child renderer exited: ${details.reason}`);
+		window.destroy();
+	});
+	window.on("closed", () => dashboardChildWindows.delete(window));
+}
+
+function closeDashboardChildWindows(): void {
+	for (const window of dashboardChildWindows.keys()) {
+		if (!window.isDestroyed()) window.destroy();
+	}
+	dashboardChildWindows.clear();
+}
+
+function hardenLocalWindow(
+	window: BrowserWindow,
+	allowedUrl: string,
+	label: string,
+	maxRendererReloads = 0,
+): void {
+	let rendererReloads = 0;
+	window.webContents.setWindowOpenHandler(() => ({ action: "deny" }));
+	const preventUnexpectedNavigation = (event: Electron.Event, url: string) => {
+		if (url !== allowedUrl) event.preventDefault();
+	};
+	window.webContents.on("will-navigate", preventUnexpectedNavigation);
+	window.webContents.on("will-redirect", preventUnexpectedNavigation);
+	window.webContents.on(
+		"did-fail-load",
+		(_event, errorCode, errorDescription, _validatedUrl, isMainFrame) => {
+			if (quitting || !isMainFrame || window.isDestroyed()) return;
+			console.error(`${label} failed to load: ${errorDescription} (${errorCode})`);
+		},
+	);
+	window.webContents.on("render-process-gone", (_event, details) => {
+		if (quitting || window.isDestroyed()) return;
+		console.error(`${label} renderer exited: ${details.reason}`);
+		if (rendererReloads < maxRendererReloads) {
+			rendererReloads += 1;
+			window.webContents.reload();
+			return;
+		}
+		runAsync(
+			`report the ${label} renderer failure`,
+			showMessageBox(
+				{
+					type: "warning",
+					message: `${label} could not recover`,
+					detail: "Close this window and open it again from iforge.",
+				},
+				window,
+			),
+		);
+	});
+}
+
+async function showConnectWindow(): Promise<void> {
+	if (process.platform === "darwin") await app.dock?.show();
+	if (connectWindow) {
+		if (connectWindow.isMinimized()) connectWindow.restore();
+		connectWindow.show();
+		connectWindow.focus();
+		return;
+	}
+
+	const preload = join(fileURLToPath(new URL(".", import.meta.url)), "connect-preload.cjs");
+	const icon = desktopIcon();
+	const window = new BrowserWindow({
+		width: 560,
+		height: 680,
+		minWidth: 480,
+		minHeight: 560,
+		show: false,
+		backgroundColor: "#faf9f7",
+		title: "Connect an Agent",
+		...(process.platform === "darwin" ? { titleBarStyle: "hiddenInset" as const } : {}),
+		...(icon.isEmpty() ? {} : { icon }),
+		webPreferences: {
+			preload,
+			contextIsolation: true,
+			nodeIntegration: false,
+			sandbox: true,
+			spellcheck: false,
+		},
+	});
+	connectWindow = window;
+	hardenLocalWindow(window, CONNECT_URL, "Connect an Agent", 1);
+	window.once("ready-to-show", () => window.show());
+	window.on("closed", () => {
+		const shouldRestore = restoreMainWindowAfterConnect;
+		restoreMainWindowAfterConnect = false;
+		runAsync("cancel sign-in", cli.cancelAuthentication());
+		if (connectWindow === window) connectWindow = null;
+		if (shouldRestore && !quitting) {
+			runAsync("restore the dashboard", showMainWindow());
+		}
+	});
+	await window.loadURL(CONNECT_URL);
+}
+
+function createTray(): void {
+	const trayIcon =
+		process.platform === "darwin"
+			? nativeImage.createFromPath(join(app.getAppPath(), "dist", "trayTemplate.png"))
+			: nativeImage.createFromPath(
+					join(
+						app.getAppPath(),
+						"dist",
+						process.platform === "win32" ? "trayWindows.png" : "trayLinux.png",
+					),
+				);
+	if (trayIcon.isEmpty()) throw new Error("Tray icon is missing.");
+	if (process.platform === "darwin") trayIcon.setTemplateImage(true);
+	tray = new Tray(trayIcon);
+	tray.setToolTip("iforge");
+	renderTrayMenu();
+	const statusRefresh = setInterval(() => {
+		if (!quitting && activeCriticalOperations === 0) {
+			runAsync("refresh sync status", refreshTrayState());
+		}
+	}, 60_000);
+	statusRefresh.unref();
+	app.once("before-quit", () => clearInterval(statusRefresh));
+	if (process.platform !== "darwin") {
+		tray.on("click", () => runAsync("show iforge", showAvailableWindow()));
+	}
+}
+
+function renderTrayMenu(): void {
+	if (!tray) return;
+	tray.setToolTip(`iforge · ${trayStatus()}`);
+	const template: MenuItemConstructorOptions[] = [
+		{ label: trayStatus(), enabled: false },
+		{
+			type: "checkbox",
+			label: "Sync",
+			checked: trayState?.daemon.installed === true,
+			enabled: trayState !== null && !trayStateChecking && activeCriticalOperations === 0,
+			click: (item) => runAsync("change sync", setSyncEnabled(item.checked)),
+		},
+		{ type: "separator" },
+		{
+			label: "Open iforge",
+			click: () => runAsync("show iforge", showAvailableWindow()),
+		},
+		{
+			label: "Connect an Agent…",
+			click: () => runAsync("open Connect an Agent", showConnectWindow()),
+		},
+	];
+	template.push(...updateMenuItems());
+
+	if (process.platform === "darwin") {
+		const loginItem = readLoginItemSettings();
+		template.push(
+			{ type: "separator" },
+			{
+				type: "checkbox",
+				label: "Open iforge at Login",
+				checked: loginItem?.openAtLogin === true,
+				enabled: app.isPackaged && loginItem !== null,
+				click: (item) => runAsync("change the login item", setLaunchAtLogin(item.checked)),
+			},
+		);
+		if (!loginItem) {
+			template.push({ label: "Login Item: Unavailable", enabled: false });
+		} else if (loginItem.status === "requires-approval") {
+			template.push({ label: "Login Item Requires Approval", enabled: false });
+		}
+	}
+
+	template.push(
+		{ type: "separator" },
+		{
+			label: "Quit iforge",
+			enabled: activeCriticalOperations === 0,
+			click: () => {
+				app.quit();
+			},
+		},
+	);
+	tray.setContextMenu(Menu.buildFromTemplate(template));
+}
+
+function trayStatus(): string {
+	if (trayStateChecking) return "Sync: Checking…";
+	if (!trayState) return "Sync: Unavailable";
+	if (!trayState.auth.authenticated) return "Sync: Sign In Required";
+	if (!trayState.daemon.installed) return "Sync: Off";
+	return trayState.daemon.running ? "Sync: Running" : "Sync: Needs Attention";
+}
+
+function setTrayState(state: DesktopBootstrapState | null): void {
+	trayState = state;
+	trayStateChecking = false;
+	renderTrayMenu();
+}
+
+async function refreshTrayState(): Promise<void> {
+	if (trayStateRefresh) return trayStateRefresh;
+	if (installationState().requiresMove) {
+		setTrayState(null);
+		return;
+	}
+	trayStateChecking = true;
+	renderTrayMenu();
+	const refresh = (async () => {
+		try {
+			setTrayState(await cli.bootstrapState());
+		} catch (error) {
+			console.error("Could not refresh sync status", error);
+			setTrayState(null);
+		}
+	})();
+	trayStateRefresh = refresh;
+	try {
+		await refresh;
+	} finally {
+		if (trayStateRefresh === refresh) trayStateRefresh = null;
+	}
+}
+
+async function setSyncEnabled(enabled: boolean): Promise<void> {
+	if (!enabled) return turnOffBackgroundSync();
+	try {
+		await withCriticalOperation(async () => {
+			assertSafeDaemonMutation();
+			const state = await cli.bootstrapState();
+			if (!state.auth.authenticated) {
+				await showConnectWindow();
+				return;
+			}
+			const agents = await cli.detectAgents();
+			if (!agents.some((agent) => agent.registered && agent.inspection === "complete")) {
+				await showConnectWindow();
+				return;
+			}
+			await cli.installDaemon();
+		});
+	} catch (error) {
+		console.error("Could not enable sync", error);
+		await showMessageBox({
+			type: "warning",
+			message: "Sync could not be enabled",
+			detail: "Open Connect an Agent to check the local setup.",
+		});
+	} finally {
+		await refreshTrayState();
+	}
+}
+
+async function turnOffBackgroundSync(): Promise<void> {
+	trayStateChecking = true;
+	renderTrayMenu();
+	try {
+		await withCriticalOperation(() => cli.uninstallDaemon());
+		await refreshTrayState();
+	} catch (error) {
+		console.error("Could not turn off sync", error);
+		await refreshTrayState();
+		await showMessageBox({
+			type: "warning",
+			message: "Sync could not be turned off",
+			detail: "Try again, or open Connect an Agent to inspect the local setup.",
+		});
+	}
+}
+
+async function setLaunchAtLogin(enabled: boolean): Promise<void> {
+	if (process.platform !== "darwin" || !app.isPackaged) {
+		renderTrayMenu();
+		return;
+	}
+	if (enabled && installationState().requiresMove) {
+		renderTrayMenu();
+		await promptToMove("iforge must be in Applications before it can open at login.");
+		return;
+	}
+	try {
+		app.setLoginItemSettings({ openAtLogin: enabled, type: "mainAppService" });
+		const actual = readLoginItemSettings();
+		if (!actual || actual.openAtLogin !== enabled) {
+			await showLoginItemError();
+		}
+	} catch (error) {
+		console.error("Could not change the login item", error);
+		await showLoginItemError();
+	}
+	renderTrayMenu();
+}
+
+function readLoginItemSettings(): ReturnType<typeof app.getLoginItemSettings> | null {
+	if (process.platform !== "darwin" || !app.isPackaged) return null;
+	try {
+		return app.getLoginItemSettings({ type: "mainAppService" });
+	} catch (error) {
+		console.error("Could not read the login item", error);
+		return null;
+	}
+}
+
+function wasOpenedAtLogin(): boolean {
+	return app.isPackaged && readLoginItemSettings()?.wasOpenedAtLogin === true;
+}
+
+async function showLoginItemError(): Promise<void> {
+	await showMessageBox({
+		type: "warning",
+		message: "The login item could not be changed",
+		detail: "Review iforge in System Settings > General > Login Items and try again.",
+	});
+}
+
+function installationState(): DesktopInstallationState {
+	return {
+		requiresMove: process.platform === "darwin" && app.isPackaged && !app.isInApplicationsFolder(),
+	};
+}
+
+function assertRuntimeLocation(): void {
+	if (!installationState().requiresMove) return;
+	throw new DesktopConnectError("Move iforge to Applications before starting its local runtime.");
+}
+
+function assertSafeDaemonMutation(): void {
+	if (!installationState().requiresMove) return;
+	throw new DesktopConnectError(
+		"Move iforge to Applications before connecting Agents or repairing sync.",
+	);
+}
+
+function moveToApplicationsFolder(): DesktopMoveToApplicationsResult {
+	if (!installationState().requiresMove) return { status: "not-required" };
+	const moved = app.moveToApplicationsFolder({
+		conflictHandler: (conflictType) => {
+			const running = conflictType === "existsAndRunning";
+			return (
+				showMessageBoxSync({
+					type: "question",
+					message: running
+						? "iforge is already running from Applications"
+						: "Replace the existing iforge app?",
+					detail: running
+						? "Open the installed copy and close this one. Sync remains independent."
+						: "The existing copy will be moved to the Trash before this copy is installed.",
+					buttons: ["Cancel", running ? "Open Installed iforge" : "Replace and Move"],
+					defaultId: 0,
+					cancelId: 0,
+					noLink: true,
+				}) === 1
+			);
+		},
+	});
+	return { status: moved ? "relaunching" : "cancelled" };
+}
+
+async function promptToMove(detail: string): Promise<void> {
+	const choice = await showMessageBox({
+		type: "info",
+		message: "Move iforge to Applications",
+		detail: `${detail} iforge will reopen automatically after it moves.`,
+		buttons: ["Not Now", "Move to Applications"],
+		defaultId: 1,
+		cancelId: 0,
+		noLink: true,
+	});
+	if (choice.response !== 1) return;
+	try {
+		moveToApplicationsFolder();
+	} catch (error) {
+		console.error("Could not move iforge to Applications", error);
+		await showMessageBox({
+			type: "warning",
+			message: "iforge could not be moved",
+			detail: "Move iforge to Applications in Finder, reopen it, and try again.",
+		});
+	}
+}
+
+async function showAvailableWindow(): Promise<void> {
+	if (connectWindow) {
+		await showConnectWindow();
+		return;
+	}
+	if (mainWindow) {
+		await showWindowFromTrayState();
+		return;
+	}
+	if (availableWindowOpening) return availableWindowOpening;
+
+	const opening = showWindowFromTrayState();
+	availableWindowOpening = opening;
+	try {
+		await opening;
+	} finally {
+		if (availableWindowOpening === opening) availableWindowOpening = null;
+	}
+}
+
+async function showWindowFromTrayState(): Promise<void> {
+	if (installationState().requiresMove) {
+		await showConnectWindow();
+		return;
+	}
+	const startup = await prepareDesktopStartup(cli);
+	setTrayState(startup.state);
+	if (startup.requiresWizard) {
+		await showConnectWindow();
+		return;
+	}
+	await loadDashboardWithRecovery();
+	runAsync("reconcile sync after opening iforge", reconcileBackgroundSyncAfterStartup());
+}
+
+async function reconcileBackgroundSyncAfterStartup(): Promise<void> {
+	const recovery = await reconcileDesktopStartupSync(cli);
+	setTrayState(recovery.state);
+}
+
+async function showMainWindow(): Promise<void> {
+	const window = mainWindow;
+	if (!window || window.isDestroyed()) {
+		await loadDashboardWithRecovery();
+		return;
+	}
+	await presentMainWindow(window);
+}
+
+async function loadDashboardWithRecovery(
+	forceAuthentication = false,
+): Promise<DashboardLoadResult> {
+	if (dashboardWindowOpening) {
+		if (!forceAuthentication) return dashboardWindowOpening;
+		await waitForDashboardOpening();
+	}
+	const opening = (async () => {
+		try {
+			const state = await cli.bootstrapState();
+			setTrayState(state);
+			if (!state.auth.authenticated || !state.auth.user) {
+				await showConnectRequired();
+				return "connect-required" as const;
+			}
+
+			const window = mainWindow;
+			const currentUrl = window && !window.isDestroyed() ? window.webContents.getURL() : "";
+			if (
+				window &&
+				!window.isDestroyed() &&
+				!forceAuthentication &&
+				dashboardAccountId === state.auth.user.id &&
+				isDashboardContentUrl(currentUrl)
+			) {
+				await presentMainWindow(window);
+				return "opened" as const;
+			}
+
+			await prepareDashboardSession(state.auth.user.id);
+			const readyWindow = mainWindow;
+			if (!readyWindow || readyWindow.isDestroyed()) throw new Error("Dashboard window was closed");
+			await presentMainWindow(readyWindow);
+			return "opened" as const;
+		} catch (error) {
+			if (error instanceof DashboardLoadCancelled) return "failed" as const;
+			console.error("Could not open the dashboard", error);
+			try {
+				const auth = await cli.getAuthState();
+				if (!auth.authenticated || !auth.user) {
+					setTrayState(
+						trayState ? { ...trayState, auth, daemon: { installed: false, running: false } } : null,
+					);
+					await showConnectRequired();
+					return "connect-required" as const;
+				}
+			} catch (authError) {
+				console.error("Could not re-check the local sign-in state", authError);
+			}
+			await showDashboardFailure();
+			return "failed" as const;
+		}
+	})();
+	dashboardWindowOpening = opening;
+	try {
+		return await opening;
+	} finally {
+		if (dashboardWindowOpening === opening) dashboardWindowOpening = null;
+	}
+}
+
+async function showDashboardFailure(forceReload = false, present = true): Promise<void> {
+	if (dashboardFailureOpening && !forceReload) return dashboardFailureOpening;
+	const opening = (async () => {
+		let window = mainWindow;
+		if (!window || window.isDestroyed()) {
+			await createMainWindow(DASHBOARD_FAILURE_URL);
+			window = mainWindow;
+		} else if (forceReload || window.webContents.getURL() !== DASHBOARD_FAILURE_URL) {
+			await window.loadURL(DASHBOARD_FAILURE_URL);
+		}
+		if (!window || window.isDestroyed()) throw new Error("Dashboard recovery window was closed");
+		if (present) await presentMainWindow(window);
+	})();
+	dashboardFailureOpening = opening;
+	try {
+		await opening;
+	} finally {
+		if (dashboardFailureOpening === opening) dashboardFailureOpening = null;
+	}
+}
+
+async function presentMainWindow(window: BrowserWindow): Promise<void> {
+	if (process.platform === "darwin") await app.dock?.show();
+	if (window.isDestroyed()) throw new Error("Dashboard window was closed");
+	if (window.isMinimized()) window.restore();
+	window.show();
+	window.focus();
+	runAsync("offer the downloaded update", maybePromptForUpdate());
+}
+
+async function prepareDashboardSession(accountId: string): Promise<void> {
+	if (!dashboardSession) throw new Error("Dashboard session is unavailable.");
+	const accounts = await dashboardSession.cookies.get({
+		url: DASHBOARD_ORIGIN,
+		name: DASHBOARD_ACCOUNT_COOKIE,
+	});
+	if (accounts[0]?.value !== accountId) {
+		await clearDashboardSession();
+	}
+	dashboardAccountId = accountId;
+	await dashboardSession.cookies.set({
+		url: DASHBOARD_ORIGIN,
+		name: DASHBOARD_ACCOUNT_COOKIE,
+		value: accountId,
+		path: "/",
+		secure: true,
+		httpOnly: true,
+		sameSite: "strict",
+		expirationDate: Math.floor(Date.now() / 1000) + 365 * 24 * 60 * 60,
+	});
+	await dashboardSession.cookies.flushStore();
+	let window = mainWindow;
+	if (!window || window.isDestroyed()) {
+		await createMainWindow(DASHBOARD_FAILURE_URL);
+		window = mainWindow;
+	}
+	if (!window || window.isDestroyed()) throw new Error("Dashboard window was closed");
+
+	const url = new URL("/desktop-auth", DASHBOARD_ORIGIN);
+	url.hash = new URLSearchParams({ account: accountId }).toString();
+	const retryingAuthPage =
+		window.webContents.getURL().split(/[?#]/)[0] === `${DASHBOARD_ORIGIN}/desktop-auth`;
+	const ready = waitForDashboardReady(window, DASHBOARD_LOAD_TIMEOUT_MS);
+	try {
+		await loadWindowUrl(window, url.toString());
+		// A hash-only navigation retains React's completed sign-in attempt.
+		if (retryingAuthPage) window.webContents.reload();
+		await ready;
+		await dashboardSession.cookies.flushStore();
+		dashboardSession.flushStorageData();
+	} catch (error) {
+		void ready.catch(() => undefined);
+		throw error;
+	}
+	dashboardAccountId = accountId;
+}
+
+async function showConnectRequired(): Promise<void> {
+	await clearDashboardSession();
+	if (mainWindow && !mainWindow.isDestroyed()) mainWindow.hide();
+	if (connectWindow && !connectWindow.isDestroyed()) connectWindow.webContents.reload();
+	await showConnectWindow();
+}
+
+function waitForDashboardReady(window: BrowserWindow, timeoutMs: number): Promise<void> {
+	return new Promise((resolvePromise, reject) => {
+		const cancel = () => finish(new DashboardLoadCancelled());
+		cancelDashboardReady = cancel;
+		const timer = setTimeout(() => finish(new Error("Dashboard sign-in timed out")), timeoutMs);
+		const onNavigate = (_event: Electron.Event, url: string) => {
+			if (isDashboardContentUrl(url)) finish();
+		};
+		const onDestroyed = () => finish(new Error("Dashboard window was closed"));
+		window.webContents.on("did-navigate", onNavigate);
+		window.webContents.once("destroyed", onDestroyed);
+
+		function finish(error?: Error) {
+			if (cancelDashboardReady === cancel) cancelDashboardReady = null;
+			clearTimeout(timer);
+			window.webContents.off("did-navigate", onNavigate);
+			window.webContents.off("destroyed", onDestroyed);
+			if (error) reject(error);
+			else resolvePromise();
+		}
+	});
+}
+
+function cancelPendingDashboardAuthentication(event: IpcMainInvokeEvent): void {
+	// Called only after the dashboard sender and main frame have been validated.
+	if (new URL(event.senderFrame?.url ?? "").pathname === "/desktop-auth") {
+		cancelDashboardReady?.();
+	}
+}
+
+async function clearDashboardSession(): Promise<void> {
+	dashboardAccountId = null;
+	closeDashboardChildWindows();
+	if (dashboardSession) await dashboardSession.clearData();
+}
+
+async function waitForDashboardOpening(): Promise<void> {
+	const pending = dashboardWindowOpening;
+	if (!pending) return;
+	try {
+		await pending;
+	} catch {
+		// The caller is replacing the pending navigation; only completion matters.
+	}
+}
+
+async function loadWindowUrl(window: BrowserWindow, url: string): Promise<void> {
+	try {
+		await window.loadURL(url);
+	} catch (error) {
+		if (!isExpectedDashboardRedirect(error, url)) throw error;
+	}
+}
+
+function isExpectedDashboardRedirect(error: unknown, requestedUrl: string): boolean {
+	if (urlOrigin(requestedUrl) !== DASHBOARD_ORIGIN || !isRecord(error)) return false;
+	return (
+		error.code === "ERR_ABORTED" &&
+		error.errno === ERR_ABORTED &&
+		typeof error.url === "string" &&
+		urlOrigin(error.url) === DASHBOARD_ORIGIN
+	);
+}
+
+function isDashboardContentUrl(raw: string): boolean {
+	try {
+		const url = new URL(raw);
+		return (
+			url.origin === DASHBOARD_ORIGIN &&
+			url.pathname !== "/desktop-auth" &&
+			url.pathname !== "/sign-in"
+		);
+	} catch {
+		return false;
+	}
+}
+
+function desktopIcon() {
+	const path = app.isPackaged
+		? join(process.resourcesPath, "iforge-logo.png")
+		: join(app.getAppPath(), "..", "web", "public", "iforge-logo-transparent.png");
+	return nativeImage.createFromPath(path);
+}
+
+function isSafeExternalUrl(raw: string): boolean {
+	try {
+		const url = new URL(raw);
+		return url.protocol === "https:" && !url.username && !url.password;
+	} catch {
+		return false;
+	}
+}
+
+function urlOrigin(raw: string): string | null {
+	try {
+		return new URL(raw).origin;
+	} catch {
+		return null;
+	}
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}

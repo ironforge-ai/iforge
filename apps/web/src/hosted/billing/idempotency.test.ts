@@ -1,0 +1,243 @@
+import { describe, expect, test } from "bun:test";
+import {
+	forgetIdempotencyAttempt,
+	forgetIdempotencyAttemptByKey,
+	IDEMPOTENCY_ATTEMPT_TTL_MS,
+	idempotencyAttemptFor,
+	idempotencyFingerprint,
+	newIdempotencyKey,
+} from "./idempotency";
+
+class MemoryStorage implements Storage {
+	private readonly items = new Map<string, string>();
+
+	get length(): number {
+		return this.items.size;
+	}
+
+	clear(): void {
+		this.items.clear();
+	}
+
+	getItem(key: string): string | null {
+		return this.items.get(key) ?? null;
+	}
+
+	key(index: number): string | null {
+		return Array.from(this.items.keys())[index] ?? null;
+	}
+
+	removeItem(key: string): void {
+		this.items.delete(key);
+	}
+
+	setItem(key: string, value: string): void {
+		this.items.set(key, value);
+	}
+}
+
+describe("newIdempotencyKey", () => {
+	test("carries the caller's prefix", () => {
+		expect(newIdempotencyKey("topup")).toMatch(/^topup-/);
+		expect(newIdempotencyKey("deploy")).toMatch(/^deploy-/);
+	});
+
+	test("mints a distinct key per call (so distinct attempts don't collide)", () => {
+		const keys = new Set(Array.from({ length: 100 }, () => newIdempotencyKey("topup")));
+		expect(keys.size).toBe(100);
+	});
+
+	test("is a non-trivial token, not just the bare prefix", () => {
+		const key = newIdempotencyKey("topup");
+		expect(key.length).toBeGreaterThan("topup-".length);
+	});
+});
+
+describe("idempotencyFingerprint", () => {
+	test("is stable for equivalent nested request bodies", () => {
+		expect(
+			idempotencyFingerprint({
+				plan_slug: "compute_performance",
+				deploy_config: { runtime: "hermes" },
+				billing_term_months: 12,
+			}),
+		).toBe(
+			idempotencyFingerprint({
+				billing_term_months: 12,
+				deploy_config: { runtime: "hermes" },
+				plan_slug: "compute_performance",
+			}),
+		);
+	});
+
+	test("changes when launch-critical request body fields change", () => {
+		const baseBody = {
+			plan_slug: "compute_performance",
+			deploy_config: { runtime: "hermes" },
+			billing_term_months: 1,
+		};
+		const baseFingerprint = idempotencyFingerprint(baseBody);
+
+		for (const changedBody of [
+			{ ...baseBody, plan_slug: "compute_basic" },
+			{ ...baseBody, billing_term_months: 12 },
+			{ ...baseBody, deploy_config: { ...baseBody.deploy_config, runtime: "openclaw" } },
+		]) {
+			expect(idempotencyFingerprint(changedBody)).not.toBe(baseFingerprint);
+		}
+	});
+});
+
+describe("idempotencyAttemptFor", () => {
+	test("scopes setup keys to one unchanged dialog session", () => {
+		let counter = 0;
+		const mint = (prefix: string) => `${prefix}-${++counter}`;
+		const fingerprint = idempotencyFingerprint({
+			amountCents: 2_500,
+			monthlyCapCents: 10_000,
+			thresholdCents: 500,
+		});
+		const first = idempotencyAttemptFor(null, "wallet-auto-reload-setup", fingerprint, mint, {
+			storage: null,
+		});
+		const retry = idempotencyAttemptFor(first, "wallet-auto-reload-setup", fingerprint, mint, {
+			storage: null,
+		});
+		const changedFingerprint = idempotencyFingerprint({
+			amountCents: 5_000,
+			monthlyCapCents: 10_000,
+			thresholdCents: 500,
+		});
+		const changed = idempotencyAttemptFor(
+			first,
+			"wallet-auto-reload-setup",
+			changedFingerprint,
+			mint,
+			{ storage: null },
+		);
+		const reopened = idempotencyAttemptFor(null, "wallet-auto-reload-setup", fingerprint, mint, {
+			storage: null,
+		});
+
+		expect(retry).toBe(first);
+		expect(retry.key).toBe("wallet-auto-reload-setup-1");
+		expect(changed.key).toBe("wallet-auto-reload-setup-2");
+		expect(reopened.key).toBe("wallet-auto-reload-setup-3");
+		expect(counter).toBe(3);
+	});
+
+	test("mints a new key when plan, term, or deploy config changes", () => {
+		let counter = 0;
+		const mint = (prefix: string) => `${prefix}-${++counter}`;
+		const monthly = idempotencyFingerprint({
+			plan_slug: "compute_performance",
+			billing_term_months: 1,
+			deploy_config: { language: "en", timezone: "America/Los_Angeles" },
+		});
+		const annual = idempotencyFingerprint({
+			plan_slug: "compute_performance",
+			billing_term_months: 12,
+			deploy_config: { language: "en", timezone: "America/Los_Angeles" },
+		});
+		const first = idempotencyAttemptFor(null, "checkout", monthly, mint);
+		const changed = idempotencyAttemptFor(first, "checkout", annual, mint);
+
+		expect(changed.key).toBe("checkout-2");
+		expect(changed).not.toBe(first);
+	});
+
+	test("reuses a persisted key for the same fingerprint across remounts", () => {
+		const storage = new MemoryStorage();
+		let counter = 0;
+		const mint = (prefix: string) => `${prefix}-${++counter}`;
+
+		const firstMount = idempotencyAttemptFor(null, "checkout", "same-attempt", mint, {
+			storage,
+			now: () => 1_000,
+		});
+		const secondMount = idempotencyAttemptFor(null, "checkout", "same-attempt", mint, {
+			storage,
+			now: () => 2_000,
+		});
+
+		expect(secondMount).toEqual(firstMount);
+		expect(counter).toBe(1);
+	});
+
+	test("mints a new persisted key for a changed fingerprint", () => {
+		const storage = new MemoryStorage();
+		let counter = 0;
+		const mint = (prefix: string) => `${prefix}-${++counter}`;
+
+		const first = idempotencyAttemptFor(null, "checkout", "monthly", mint, {
+			storage,
+			now: () => 1_000,
+		});
+		const changed = idempotencyAttemptFor(first, "checkout", "annual", mint, {
+			storage,
+			now: () => 2_000,
+		});
+
+		expect(changed.key).toBe("checkout-2");
+		expect(changed.key).not.toBe(first.key);
+	});
+
+	test("mints a new persisted key after the TTL expires", () => {
+		const storage = new MemoryStorage();
+		let counter = 0;
+		const mint = (prefix: string) => `${prefix}-${++counter}`;
+
+		const first = idempotencyAttemptFor(null, "checkout", "same-attempt", mint, {
+			storage,
+			now: () => 1_000,
+		});
+		const expired = idempotencyAttemptFor(first, "checkout", "same-attempt", mint, {
+			storage,
+			now: () => 1_000 + IDEMPOTENCY_ATTEMPT_TTL_MS + 1,
+		});
+
+		expect(expired.key).toBe("checkout-2");
+		expect(expired.key).not.toBe(first.key);
+	});
+
+	test("is safe without browser storage", () => {
+		let counter = 0;
+		const mint = (prefix: string) => `${prefix}-${++counter}`;
+
+		const first = idempotencyAttemptFor(null, "checkout", "same-attempt", mint, {
+			storage: null,
+		});
+		const retry = idempotencyAttemptFor(first, "checkout", "same-attempt", mint, {
+			storage: null,
+		});
+
+		expect(retry).toBe(first);
+		expect(counter).toBe(1);
+		expect(() => idempotencyAttemptFor(null, "checkout", "ssr-safe", mint)).not.toThrow();
+	});
+
+	test("forgets a completed attempt so the next identical action gets a fresh key", () => {
+		const storage = new MemoryStorage();
+		let counter = 0;
+		const mint = (prefix: string) => `${prefix}-${++counter}`;
+		const first = idempotencyAttemptFor(null, "wallet-deploy", "same", mint, { storage });
+
+		forgetIdempotencyAttempt("wallet-deploy", "same", { storage });
+		const next = idempotencyAttemptFor(null, "wallet-deploy", "same", mint, { storage });
+
+		expect(first.key).toBe("wallet-deploy-1");
+		expect(next.key).toBe("wallet-deploy-2");
+	});
+
+	test("forgets a persisted attempt by its durable request key", () => {
+		const storage = new MemoryStorage();
+		let counter = 0;
+		const mint = (prefix: string) => `${prefix}-${++counter}`;
+		const first = idempotencyAttemptFor(null, "checkout", "same", mint, { storage });
+
+		forgetIdempotencyAttemptByKey("checkout", first.key, { storage });
+		const next = idempotencyAttemptFor(null, "checkout", "same", mint, { storage });
+
+		expect(next.key).toBe("checkout-2");
+	});
+});

@@ -1,0 +1,1672 @@
+/**
+ * `iforge daemon` entry.
+ *
+ * Long-lived process. Watches local skill directories, projects their
+ * Agent-authoritative state to Cloud, posts heartbeats, and keeps a bounded
+ * retry queue to survive transient outages. Cloud Skill events only wake a
+ * local re-scan; they never mutate the Agent filesystem.
+ *
+ * Three deploy contexts share this same code:
+ *   - laptop: started by the user via `iforge daemon install`
+ *     (launchd / systemd unit) or `iforge daemon run` in a terminal pane
+ *   - VPS: same as laptop (systemd unit)
+ *   - hosted pod: pid-1 in a sidecar container; auth via
+ *     CLAWDI_AUTH_TOKEN env, env id passed via flag or env var
+ *
+ * The differences (signals, fs.watch vs poll, log format) are
+ * controlled by `CLAWDI_SERVE_MODE`:
+ *   - "container" — force poll watcher, exit 0 on SIGTERM (k8s
+ *     graceful), no startup auth check (env may not be ready
+ *     yet on first boot)
+ *   - "host" (default) — fs.watch, normal SIGINT/SIGTERM
+ *
+ * Logs are JSON-per-line on stderr; stdout is reserved.
+ */
+
+import { execFileSync } from "node:child_process";
+import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+import { AGENT_TYPES, type AgentType } from "../adapters/registry";
+import { loadAuthTokenFile } from "../lib/auth-token-file";
+import {
+	captureStoredCredentialIdentity,
+	clearPendingClerkOAuthLogin,
+	commitClawdiCredential,
+	createClerkOAuthAuthorization,
+	createCredentialEndpointBinding,
+	exchangeClerkOAuthCode,
+	fetchClerkOAuthClientConfig,
+	fetchClerkOAuthDiscovery,
+	isClerkOAuthAuth,
+	logoutClawdiCredentials,
+	persistPendingClerkOAuthLogin,
+	type StoredCredentialIdentity,
+	verifyAndPersistClerkOAuthLogin,
+} from "../lib/clerk-oauth";
+import { getAuth, getClawdiDir, getConfig, getPendingAuth, isLoggedIn } from "../lib/config";
+import { adapterForType, getEnvIdByAgent, listRegisteredAgentTypes } from "../lib/select-adapter";
+import { getCliVersion } from "../lib/version";
+import { evaluateHostPolicyForCommand } from "../runtime/host-policy";
+import { runRuntimeObservationProducer } from "../runtime/observation-producer";
+import { detectRuntimeMode } from "../runtime/paths";
+import {
+	createRestartCoordination,
+	type RestartCoordination,
+	startAutoRestart,
+} from "../serve/auto-restart";
+import {
+	type ControlRpcClientConfig,
+	type ControlRpcHandlers,
+	type ControlRpcListenConfig,
+	type ControlRpcServer,
+	callControlRpc,
+	DEFAULT_CONTROL_RPC_HOST,
+	DEFAULT_CONTROL_RPC_PORT,
+	isLoopbackRpcHost,
+	rotateControlToken,
+	startControlRpcServer,
+} from "../serve/control-rpc";
+import {
+	unitFileName as daemonUnitFileName,
+	install as installService,
+	isSingletonDaemonInstalled,
+	isSingletonDaemonRunning,
+	listInstalledAgents,
+	readHealth,
+	restart as restartService,
+	statusLines as serviceStatusLines,
+	stop as stopService,
+	uninstall as uninstallService,
+} from "../serve/installer";
+import { log, toErrorMessage } from "../serve/log";
+import {
+	type CommandResult,
+	operationManager,
+	runCliCommandImmediate,
+} from "../serve/operation-runner";
+import { getDaemonControlTokenPath, getServeLogPath, getServeStateDir } from "../serve/paths";
+import { runSyncEngine } from "../serve/sync-engine";
+import { clearAccountMismatchedVaultFiles } from "../serve/vault-sync";
+import { powershellLiteral, windowsTaskLogPath } from "../serve/windows-task";
+import { daemonAutoUpdateOnce, startDaemonAutoUpdate } from "./update";
+
+type ServeOpts = Record<string, unknown>;
+
+interface RpcListenOpts {
+	host?: unknown;
+	port?: unknown;
+	allowRemote?: unknown;
+}
+
+interface LegacyRunOpts {
+	agent?: unknown;
+	environmentId?: unknown;
+}
+
+interface AuthTokenFileOpts {
+	authTokenFile?: unknown;
+}
+
+interface ResolvedRpcListenConfig extends ControlRpcListenConfig {
+	host: string;
+	port: number;
+	allowRemote?: boolean;
+}
+
+let activeControlRpcHttp: { host: string; port: number; allow_remote: boolean } | null = null;
+
+const CONTROL_ACTION_DELAY_MS = 100;
+
+interface DaemonRunTarget {
+	agentType: AgentType;
+	adapter: NonNullable<ReturnType<typeof adapterForType>>;
+	environmentId: string;
+}
+
+interface DaemonStatusReport {
+	agent: AgentType;
+	state_dir: string;
+	health: ReturnType<typeof readHealth> & { fresh: boolean };
+	supervisor: string[];
+}
+
+interface DaemonDoctorReport {
+	entrypoint: string | null;
+	node: string;
+	cli_version: string;
+	registered_agents: number;
+	singleton_unit_installed: boolean;
+	singleton_unit_running: boolean;
+	legacy_daemon_units: AgentType[];
+	control_rpc: {
+		token_path: string;
+		http: { host: string; port: number; allow_remote: boolean };
+	};
+	api_url: string | null;
+	agents: Array<
+		DaemonStatusReport & {
+			daemon_version: string | null;
+			daemon_executable: string | null;
+			version_drift: boolean;
+			heartbeat: {
+				age_seconds: number | null;
+				status: "live" | "stale" | "never_ran";
+			};
+		}
+	>;
+}
+
+interface RpcCommandOptions {
+	name: string;
+	args: string[];
+	cwd?: string;
+	stdin?: string;
+	wait: boolean;
+	parseJson?: boolean;
+	redactedArgs?: string[];
+	timeoutMs?: number;
+	exclusiveKey?: string;
+}
+
+interface RpcCommandResponse extends CommandResult {
+	json?: unknown;
+}
+
+/**
+ * Reject legacy selector options that a singleton-daemon subcommand
+ * does not support. Pre-fix `iforge daemon doctor --agent codex`
+ * and `iforge daemon status --environment-id <id>` silently accepted
+ * those flags but ignored them, leaving users with no signal that
+ * their command had no effect.
+ */
+export function rejectUnsupportedOpts(
+	cmdName: string,
+	opts: Record<string, unknown>,
+	allowed: ReadonlySet<string>,
+): void {
+	const offenders: string[] = [];
+	for (const key of Object.keys(opts)) {
+		if (!allowed.has(key)) offenders.push(key);
+	}
+	if (offenders.length > 0) {
+		const flags = offenders.map(camelToFlag).join(", ");
+		console.error(
+			`\`daemon ${cmdName}\` does not accept ${flags}. ` +
+				`See \`iforge daemon ${cmdName} --help\`.`,
+		);
+		process.exit(1);
+	}
+}
+
+function camelToFlag(name: string): string {
+	return `--${name.replace(/[A-Z]/g, (c) => `-${c.toLowerCase()}`)}`;
+}
+
+export async function serve(_opts: ServeOpts): Promise<void> {
+	const opts = _opts as RpcListenOpts & LegacyRunOpts & AuthTokenFileOpts;
+	const mode = (process.env.CLAWDI_SERVE_MODE ?? "host").toLowerCase();
+	const isContainer = mode === "container";
+	loadAuthTokenFile(optionalStringParam(opts.authTokenFile, "--auth-token-file"));
+	const legacyRun = resolveLegacyRunOpts(opts);
+
+	if (legacyRun && !isContainer) {
+		await migrateLegacyDaemonRun(legacyRun);
+		return;
+	}
+
+	const rpcListen = resolveRpcListenConfig(opts);
+
+	if (!isLoggedIn()) {
+		log.error("serve.no_auth", {
+			hint: "Set IFORGE_AUTH_TOKEN env or run `iforge auth login`.",
+		});
+		process.exit(1);
+	}
+
+	const hostedRuntime = detectRuntimeMode() === "hosted";
+	if (!hostedRuntime) {
+		for (const agentType of AGENT_TYPES) {
+			try {
+				clearAccountMismatchedVaultFiles(agentType);
+			} catch {
+				log.warn("serve.vault_cleanup_failed", {
+					agent: agentType,
+					message: "Owned Vault files need local repair.",
+				});
+			}
+		}
+	}
+	const targets = legacyRun
+		? [pickLegacyDaemonRunTarget(legacyRun)]
+		: pickDaemonRunTargets({ allowEmpty: hostedRuntime });
+
+	log.info("serve.boot", {
+		mode,
+		agents: targets.map((target) => target.agentType),
+		state_dirs: Object.fromEntries(
+			targets.map((target) => [target.agentType, getServeStateDir(target.agentType)]),
+		),
+		pid: process.pid,
+	});
+
+	const abort = new AbortController();
+	const restartCoordination = createRestartCoordination(abort);
+	const triggerShutdown = (signal: string) => {
+		log.info("serve.signal", { signal });
+		abort.abort();
+	};
+
+	// In container mode SIGTERM is graceful (kubelet sends it
+	// during pod termination). On host, both SIGINT (ctrl-c) and
+	// SIGTERM (systemctl stop) flow through the same shutdown.
+	process.once("SIGINT", () => triggerShutdown("SIGINT"));
+	process.once("SIGTERM", () => triggerShutdown("SIGTERM"));
+
+	// Crash-loop detection courtesy: if the daemon exits within 5s
+	// of boot, supervisors (systemd, k8s) flag it loudly. We don't
+	// add a delay here — the engine itself tolerates SSE failures
+	// and the heartbeat posts during outages — but a hard crash
+	// means setup is wrong, and the supervisor's restart-with-
+	// backoff is the right answer.
+
+	// Watch our own bundled JS for updates; if `npm i -g clawdi`
+	// or `bun run build:dev` rewrites the file, abort cleanly so
+	// launchd / systemd respawns the daemon with the new code.
+	// Skip in container mode — k8s rolls pods on its own schedule
+	// and self-restart inside a pod fights the orchestrator.
+	if (!isContainer) {
+		const watching = await startAutoRestart({ abort, restart: restartCoordination });
+		if (watching) {
+			log.info("serve.auto_restart_armed", { entry: watching });
+		}
+		if (startDaemonAutoUpdate({ abort, restart: restartCoordination })) {
+			log.info("serve.auto_update_armed", {});
+		}
+	}
+
+	const rpc = await startDaemonControlRpc(
+		createControlRpcHandlers({ abortController: abort, restartCoordination }),
+		abort.signal,
+		rpcListen,
+	);
+	if (rpc) {
+		activeControlRpcHttp = { ...rpc.http, allow_remote: rpcListen.allowRemote === true };
+		log.info("serve.rpc_listening", {
+			token_path: rpc.tokenPath,
+			http: rpc.http,
+		});
+	} else {
+		activeControlRpcHttp = null;
+		log.info("serve.rpc_disabled", { runtime_mode: "hosted" });
+	}
+
+	try {
+		await runDaemonWorkers({
+			targets,
+			abortController: abort,
+			forcePollWatcher: isContainer,
+		});
+	} catch (e) {
+		log.error("serve.fatal", { error: toErrorMessage(e) });
+		process.exitCode = 1;
+	} finally {
+		abort.abort();
+		const cleanupTasks: Promise<unknown>[] = [operationManager.shutdownAll()];
+		if (rpc) cleanupTasks.push(rpc.close());
+		const cleanup = await Promise.allSettled(cleanupTasks);
+		activeControlRpcHttp = null;
+		for (const result of cleanup) {
+			if (result.status === "fulfilled") continue;
+			log.error("serve.shutdown_failed", { error: toErrorMessage(result.reason) });
+			process.exitCode = 1;
+		}
+	}
+
+	// Preserve any supervisor control outcome the engine set (for example,
+	// auth/disconnect no-restart → 2). A naked `process.exit(0)` would mask it
+	// and defeat the supervisor contract; status 2 does not imply a crash.
+	const code = process.exitCode ?? 0;
+	log.info("serve.exit", { code });
+	process.exit(code);
+}
+
+export async function startDaemonControlRpc(
+	handlers: ControlRpcHandlers,
+	abort: AbortSignal,
+	config: ControlRpcListenConfig,
+): Promise<ControlRpcServer | null> {
+	if (detectRuntimeMode() === "hosted") return null;
+	return startControlRpcServer(handlers, abort, config);
+}
+
+type ServeInstallOpts = Record<string, unknown>;
+
+export async function serveInstall(opts: ServeInstallOpts): Promise<void> {
+	rejectUnsupportedOpts("install", opts as Record<string, unknown>, INSTALL_ALLOWED);
+	const rpcListen = resolveRpcListenConfig(opts as RpcListenOpts);
+	if (!isLoggedIn()) {
+		console.error("Not logged in. Run `iforge auth login` first — the daemon needs an api key.");
+		process.exit(1);
+	}
+	const registered = listRegisteredAgentTypes();
+	if (registered.length === 0) {
+		console.error("No agents registered. Run `iforge setup` first.");
+		process.exit(1);
+	}
+	for (const agentType of registered) {
+		if (getEnvIdByAgent(agentType) === null) {
+			console.error(
+				`No environment configured for ${agentType} ` +
+					`(missing ~/.iforge/environments/${agentType}.json). ` +
+					`Run \`iforge setup --agent ${agentType}\` first.`,
+			);
+			process.exit(1);
+		}
+	}
+	try {
+		const result = installService({
+			rpcHost: rpcListen.host,
+			rpcPort: rpcListen.port,
+			rpcAllowRemote: rpcListen.allowRemote === true ? true : undefined,
+		});
+		const verb = result.replaced ? "Replaced existing" : "Installed";
+		console.log(`✓ ${verb} singleton daemon unit: ${result.unit}`);
+		console.log(result.instructions);
+	} catch (e) {
+		console.error(`Install failed: ${toErrorMessage(e)}`);
+		process.exit(1);
+	}
+	const failed = cleanupLegacyDaemonUnits();
+	if (failed > 0) process.exit(1);
+}
+
+const INSTALL_ALLOWED = new Set(["host", "port", "allowRemote"]);
+const UNINSTALL_ALLOWED = new Set<string>();
+const STOP_ALLOWED = new Set<string>();
+const STATUS_ALLOWED = new Set(["agent"]);
+const DOCTOR_ALLOWED = new Set(["json"]);
+const RPC_ALLOWED = new Set(["host", "port", "token"]);
+
+export async function serveUninstall(opts: ServeInstallOpts): Promise<void> {
+	rejectUnsupportedOpts("uninstall", opts as Record<string, unknown>, UNINSTALL_ALLOWED);
+	let removed = 0;
+	let failed = 0;
+	try {
+		const result = uninstallService();
+		if (result.removed) {
+			console.log("✓ Removed singleton daemon unit.");
+			removed += 1;
+		} else {
+			console.log("(no singleton daemon unit installed)");
+		}
+	} catch (e) {
+		console.error(`✗ daemon: ${toErrorMessage(e)}`);
+		failed += 1;
+	}
+	failed += cleanupLegacyDaemonUnits();
+	if (removed === 0 && failed === 0) console.log("No daemon units installed.");
+	if (failed > 0) process.exit(1);
+}
+
+export async function serveStop(opts: ServeInstallOpts): Promise<void> {
+	rejectUnsupportedOpts("stop", opts as Record<string, unknown>, STOP_ALLOWED);
+	try {
+		stopService();
+		console.log("✓ Stopped singleton daemon; service unit remains installed.");
+	} catch (e) {
+		console.error(`Stop failed: ${toErrorMessage(e)}`);
+		process.exit(1);
+	}
+}
+
+const RESTART_ALLOWED = new Set<string>();
+
+export async function serveRestart(opts: ServeInstallOpts): Promise<void> {
+	rejectUnsupportedOpts("restart", opts as Record<string, unknown>, RESTART_ALLOWED);
+	try {
+		restartService();
+		console.log("✓ Restarted singleton daemon.");
+	} catch (e) {
+		console.error(`Restart failed: ${toErrorMessage(e)}`);
+		process.exit(1);
+	}
+}
+
+interface ServeStatusOpts {
+	agent?: string;
+}
+
+export async function serveStatus(opts: ServeStatusOpts): Promise<void> {
+	rejectUnsupportedOpts("status", opts as Record<string, unknown>, STATUS_ALLOWED);
+	const targets: AgentType[] = opts.agent
+		? [pickAgent(opts.agent).agentType]
+		: listRegisteredAgentTypes();
+	if (targets.length === 0) {
+		console.log("No agents registered yet — run `iforge setup` first.");
+		return;
+	}
+	for (const [i, report] of targets.map(buildStatusReport).entries()) {
+		if (i > 0) console.log("");
+		printAgentStatus(report);
+	}
+}
+
+function buildStatusReport(agentType: AgentType): DaemonStatusReport {
+	const stateDir = getServeStateDir(agentType);
+	const health = readHealth(stateDir);
+	const fresh = health.exists && health.ageSeconds !== null && health.ageSeconds < 90;
+	return {
+		agent: agentType,
+		state_dir: stateDir,
+		health: { ...health, fresh },
+		supervisor: serviceStatusLines(),
+	};
+}
+
+function printAgentStatus(report: DaemonStatusReport): void {
+	const health = report.health;
+	console.log(`agent:   ${report.agent}`);
+	console.log(`state:   ${report.state_dir}`);
+	if (health.exists) {
+		// The local health file has its own 90s freshness window. Cloud
+		// runtime evidence uses a wider two-heartbeat window because it
+		// also includes network delivery jitter.
+		console.log(
+			`health:  ${health.fresh ? "✓ live" : "stale"} (last write ${health.ageSeconds}s ago)`,
+		);
+	} else {
+		console.log("health:  (no health file — daemon never ran or wrote elsewhere)");
+	}
+	if (health.version) {
+		// Surface daemon-vs-CLI version drift. After a `bun install
+		// -g clawdi@latest` the dist/index.js gets replaced;
+		// auto-restart picks it up within seconds, but until it
+		// fires the user can't tell which version is actually
+		// running. Spelling the gap out beats a silent stale state.
+		const cliVersion = getCliVersion();
+		if (health.version !== cliVersion) {
+			console.log(
+				`version: daemon=${health.version}, CLI=${cliVersion} ` +
+					"⚠ drift — run `iforge daemon restart` to pick up the latest",
+			);
+		} else {
+			console.log(`version: ${health.version}`);
+		}
+	}
+	for (const line of report.supervisor) {
+		console.log(line);
+	}
+}
+
+interface ServeLogsOpts {
+	follow?: boolean;
+}
+
+const LOGS_ALLOWED = new Set(["follow"]);
+
+export async function serveLogs(opts: ServeLogsOpts): Promise<void> {
+	rejectUnsupportedOpts("logs", opts as Record<string, unknown>, LOGS_ALLOWED);
+	const { spawn } = await import("node:child_process");
+	// Per-platform log access. macOS launchd writes to the plist's
+	// StandardErrorPath; Linux systemd writes to journald.
+	const platform = process.platform;
+	let cmd: string;
+	let args: string[];
+	if (platform === "linux") {
+		const unit = daemonUnitFileName();
+		cmd = "journalctl";
+		args = opts.follow
+			? ["--user", "-u", unit, "-n", "200", "-f"]
+			: ["--user", "-u", unit, "-n", "200"];
+	} else if (platform === "darwin") {
+		const path = getServeLogPath("daemon", "stderr");
+		if (!existsSync(path)) {
+			console.error(
+				`No log file at ${path} (daemon hasn't started yet — run \`iforge daemon install\`).`,
+			);
+			process.exit(1);
+		}
+		cmd = "tail";
+		args = opts.follow ? ["-n", "200", "-F", path] : ["-n", "200", path];
+	} else if (platform === "win32") {
+		const path = windowsTaskLogPath(getClawdiDir());
+		if (!existsSync(path)) {
+			console.error("No daemon log file yet. Enable Sync first.");
+			process.exit(1);
+		}
+		cmd = "powershell.exe";
+		args = [
+			"-NoProfile",
+			"-NonInteractive",
+			"-EncodedCommand",
+			Buffer.from(
+				`Get-Content -LiteralPath ${powershellLiteral(path)} -Tail 200${opts.follow ? " -Wait" : ""}`,
+				"utf16le",
+			).toString("base64"),
+		];
+	} else {
+		console.error(`unsupported platform for daemon logs: ${platform}`);
+		process.exit(1);
+	}
+	const proc = spawn(cmd, args, { stdio: "inherit", windowsHide: true });
+	proc.on("error", () => {
+		console.error("Could not open daemon logs.");
+		process.exitCode = 1;
+	});
+	proc.on("exit", (code) => process.exit(code ?? 0));
+}
+
+interface ServeDoctorOpts {
+	json?: boolean;
+}
+
+export async function serveDoctor(opts: ServeDoctorOpts): Promise<void> {
+	rejectUnsupportedOpts("doctor", opts as Record<string, unknown>, DOCTOR_ALLOWED);
+	// `iforge daemon doctor` — single-call snapshot of every
+	// daemon's runtime state, designed for support handoff and
+	// for the dashboard's "What's wrong with my sync?" panel
+	// (round-5 must-have #3). Shows per-agent: registration,
+	// state-dir path, last-heartbeat age, OS supervisor unit
+	// state, daemon entrypoint binary. JSON mode is for
+	// programmatic callers.
+	const summary = buildDoctorReport();
+	if (opts.json) {
+		console.log(JSON.stringify(summary, null, 2));
+		return;
+	}
+	console.log(`entrypoint:  ${summary.entrypoint ?? "?"}`);
+	console.log(`node:        ${summary.node}`);
+	console.log(`cli version: ${summary.cli_version}`);
+	console.log(`agents:      ${summary.registered_agents}`);
+	console.log(`unit:        ${summary.singleton_unit_installed ? "installed" : "not installed"}`);
+	if (summary.legacy_daemon_units.length > 0) {
+		console.log(`legacy:      ${summary.legacy_daemon_units.join(", ")}`);
+	}
+	console.log(`rpc http:    ${summary.control_rpc.http.host}:${summary.control_rpc.http.port}`);
+	console.log("");
+	if (summary.registered_agents === 0) {
+		console.log("No agents registered yet — run `iforge setup` first.");
+		return;
+	}
+	let anyDrift = false;
+	for (const r of summary.agents) {
+		console.log(`── ${r.agent} ──`);
+		console.log(`state dir: ${r.state_dir}`);
+		const hb = r.heartbeat;
+		if (hb.status === "live") {
+			console.log(`heartbeat: ✓ live (${hb.age_seconds}s ago)`);
+		} else if (hb.status === "stale") {
+			console.log(`heartbeat: ✗ stale (${hb.age_seconds}s ago)`);
+		} else {
+			console.log("heartbeat: — never ran");
+		}
+		if (r.daemon_version) {
+			if (r.version_drift) {
+				console.log(`version:   ⚠ daemon=${r.daemon_version}, CLI=${summary.cli_version}`);
+				anyDrift = true;
+			} else {
+				console.log(`version:   ${r.daemon_version}`);
+			}
+		}
+		for (const line of r.supervisor) {
+			console.log(line);
+		}
+		console.log("");
+	}
+	if (anyDrift) {
+		console.log(
+			"⚠ One or more daemons are running an older CLI version. " +
+				"Run `iforge daemon restart` to pick up the latest.",
+		);
+	}
+}
+
+function buildDoctorReport(): DaemonDoctorReport {
+	const cliVersion = getCliVersion();
+	const registered = listRegisteredAgentTypes();
+	const agents = registered.map((agent) => {
+		const report = buildStatusReport(agent);
+		const status: "live" | "stale" | "never_ran" = report.health.fresh
+			? "live"
+			: report.health.exists
+				? "stale"
+				: "never_ran";
+		return {
+			...report,
+			daemon_version: report.health.version,
+			daemon_executable: report.health.executablePath ?? null,
+			version_drift: report.health.version !== null && report.health.version !== cliVersion,
+			heartbeat: report.health.exists
+				? { age_seconds: report.health.ageSeconds, status }
+				: { age_seconds: null, status },
+		};
+	});
+	return {
+		entrypoint: process.argv[1] ?? null,
+		node: process.execPath,
+		cli_version: cliVersion,
+		registered_agents: registered.length,
+		singleton_unit_installed: isSingletonDaemonInstalled(),
+		singleton_unit_running: isSingletonDaemonRunning(),
+		legacy_daemon_units: listInstalledAgents(),
+		control_rpc: {
+			token_path: getDaemonControlTokenPath(),
+			http: activeControlRpcHttp ?? normalizeRpcHttpConfig(resolveRpcListenConfig({})),
+		},
+		api_url: process.env.CLAWDI_API_URL ?? null,
+		agents,
+	};
+}
+
+interface ServeRpcOpts {
+	host?: unknown;
+	port?: unknown;
+	token?: unknown;
+}
+
+export async function serveRpc(method: string, opts: ServeRpcOpts): Promise<void> {
+	const normalizedMethod = normalizeRpcMethod(method);
+	rejectUnsupportedOpts(
+		rpcMethodCommandName(normalizedMethod),
+		opts as Record<string, unknown>,
+		RPC_ALLOWED,
+	);
+	const rpcTarget = resolveRpcClientConfig(opts);
+	const result = await callControlRpc(normalizedMethod, {}, rpcTarget);
+	console.log(JSON.stringify(result, null, 2));
+}
+
+function normalizeRpcMethod(method: string): string {
+	const trimmed = method.trim();
+	if (!trimmed) throw new Error("RPC method is required");
+	return trimmed;
+}
+
+function rpcMethodCommandName(method: string): string {
+	if (method === "rotate_token") return "rotate-token";
+	return method;
+}
+
+interface ControlRpcHandlerOptions {
+	abortController?: AbortController;
+	restartCoordination?: RestartCoordination;
+}
+
+export function createControlRpcHandlers(opts: ControlRpcHandlerOptions = {}): ControlRpcHandlers {
+	const handlers: ControlRpcHandlers = {};
+	handlers.ping = () => ({
+		pid: process.pid,
+		version: getCliVersion(),
+		uptime_seconds: Math.round(process.uptime()),
+	});
+	handlers.methods = () => ({
+		methods: Object.keys(handlers).sort(),
+	});
+	handlers.status = (params) => {
+		const record = rpcParamsRecord(params);
+		rejectRpcParams(record, new Set(["agent"]));
+		const agent = optionalAgentParam(record.agent);
+		const targets = agent ? [agent] : listRegisteredAgentTypes();
+		return {
+			singleton_unit_installed: isSingletonDaemonInstalled(),
+			legacy_daemon_units: listInstalledAgents(),
+			agents: targets.map(buildStatusReport),
+		};
+	};
+	handlers.doctor = () => buildDoctorReport();
+	handlers.install = (params) => daemonInstallRpc(params);
+	handlers.uninstall = (params) => daemonUninstallRpc(params);
+	handlers.restart = (params) => daemonRestartRpc(params);
+	handlers.logs = (params) => daemonLogsRpc(params);
+	handlers.rotate_token = (params) => daemonRotateTokenRpc(params);
+	handlers["operation.list"] = (params) => operationListRpc(params);
+	handlers["operation.status"] = (params) => operationStatusRpc(params);
+	handlers["operation.logs"] = (params) => operationLogsRpc(params);
+	handlers["operation.cancel"] = (params) => operationCancelRpc(params);
+	handlers["sync.push"] = (params) => syncPushRpc(params);
+	handlers["sync.pull"] = (params) => syncPullRpc(params);
+	handlers["sync.push_dry_run"] = (params) => syncPushDryRunRpc(params);
+	handlers["sync.pull_dry_run"] = (params) => syncPullDryRunRpc(params);
+	handlers["auth.status"] = (params) => authStatusRpc(params);
+	handlers["auth.login"] = (params) => authLoginRpc(params);
+	handlers["auth.complete"] = (params) => authCompleteRpc(params);
+	handlers["auth.logout"] = (params) => authLogoutRpc(params);
+	if (evaluateHostPolicyForCommand("update").allowed) {
+		handlers["update.check"] = (params) => updateCheckRpc(params);
+		handlers["update.install"] = (params) =>
+			updateInstallRpc(params, opts.abortController, opts.restartCoordination);
+	}
+	return handlers;
+}
+
+function operationListRpc(params: unknown): unknown {
+	const record = rpcParamsRecord(params);
+	rejectRpcParams(record, new Set(["limit"]));
+	const limit = optionalLimitParam(record.limit, "limit", 1, 1000, 50);
+	return { operations: operationManager.list(limit) };
+}
+
+function operationStatusRpc(params: unknown): unknown {
+	const record = rpcParamsRecord(params);
+	rejectRpcParams(record, new Set(["id"]));
+	const operation = operationManager.get(requiredStringParam(record, "id"));
+	if (!operation) throw new Error("Unknown operation id");
+	return operation;
+}
+
+function operationLogsRpc(params: unknown): unknown {
+	const record = rpcParamsRecord(params);
+	rejectRpcParams(record, new Set(["id", "limit"]));
+	const logs = operationManager.logs(
+		requiredStringParam(record, "id"),
+		optionalLimitParam(record.limit, "limit", 1, 1000, 200),
+	);
+	if (!logs) throw new Error("Unknown operation id");
+	return logs;
+}
+
+function operationCancelRpc(params: unknown): unknown {
+	const record = rpcParamsRecord(params);
+	rejectRpcParams(record, new Set(["id"]));
+	const operation = operationManager.cancel(requiredStringParam(record, "id"));
+	if (!operation) throw new Error("Unknown operation id");
+	return operation;
+}
+
+function syncPushRpc(params: unknown): Promise<unknown> {
+	return syncCommandRpc("push", params, { forceDryRun: false, defaultWait: false });
+}
+
+function syncPullRpc(params: unknown): Promise<unknown> {
+	return syncCommandRpc("pull", params, { forceDryRun: false, defaultWait: false });
+}
+
+function syncPushDryRunRpc(params: unknown): Promise<unknown> {
+	return syncCommandRpc("push", params, { forceDryRun: true, defaultWait: true });
+}
+
+function syncPullDryRunRpc(params: unknown): Promise<unknown> {
+	return syncCommandRpc("pull", params, { forceDryRun: true, defaultWait: true });
+}
+
+async function syncCommandRpc(
+	command: "push" | "pull",
+	params: unknown,
+	opts: { forceDryRun: boolean; defaultWait: boolean },
+): Promise<unknown> {
+	const record = rpcParamsRecord(params);
+	const allowedParams = new Set([
+		"modules",
+		"project",
+		"all",
+		"all_agents",
+		"agent",
+		"dry_run",
+		"cwd",
+		"wait",
+	]);
+	if (command === "push") allowedParams.add("exclude_project");
+	rejectRpcParams(record, allowedParams);
+	const args: string[] = [command];
+	const modules = optionalStringParam(record.modules, "modules");
+	const project = optionalStringParam(record.project, "project");
+	const agent = optionalStringParam(record.agent, "agent");
+	const cwd = optionalStringParam(record.cwd, "cwd");
+	const all = optionalBooleanParam(record.all, "all") ?? false;
+	const allAgents = optionalBooleanParam(record.all_agents, "all_agents") ?? false;
+	const dryRun = opts.forceDryRun || (optionalBooleanParam(record.dry_run, "dry_run") ?? false);
+	if (modules) args.push("--modules", modules);
+	if (project) args.push("--project", project);
+	if (agent) args.push("--agent", agent);
+	if (all) args.push("--all");
+	if (allAgents) args.push("--all-agents");
+	if (dryRun) args.push("--dry-run");
+	if (command === "push") {
+		for (const excluded of optionalStringListParam(record.exclude_project, "exclude_project") ??
+			[]) {
+			args.push("--exclude-project", excluded);
+		}
+		if (!all && !project && !cwd) {
+			throw new Error("sync.push RPC requires cwd or project unless all=true.");
+		}
+	}
+	return runCommandRpc({
+		name: `sync.${command}`,
+		args,
+		cwd,
+		wait: optionalBooleanParam(record.wait, "wait") ?? opts.defaultWait,
+		exclusiveKey: dryRun ? undefined : "sync",
+	});
+}
+
+function authStatusRpc(params: unknown): unknown {
+	const record = rpcParamsRecord(params);
+	rejectRpcParams(record, new Set());
+	const auth = getAuth();
+	const pending = getPendingAuth();
+	return {
+		logged_in: auth !== null,
+		user: auth ? { email: auth.email, id: auth.userId } : null,
+		credential_type: isClerkOAuthAuth(auth) ? "clerk-oauth" : auth ? "legacy-api-key" : null,
+		api_url: getConfig().apiUrl,
+		pending_auth: pending
+			? {
+					authorization_url: pending.authorizationUrl,
+					redirect_uri: pending.redirectUri,
+					expires_at: pending.expiresAt,
+					api_url: pending.apiUrl,
+				}
+			: null,
+	};
+}
+
+async function authLoginRpc(params: unknown): Promise<unknown> {
+	const record = rpcParamsRecord(params);
+	rejectRpcParams(record, new Set(["api_key", "api_url", "replace", "confirm_secret_access"]));
+	const existing = getAuth();
+	const expectedCredential = captureStoredCredentialIdentity();
+	const replace = optionalBooleanParam(record.replace, "replace") ?? false;
+	if (existing && !replace) {
+		return { status: "already_logged_in", user: { email: existing.email, id: existing.userId } };
+	}
+	if (existing && replace) {
+		requireBooleanConfirmation(record, "confirm_secret_access", "auth.login replace existing auth");
+	}
+	const endpointConfig = getConfig();
+	const apiUrl = optionalStringParam(record.api_url, "api_url") ?? endpointConfig.apiUrl;
+	const apiKey = optionalStringParam(record.api_key, "api_key");
+	if (existing && replace && !apiKey) {
+		throw new Error("auth.login replace requires api_key, or call auth.logout before OAuth login.");
+	}
+	if (apiKey) {
+		requireBooleanConfirmation(record, "confirm_secret_access", "auth.login API key import");
+		const me = await verifyAndSaveRpcAuth(apiUrl, apiKey, expectedCredential);
+		return { status: "logged_in", user: me, api_url: apiUrl };
+	}
+	return startOAuthAuthRpc(apiUrl, endpointConfig.deployApiUrl, expectedCredential);
+}
+
+async function authCompleteRpc(params: unknown): Promise<unknown> {
+	const record = rpcParamsRecord(params);
+	rejectRpcParams(record, new Set(["callback_url", "confirm_secret_access"]));
+	if (getAuth()) return { status: "already_logged_in" };
+	const pending = getPendingAuth();
+	if (!pending) return { status: "no_pending_auth" };
+	if (Date.parse(pending.expiresAt) <= Date.now()) {
+		await clearPendingClerkOAuthLogin(pending);
+		return { status: "expired" };
+	}
+	requireBooleanConfirmation(
+		record,
+		"confirm_secret_access",
+		"auth.complete OAuth callback import",
+	);
+	const callbackUrl = requiredStringParam(record, "callback_url");
+	const auth = await exchangeClerkOAuthCode(pending, callbackUrl);
+	const verification = await verifyAndPersistClerkOAuthLogin(pending.apiUrl, auth, {
+		expectedCredential: { kind: "none" },
+		pending,
+	});
+	if (verification.kind === "cloud_unverified") {
+		return {
+			status: "cloud_unverified",
+			cloud_verified: false,
+			reason: verification.reason,
+			...(verification.httpStatus ? { http_status: verification.httpStatus } : {}),
+		};
+	}
+	return { status: "logged_in", cloud_verified: true, user: verification.user };
+}
+
+async function authLogoutRpc(params: unknown): Promise<unknown> {
+	const record = rpcParamsRecord(params);
+	rejectRpcParams(record, new Set(["confirm"]));
+	requireBooleanConfirmation(record, "confirm", "auth.logout");
+	const result = await logoutClawdiCredentials(getConfig().apiUrl);
+	return {
+		logged_out: result.loggedOut,
+		remote_revoked: result.remoteRevoked,
+		environment_credential: result.environmentCredential,
+	};
+}
+
+function updateCheckRpc(params: unknown): Promise<unknown> {
+	const record = rpcParamsRecord(params);
+	rejectRpcParams(record, new Set(["cwd"]));
+	return runCommandRpc({
+		name: "update.check",
+		args: ["update", "--json"],
+		cwd: optionalStringParam(record.cwd, "cwd"),
+		wait: true,
+		parseJson: true,
+	});
+}
+
+async function updateInstallRpc(
+	params: unknown,
+	abortController: AbortController | undefined,
+	restartCoordination: RestartCoordination | undefined,
+): Promise<unknown> {
+	const record = rpcParamsRecord(params);
+	rejectRpcParams(record, new Set(["confirm"]));
+	requireBooleanConfirmation(record, "confirm", "update.install");
+	const result = await daemonAutoUpdateOnce({
+		currentVersion: getCliVersion(),
+		ignoreDisabled: true,
+		restartCoordination,
+	});
+	const restartScheduled = result === "installed" && abortController !== undefined;
+	if (restartScheduled) {
+		setTimeout(() => {
+			log.info("daemon.update_install_restart_scheduled", {});
+			if (restartCoordination) restartCoordination.requestRestart();
+			else abortController.abort();
+		}, CONTROL_ACTION_DELAY_MS);
+	}
+	return {
+		result,
+		restart_scheduled: restartScheduled,
+	};
+}
+
+async function runCommandRpc(options: RpcCommandOptions): Promise<unknown> {
+	if (!options.wait) {
+		return {
+			operation: operationManager.start({
+				name: options.name,
+				args: options.args,
+				cwd: options.cwd,
+				stdin: options.stdin,
+				redactedArgs: options.redactedArgs,
+				exclusiveKey: options.exclusiveKey,
+			}),
+		};
+	}
+	const result = await runCliCommandImmediate({
+		name: options.name,
+		args: options.args,
+		cwd: options.cwd,
+		stdin: options.stdin,
+		redactedArgs: options.redactedArgs,
+		timeoutMs: options.timeoutMs,
+	});
+	const response: RpcCommandResponse = { ...result };
+	if (options.parseJson && result.stdout.trim()) {
+		response.json = JSON.parse(result.stdout);
+	}
+	return response;
+}
+
+interface AuthMeResponse {
+	id: string;
+	email?: string;
+	name?: string;
+}
+
+async function verifyAndSaveRpcAuth(
+	apiUrl: string,
+	apiKey: string,
+	expectedCredential: StoredCredentialIdentity,
+): Promise<AuthMeResponse> {
+	const endpointBinding = createCredentialEndpointBinding(apiUrl);
+	const response = await fetch(`${endpointBinding.cloudApiOrigin}/v1/auth/me`, {
+		headers: { Authorization: `Bearer ${apiKey}` },
+	});
+	if (!response.ok) {
+		throw new Error(`API key verification failed with HTTP ${response.status}`);
+	}
+	const me = await readJsonObject<AuthMeResponse>(response, isAuthMeResponse, "/v1/auth/me");
+	await commitClawdiCredential(
+		{ apiKey, userId: me.id, email: me.email, endpointBinding },
+		expectedCredential,
+	);
+	return me;
+}
+
+async function startOAuthAuthRpc(
+	apiUrl: string,
+	hostedApiUrl: string,
+	expectedCredential: StoredCredentialIdentity,
+): Promise<unknown> {
+	const endpointBinding = createCredentialEndpointBinding(apiUrl, hostedApiUrl);
+	if (!endpointBinding.hostedApiOrigin) {
+		throw new Error("Hosted endpoint binding is required for OAuth login.");
+	}
+	const config = await fetchClerkOAuthClientConfig(endpointBinding.cloudApiOrigin);
+	const discovery = await fetchClerkOAuthDiscovery(config);
+	const pending = createClerkOAuthAuthorization({
+		config,
+		discovery,
+		apiUrl: endpointBinding.cloudApiOrigin,
+		hostedApiUrl: endpointBinding.hostedApiOrigin,
+	});
+	await persistPendingClerkOAuthLogin(pending, expectedCredential);
+	return {
+		status: "pending",
+		authorization_url: pending.authorizationUrl,
+		redirect_uri: pending.redirectUri,
+		expires_at: pending.expiresAt,
+		api_url: pending.apiUrl,
+	};
+}
+
+async function readJsonObject<T>(
+	response: Response,
+	guard: (value: unknown) => value is T,
+	label: string,
+): Promise<T> {
+	const value: unknown = await response.json();
+	if (!guard(value)) throw new Error(`Unexpected response body from ${label}`);
+	return value;
+}
+
+function isAuthMeResponse(value: unknown): value is AuthMeResponse {
+	if (!isRecord(value)) return false;
+	return typeof value.id === "string";
+}
+
+function daemonInstallRpc(params: unknown): unknown {
+	const record = rpcParamsRecord(params);
+	rejectRpcParams(record, new Set(["host", "port", "allow_remote"]));
+	const hasExplicitRpcConfig =
+		record.host !== undefined || record.port !== undefined || record.allow_remote !== undefined;
+	const rpcListen = hasExplicitRpcConfig
+		? resolveRpcListenConfig({
+				host: record.host,
+				port: record.port,
+				allowRemote: record.allow_remote,
+			})
+		: resolveRpcListenConfig({
+				host: activeControlRpcHttp?.host,
+				port: activeControlRpcHttp?.port,
+				allowRemote: activeControlRpcHttp?.allow_remote,
+			});
+	return scheduleDaemonControlAction(
+		"install",
+		() => {
+			installService({
+				rpcHost: rpcListen.host,
+				rpcPort: rpcListen.port,
+				rpcAllowRemote: rpcListen.allowRemote === true ? true : undefined,
+			});
+		},
+		{
+			rpc_http: normalizeRpcHttpConfig(rpcListen),
+		},
+	);
+}
+
+function daemonUninstallRpc(params: unknown): unknown {
+	const record = rpcParamsRecord(params);
+	rejectRpcParams(record, new Set());
+	const targets = daemonUnitTargets();
+	if (targets.length === 0) {
+		return { accepted: false, reason: "no daemon units installed" };
+	}
+	return scheduleDaemonControlAction(
+		"uninstall",
+		() => {
+			for (const target of targets) {
+				try {
+					const opts = target === "daemon" ? undefined : { agent: target };
+					uninstallService(opts);
+				} catch (error) {
+					log.error("daemon.control_action_target_failed", {
+						action: "uninstall",
+						target,
+						error: toErrorMessage(error),
+					});
+				}
+			}
+		},
+		{ targets },
+	);
+}
+
+function daemonRestartRpc(params: unknown): unknown {
+	const record = rpcParamsRecord(params);
+	rejectRpcParams(record, new Set());
+	if (!isSingletonDaemonInstalled()) {
+		return { accepted: false, reason: "no singleton daemon unit installed" };
+	}
+	return scheduleDaemonControlAction(
+		"restart",
+		() => {
+			restartService();
+		},
+		{ target: "daemon" },
+	);
+}
+
+function daemonRotateTokenRpc(params: unknown): unknown {
+	const record = rpcParamsRecord(params);
+	rejectRpcParams(record, new Set());
+	const token = rotateControlToken();
+	return {
+		rotated: true,
+		token_path: getDaemonControlTokenPath(),
+		token,
+	};
+}
+
+function scheduleDaemonControlAction(
+	action: string,
+	run: () => void,
+	extra: Record<string, unknown> = {},
+): unknown {
+	setTimeout(() => {
+		try {
+			run();
+			log.info("daemon.control_action_completed", { action });
+		} catch (error) {
+			log.error("daemon.control_action_failed", { action, error: toErrorMessage(error) });
+		}
+	}, CONTROL_ACTION_DELAY_MS);
+	return {
+		accepted: true,
+		action,
+		delay_ms: CONTROL_ACTION_DELAY_MS,
+		...extra,
+	};
+}
+
+function daemonLogsRpc(params: unknown): unknown {
+	const record = rpcParamsRecord(params);
+	rejectRpcParams(record, new Set(["limit"]));
+	const limit = optionalLogLimitParam(record.limit);
+	const currentPlatform = process.platform;
+	if (currentPlatform === "linux") {
+		const command = [
+			"journalctl",
+			"--user",
+			"-u",
+			daemonUnitFileName(),
+			"-n",
+			String(limit),
+			"--no-pager",
+		];
+		try {
+			const output = execFileSync(command[0], command.slice(1), {
+				encoding: "utf-8",
+				maxBuffer: 1024 * 1024,
+				stdio: ["ignore", "pipe", "pipe"],
+				timeout: 5000,
+			});
+			return {
+				platform: currentPlatform,
+				source: "journalctl",
+				command,
+				lines: splitLogLines(output),
+			};
+		} catch (error) {
+			return {
+				platform: currentPlatform,
+				source: "journalctl",
+				command,
+				lines: [],
+				error: toErrorMessage(error),
+			};
+		}
+	}
+	if (currentPlatform === "darwin" || currentPlatform === "win32") {
+		const windows = currentPlatform === "win32";
+		const stderr = windows
+			? windowsTaskLogPath(getClawdiDir())
+			: getServeLogPath("daemon", "stderr");
+		const output = existsSync(stderr)
+			? readFileSync(stderr, windows ? "utf16le" : "utf8").replace(/^\uFEFF/, "")
+			: "";
+		return {
+			platform: currentPlatform,
+			source: "file",
+			stdout: windows ? stderr : getServeLogPath("daemon", "stdout"),
+			stderr,
+			lines: tailLogLines(splitLogLines(output), limit),
+		};
+	}
+	return {
+		platform: currentPlatform,
+		lines: [],
+		error: `unsupported platform for daemon logs: ${currentPlatform}`,
+	};
+}
+
+function splitLogLines(output: string): string[] {
+	return output.split(/\r?\n/).filter((line) => line.length > 0);
+}
+
+function tailLogLines(lines: string[], limit: number): string[] {
+	return lines.slice(Math.max(0, lines.length - limit));
+}
+
+function daemonUnitTargets(): Array<"daemon" | AgentType> {
+	const targets: Array<"daemon" | AgentType> = [];
+	if (isSingletonDaemonInstalled()) targets.push("daemon");
+	targets.push(...listInstalledAgents());
+	return targets;
+}
+
+function rejectRpcParams(record: Record<string, unknown>, allowed: ReadonlySet<string>): void {
+	const offenders = Object.keys(record).filter((key) => !allowed.has(key));
+	if (offenders.length > 0) {
+		throw new Error(`Unsupported RPC params: ${offenders.join(", ")}`);
+	}
+}
+
+function rpcParamsRecord(params: unknown): Record<string, unknown> {
+	if (params === undefined || params === null) return {};
+	if (typeof params !== "object" || Array.isArray(params)) {
+		throw new Error("RPC params must be a JSON object");
+	}
+	return params as Record<string, unknown>;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function requiredStringParam(record: Record<string, unknown>, key: string): string {
+	const value = optionalStringParam(record[key], key);
+	if (value === undefined) throw new Error(`${key} is required`);
+	return value;
+}
+
+function optionalStringParam(value: unknown, label: string): string | undefined {
+	if (value === undefined || value === null) return undefined;
+	if (typeof value !== "string") throw new Error(`${label} must be a string`);
+	if (!value.trim()) throw new Error(`${label} must not be empty`);
+	return value;
+}
+
+function optionalStringListParam(value: unknown, label: string): string[] | undefined {
+	if (value === undefined || value === null) return undefined;
+	if (typeof value === "string") return [optionalStringParam(value, label) ?? ""];
+	if (!Array.isArray(value)) throw new Error(`${label} must be a string or string array`);
+	const items: string[] = [];
+	for (const item of value) {
+		items.push(optionalStringParam(item, label) ?? "");
+	}
+	return items;
+}
+
+function optionalAgentParam(value: unknown): AgentType | undefined {
+	const agent = optionalStringParam(value, "agent");
+	if (agent === undefined) return undefined;
+	if (!isAgentType(agent)) {
+		throw new Error(`Unknown agent: ${agent}. Expected one of: ${AGENT_TYPES.join(", ")}`);
+	}
+	return agent;
+}
+
+function resolveRpcListenConfig(opts: RpcListenOpts): ResolvedRpcListenConfig {
+	const host =
+		optionalStringParam(opts.host, "--host") ??
+		process.env.CLAWDI_DAEMON_RPC_HOST ??
+		DEFAULT_CONTROL_RPC_HOST;
+	const portValue = opts.port ?? process.env.CLAWDI_DAEMON_RPC_PORT;
+	const port =
+		optionalPortParam(portValue, "--port", { allowZero: true }) ?? DEFAULT_CONTROL_RPC_PORT;
+	const allowRemote =
+		optionalBooleanParam(opts.allowRemote, "--allow-remote") ??
+		optionalBooleanParam(
+			process.env.CLAWDI_DAEMON_RPC_ALLOW_REMOTE,
+			"CLAWDI_DAEMON_RPC_ALLOW_REMOTE",
+		) ??
+		false;
+	if (!allowRemote && !isLoopbackRpcHost(host)) {
+		throw new Error(
+			`Refusing to listen on non-loopback HTTP RPC host ${host}. ` +
+				"Use --allow-remote only behind SSH tunneling or a TLS-terminating proxy.",
+		);
+	}
+	return { host, port, allowRemote };
+}
+
+function resolveRpcClientConfig(opts: RpcListenOpts & { token?: unknown }): ControlRpcClientConfig {
+	const host =
+		optionalStringParam(opts.host, "--host") ??
+		process.env.CLAWDI_DAEMON_RPC_HOST ??
+		DEFAULT_CONTROL_RPC_HOST;
+	const portValue = opts.port ?? process.env.CLAWDI_DAEMON_RPC_PORT;
+	const port = optionalPortParam(portValue, "--port") ?? DEFAULT_CONTROL_RPC_PORT;
+	const token = optionalStringParam(opts.token, "--token");
+	return { host, port, token };
+}
+
+function normalizeRpcHttpConfig(config: ResolvedRpcListenConfig): {
+	host: string;
+	port: number;
+	allow_remote: boolean;
+} {
+	return {
+		host: config.host,
+		port: config.port,
+		allow_remote: config.allowRemote === true,
+	};
+}
+
+function optionalBooleanParam(value: unknown, label: string): boolean | undefined {
+	if (value === undefined || value === null) return undefined;
+	if (typeof value === "boolean") return value;
+	if (typeof value === "string") {
+		const normalized = value.trim().toLowerCase();
+		if (!normalized) return undefined;
+		if (["1", "true", "yes", "on"].includes(normalized)) return true;
+		if (["0", "false", "no", "off"].includes(normalized)) return false;
+	}
+	throw new Error(`${label} must be a boolean`);
+}
+
+function optionalLogLimitParam(value: unknown): number {
+	if (value === undefined || value === null) return 200;
+	let limit: number;
+	if (typeof value === "number") {
+		limit = value;
+	} else if (typeof value === "string" && /^\d+$/.test(value.trim())) {
+		limit = Number(value);
+	} else {
+		throw new Error("limit must be an integer from 1 to 1000");
+	}
+	if (!Number.isInteger(limit) || limit < 1 || limit > 1000) {
+		throw new Error("limit must be an integer from 1 to 1000");
+	}
+	return limit;
+}
+
+function optionalLimitParam(
+	value: unknown,
+	label: string,
+	min: number,
+	max: number,
+	defaultValue: number,
+): number {
+	if (value === undefined || value === null) return defaultValue;
+	let parsed: number;
+	if (typeof value === "number") {
+		parsed = value;
+	} else if (typeof value === "string" && /^\d+$/.test(value.trim())) {
+		parsed = Number(value);
+	} else {
+		throw new Error(`${label} must be an integer from ${min} to ${max}`);
+	}
+	if (!Number.isInteger(parsed) || parsed < min || parsed > max) {
+		throw new Error(`${label} must be an integer from ${min} to ${max}`);
+	}
+	return parsed;
+}
+
+function requireBooleanConfirmation(
+	record: Record<string, unknown>,
+	key: string,
+	action: string,
+): void {
+	if (optionalBooleanParam(record[key], key) !== true) {
+		throw new Error(`${action} requires ${key}=true.`);
+	}
+}
+
+function optionalPortParam(
+	value: unknown,
+	label: string,
+	opts: { allowZero?: boolean } = {},
+): number | undefined {
+	if (value === undefined || value === null) return undefined;
+	let port: number;
+	const min = opts.allowZero === true ? 0 : 1;
+	const message = `${label} must be an integer from ${min} to 65535`;
+	if (typeof value === "number") {
+		port = value;
+	} else if (typeof value === "string" && /^\d+$/.test(value.trim())) {
+		port = Number(value);
+	} else {
+		throw new Error(message);
+	}
+	if (!Number.isInteger(port) || port < min || port > 65535) {
+		throw new Error(message);
+	}
+	return port;
+}
+
+function cleanupLegacyDaemonUnits(): number {
+	return cleanupLegacyDaemonUnitsExceptLast();
+}
+
+function cleanupLegacyDaemonUnitsExceptLast(lastAgent?: AgentType): number {
+	let failed = 0;
+	const installedAgents = listInstalledAgents();
+	const orderedAgents = lastAgent
+		? [
+				...installedAgents.filter((agentType) => agentType !== lastAgent),
+				...installedAgents.filter((agentType) => agentType === lastAgent),
+			]
+		: installedAgents;
+	for (const agentType of orderedAgents) {
+		try {
+			const result = uninstallService({ agent: agentType });
+			if (result.removed) {
+				console.log(`✓ Removed legacy per-agent daemon unit for ${agentType}`);
+			}
+		} catch (e) {
+			console.error(`✗ Failed to remove legacy daemon unit for ${agentType}: ${toErrorMessage(e)}`);
+			failed += 1;
+		}
+	}
+	return failed;
+}
+
+interface LegacyDaemonRun {
+	agentType: AgentType;
+	environmentId?: string;
+}
+
+function resolveLegacyRunOpts(opts: LegacyRunOpts): LegacyDaemonRun | null {
+	const agentType = optionalAgentParam(opts.agent);
+	const environmentId = optionalStringParam(opts.environmentId, "--environment-id");
+	if (!agentType) {
+		if (environmentId) {
+			throw new Error("--environment-id requires --agent for legacy daemon run compatibility");
+		}
+		return null;
+	}
+	return { agentType, environmentId };
+}
+
+async function migrateLegacyDaemonRun(legacy: LegacyDaemonRun): Promise<void> {
+	if (!isLoggedIn()) {
+		log.error("serve.legacy_daemon_migration_no_auth", {
+			agent: legacy.agentType,
+			hint: "Set IFORGE_AUTH_TOKEN env or run `iforge auth login`, then run `iforge daemon install`.",
+		});
+		process.exit(1);
+	}
+	if (legacy.environmentId) {
+		persistLegacyEnvironmentId(legacy);
+	}
+	log.info("serve.legacy_daemon_migration_started", {
+		agent: legacy.agentType,
+		has_environment_id: legacy.environmentId !== undefined,
+	});
+	try {
+		const result = installService();
+		log.info("serve.legacy_daemon_migration_singleton_installed", {
+			unit: result.unit,
+			replaced: result.replaced,
+		});
+	} catch (error) {
+		log.error("serve.legacy_daemon_migration_install_failed", {
+			agent: legacy.agentType,
+			error: toErrorMessage(error),
+		});
+		process.exit(1);
+	}
+	const failed = cleanupLegacyDaemonUnitsExceptLast(legacy.agentType);
+	log.info("serve.legacy_daemon_migration_finished", {
+		agent: legacy.agentType,
+		failed,
+	});
+	process.exit(failed > 0 ? 1 : 0);
+}
+
+function persistLegacyEnvironmentId(legacy: LegacyDaemonRun): void {
+	if (!legacy.environmentId) return;
+	const envDir = join(getClawdiDir(), "environments");
+	mkdirSync(envDir, { recursive: true });
+	const envPath = join(envDir, `${legacy.agentType}.json`);
+	writeFileSync(
+		envPath,
+		`${JSON.stringify({ id: legacy.environmentId, agentType: legacy.agentType }, null, 2)}\n`,
+		{ mode: 0o600 },
+	);
+	try {
+		chmodSync(envPath, 0o600);
+	} catch {
+		/* best effort */
+	}
+}
+
+function pickLegacyDaemonRunTarget(legacy: LegacyDaemonRun): DaemonRunTarget {
+	const adapter = adapterForType(legacy.agentType);
+	if (!adapter) {
+		log.error("serve.no_agent_adapter", { agent: legacy.agentType });
+		console.error(`No adapter available for ${legacy.agentType}.`);
+		process.exit(1);
+	}
+	const environmentId = legacy.environmentId ?? resolveEnvironmentId(legacy.agentType, 1);
+	if (!environmentId) {
+		log.error("serve.no_environment", {
+			agent: legacy.agentType,
+			hint: "Pass --environment-id, set IFORGE_ENVIRONMENT_ID, or run `iforge setup`.",
+		});
+		process.exit(1);
+	}
+	return {
+		agentType: legacy.agentType,
+		adapter,
+		environmentId,
+	};
+}
+
+function isAgentType(s: string): s is AgentType {
+	return (AGENT_TYPES as readonly string[]).includes(s);
+}
+
+function pickDaemonRunTargets(options: { allowEmpty?: boolean } = {}): DaemonRunTarget[] {
+	const registered = listRegisteredAgentTypes();
+	const envAgent = process.env.CLAWDI_AGENT_TYPE;
+	const targets = registered.length > 0 ? registered : envAgent ? [envAgent] : [];
+	for (const target of targets) {
+		if (!isAgentType(target)) {
+			log.error("serve.unknown_agent", { agent: target, known: AGENT_TYPES });
+			console.error(`Unknown agent: ${target}. Expected one of: ${AGENT_TYPES.join(", ")}`);
+			process.exit(1);
+		}
+	}
+	if (registered.length === 0) {
+		if (!envAgent) {
+			if (options.allowEmpty) return [];
+			log.error("serve.no_agent", {
+				hint: "Run `iforge setup` to register an agent on this machine, or set IFORGE_AGENT_TYPE in a container.",
+			});
+			process.exit(1);
+		}
+	}
+	const agentTypes = targets as AgentType[];
+	return agentTypes.map((agentType) => {
+		const adapter = adapterForType(agentType);
+		if (!adapter) {
+			log.error("serve.no_agent_adapter", { agent: agentType });
+			console.error(`No adapter available for ${agentType}.`);
+			process.exit(1);
+		}
+		const environmentId = resolveEnvironmentId(agentType, agentTypes.length);
+		if (!environmentId) {
+			log.error("serve.no_environment", {
+				agent: agentType,
+				hint: "Run `iforge setup` to write ~/.iforge/environments/<agent>.json.",
+			});
+			process.exit(1);
+		}
+		return { agentType, adapter, environmentId };
+	});
+}
+
+export async function runDaemonWorkers(input: {
+	targets: DaemonRunTarget[];
+	abortController: AbortController;
+	forcePollWatcher: boolean;
+	runObservationProducer?: typeof runRuntimeObservationProducer;
+	runEngine?: typeof runSyncEngine;
+}): Promise<void> {
+	const producer = input.runObservationProducer ?? runRuntimeObservationProducer;
+	const engine = input.runEngine ?? runSyncEngine;
+	await Promise.all([
+		producer({ abort: input.abortController.signal }),
+		...input.targets.map((target) =>
+			engine({
+				environmentId: target.environmentId,
+				adapter: target.adapter,
+				abort: input.abortController.signal,
+				abortController: input.abortController,
+				forcePollWatcher: input.forcePollWatcher,
+			}),
+		),
+	]);
+}
+
+function pickAgent(explicit: string | undefined): {
+	agentType: AgentType;
+	adapter: ReturnType<typeof adapterForType>;
+} {
+	const registered = listRegisteredAgentTypes();
+	if (explicit) {
+		// Validate against AGENT_TYPES before narrowing — otherwise
+		// `--agent foo` slipped through as an `as AgentType` cast,
+		// adapterForType returned null, and the daemon started in
+		// a useless half-state. Exit early with a clear error.
+		if (!isAgentType(explicit)) {
+			log.error("serve.unknown_agent", {
+				agent: explicit,
+				known: AGENT_TYPES,
+			});
+			console.error(`Unknown agent: ${explicit}. Expected one of: ${AGENT_TYPES.join(", ")}`);
+			process.exit(1);
+		}
+		const adapter = adapterForType(explicit);
+		return { agentType: explicit, adapter };
+	}
+	if (registered.length === 0) {
+		return { agentType: "claude_code", adapter: null };
+	}
+	if (registered.length > 1) {
+		// Fail-fast on multi-agent without an explicit pick. Pre-fix
+		// we picked `registered[0]` and emitted a warn-level event,
+		// which used to let target-specific daemon operations pick
+		// an arbitrary agent. Single-agent setups are unaffected
+		// — registered.length === 1 takes the next line and
+		// auto-picks.
+		log.error("serve.ambiguous_agent", { agents: registered });
+		console.error(
+			`Multiple agents registered (${registered.join(", ")}). ` +
+				"Use `iforge daemon status --agent <type>` to inspect one agent.",
+		);
+		process.exit(1);
+	}
+	const picked = registered[0];
+	return { agentType: picked, adapter: adapterForType(picked) };
+}
+
+function resolveEnvironmentId(agentType: AgentType, registeredCount: number): string | null {
+	// Fallback: read the per-agent env file written by `iforge
+	// setup`. Hosted pods bypass this (provision flow injects
+	// CLAWDI_ENVIRONMENT_ID directly); laptops use it.
+	const fromFile = getEnvIdByAgent(agentType);
+	if (fromFile) return fromFile;
+	// Hosted/single-agent containers can still pass one env id via
+	// env var or mounted file. Multi-agent singleton runs must not
+	// apply one global env id to every engine.
+	if (registeredCount === 1) {
+		const fromEnv = process.env.CLAWDI_ENVIRONMENT_ID;
+		if (fromEnv) return fromEnv;
+	}
+	return null;
+}

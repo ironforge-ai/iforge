@@ -1,0 +1,869 @@
+import {
+	closeSync,
+	existsSync,
+	fsyncSync,
+	lstatSync,
+	openSync,
+	readdirSync,
+	readFileSync,
+	rmSync,
+} from "node:fs";
+import { dirname, join } from "node:path";
+import { z } from "zod";
+import { toErrorMessage } from "../serve/log";
+import {
+	readRuntimeAppliedState,
+	runtimeAppliedApplyIdentity,
+	runtimeContentSha256,
+} from "./applied-state";
+import {
+	type RuntimeApplyContext,
+	readRuntimeApplyContext,
+	resolveRuntimeApplyGeneration,
+	runtimeApplyIdentitiesEqual,
+} from "./apply-identity";
+import { applyRuntimeBundleChannelsToManifestLoad } from "./channels";
+import { egressProfileSecretRefs } from "./egress-profiles";
+import { isClawdiManagedProviderProjection } from "./hosted-egress-profiles";
+import {
+	HOSTED_RUNTIME_BUNDLE_V2_SCHEMA_VERSION,
+	hostedRuntimeBundleV2ManifestSchema,
+	type RuntimeManifest,
+	validateUnmanagedProviderSecretValues,
+} from "./manifest-contract";
+import { writeRuntimePrivateFileAtomic } from "./manifest-shared";
+import type { RuntimePaths } from "./paths";
+import {
+	canonicalSecretRefSchema,
+	normalizeSecretValues,
+	runtimeSecretValue,
+} from "./secret-values";
+import { managedWhatsAppAuthCredentials } from "./whatsapp-credential-projection";
+
+export interface RuntimeManifestLoad {
+	manifest: RuntimeManifest;
+	source: "remote-datasource" | "last-good-cache";
+	sourcePath: string;
+	offline: boolean;
+	// Datasource secret values are the sole authority for manifest secret:// refs.
+	secretValues?: Record<string, string>;
+	// In-memory bootstrap/apply context used to load and bind this desired state.
+	applyContext?: RuntimeApplyContext;
+	channelBindings?: RuntimeBundleChannelBinding[];
+	sourceRevision?: string;
+	// Validated wire bundle with secretValues persisted separately.
+	sourceBundle?: unknown;
+	etag?: string;
+}
+
+export const HOSTED_RUNTIME_BUNDLE_V2_MEDIA_TYPE = "application/vnd.clawdi.runtime-bundle.v2+json";
+export const HOSTED_RUNTIME_CAPABILITIES_HEADER = "x-clawdi-runtime-capabilities";
+export const HOSTED_AGENT_PLUGIN_MANIFEST_CAPABILITY = "agent-plugins-manifest-v1";
+export const HOSTED_AGENT_PLUGIN_GITHUB_RELEASE_SOURCE_CAPABILITY =
+	"agent-plugin-github-release-source-v1";
+
+const runtimeBundleTokenChannelBindingSchema = z
+	.object({
+		provider: z.enum(["telegram", "discord"]),
+		accountKey: z.string().min(1),
+		agentTokenSecretRef: canonicalSecretRefSchema,
+		placeholderTokenSecretRef: canonicalSecretRefSchema,
+	})
+	.strict();
+
+const runtimeBundleWhatsAppBindingSchema = z
+	.object({
+		provider: z.literal("whatsapp"),
+		accountId: z.string().uuid(),
+		accountKey: z.string().min(1),
+		linkId: z.string().uuid(),
+		agentTokenSecretRef: canonicalSecretRefSchema,
+		placeholderTokenSecretRef: canonicalSecretRefSchema.optional(),
+		credential: z
+			.object({
+				id: z.string().uuid(),
+				credsSecretRef: canonicalSecretRefSchema,
+				authCert: z
+					.object({
+						SERIAL: z.number().int().nonnegative().safe(),
+						ISSUER: z.string().trim().min(1).max(256),
+						PUBLIC_KEY: z
+							.object({
+								type: z.literal("Buffer"),
+								data: z.string().min(1),
+							})
+							.strict(),
+					})
+					.strict(),
+			})
+			.strict(),
+	})
+	.strict();
+
+const runtimeBundleChannelBindingSchema = z.discriminatedUnion("provider", [
+	runtimeBundleTokenChannelBindingSchema,
+	runtimeBundleWhatsAppBindingSchema,
+]);
+
+export type RuntimeBundleChannelBinding = z.infer<typeof runtimeBundleChannelBindingSchema>;
+
+export const hostedRuntimeBundleV2Schema = z
+	.object({
+		schemaVersion: z.literal(HOSTED_RUNTIME_BUNDLE_V2_SCHEMA_VERSION),
+		sourceRevision: z.string().regex(/^[a-f0-9]{64}$/),
+		manifest: z.unknown(),
+		applyGeneration: z.number().int().positive().safe().optional(),
+		channelBindings: z.array(runtimeBundleChannelBindingSchema),
+		secretValues: z.record(canonicalSecretRefSchema, z.string()),
+	})
+	.strict()
+	.transform((bundle, ctx) => {
+		const manifest = hostedRuntimeBundleV2ManifestSchema.safeParse(bundle.manifest);
+		if (!manifest.success) {
+			for (const issue of manifest.error.issues) {
+				ctx.addIssue({ ...issue, path: ["manifest", ...issue.path] });
+			}
+			return z.NEVER;
+		}
+		return {
+			...bundle,
+			sourceBundle: { ...bundle, secretValues: {} },
+			manifest: {
+				...manifest.data,
+				...(bundle.applyGeneration === undefined
+					? {}
+					: { applyGeneration: bundle.applyGeneration }),
+			},
+		};
+	})
+	.superRefine(validateUnmanagedProviderSecretValues);
+
+export interface RuntimeManifestNotModified {
+	source: "remote-datasource";
+	sourcePath: string;
+	notModified: true;
+	etag?: string;
+	applyContext?: RuntimeApplyContext;
+}
+
+export interface RuntimeManifestFailure {
+	mode: "repair" | "manifest-rejected";
+	stage: "detect" | "local" | "network" | "auth";
+	errors: string[];
+	etag?: string;
+	rejectedGeneration?: number | null;
+	activeGeneration?: number | null;
+}
+
+interface ExistingManifestState {
+	instanceId?: string;
+	generation?: number;
+}
+
+class RuntimeAuthError extends Error {
+	constructor(
+		readonly status: number,
+		detail: string,
+	) {
+		super(
+			`runtime manifest authentication failed: HTTP ${status}${
+				detail ? ` ${detail.slice(0, 200)}` : ""
+			}`,
+		);
+	}
+}
+
+class RuntimeManifestResponseError extends Error {
+	constructor(
+		message: string,
+		readonly etag: string | undefined,
+	) {
+		super(message);
+	}
+}
+
+function readJsonFile(path: string): unknown {
+	const content = readFileSync(path, "utf-8");
+	try {
+		return JSON.parse(content) as unknown;
+	} catch {
+		// JSON parser diagnostics can include raw runtime secret bytes.
+		throw new Error("runtime snapshot JSON is invalid");
+	}
+}
+
+function zodErrors(error: z.ZodError): string[] {
+	return error.issues.map((issue) => {
+		const path = issue.path.length > 0 ? `${issue.path.join(".")}: ` : "";
+		return `${path}${issue.message}`;
+	});
+}
+
+export function parseHostedRuntimeBundleV2(
+	value: unknown,
+	sourcePath: string,
+): RuntimeManifestLoad {
+	const hostedResponse = hostedRuntimeBundleV2Schema.parse(value);
+	return {
+		manifest: hostedResponse.manifest,
+		sourceBundle: hostedResponse.sourceBundle,
+		source: "remote-datasource",
+		sourcePath,
+		offline: false,
+		secretValues: normalizeSecretValues(hostedResponse.secretValues),
+		channelBindings: hostedResponse.channelBindings,
+		sourceRevision: hostedResponse.sourceRevision,
+	};
+}
+
+function rawGeneration(value: unknown): number | null {
+	const generation = plainRecord(plainRecord(value)?.manifest)?.generation;
+	return typeof generation === "number" && Number.isInteger(generation) ? generation : null;
+}
+
+async function fetchRuntimeManifestPayload(
+	applyContext: RuntimeApplyContext,
+	opts: { ifNoneMatch?: string } = {},
+): Promise<
+	| {
+			url: string;
+			raw: unknown;
+			etag?: string;
+	  }
+	| {
+			url: string;
+			notModified: true;
+			etag?: string;
+	  }
+> {
+	const url = applyContext.manifestSource.url;
+	const token = applyContext.manifestSource.auth.token;
+	const timeoutMs = 15_000;
+	const controller = new AbortController();
+	const timer = setTimeout(() => controller.abort(), timeoutMs);
+	try {
+		const response = await fetch(url, {
+			method: "GET",
+			headers: {
+				accept: HOSTED_RUNTIME_BUNDLE_V2_MEDIA_TYPE,
+				authorization: `Bearer ${token}`,
+				[HOSTED_RUNTIME_CAPABILITIES_HEADER]: [
+					HOSTED_AGENT_PLUGIN_MANIFEST_CAPABILITY,
+					"provider-identity-v1",
+					HOSTED_AGENT_PLUGIN_GITHUB_RELEASE_SOURCE_CAPABILITY,
+				].join(", "),
+				...(opts.ifNoneMatch ? { "if-none-match": opts.ifNoneMatch } : {}),
+			},
+			signal: controller.signal,
+		});
+		const etag = response.headers.get("etag") ?? undefined;
+		if (response.status === 304) {
+			return { url, notModified: true, etag };
+		}
+		if (!response.ok) {
+			const detail = await response.text().catch(() => "");
+			if (response.status === 401 || response.status === 403) {
+				throw new RuntimeAuthError(response.status, detail);
+			}
+			throw new Error(
+				`runtime manifest request failed: HTTP ${response.status}${
+					detail ? ` ${detail.slice(0, 200)}` : ""
+				}`,
+			);
+		}
+		const contentType = response.headers.get("content-type")?.split(";", 1)[0]?.trim();
+		if (contentType !== HOSTED_RUNTIME_BUNDLE_V2_MEDIA_TYPE) {
+			throw new RuntimeManifestResponseError(
+				`runtime manifest response content-type must be ${HOSTED_RUNTIME_BUNDLE_V2_MEDIA_TYPE}, received ${contentType ?? "missing"}`,
+				etag,
+			);
+		}
+		if (!etag) throw new Error("runtime bundle response is missing its strong ETag");
+		try {
+			return { url, raw: await response.json(), etag };
+		} catch (error) {
+			throw new RuntimeManifestResponseError(
+				`runtime manifest response is not valid JSON: ${toErrorMessage(error)}`,
+				etag,
+			);
+		}
+	} finally {
+		clearTimeout(timer);
+	}
+}
+
+type RemoteRuntimeManifestResult =
+	| RuntimeManifestLoad
+	| RuntimeManifestFailure
+	| RuntimeManifestNotModified;
+
+export async function loadRemoteRuntimeManifest(
+	paths: RuntimePaths,
+	opts: { ifNoneMatch?: string; applyContext?: RuntimeApplyContext } = {},
+): Promise<RemoteRuntimeManifestResult> {
+	let applyContext: RuntimeApplyContext;
+	try {
+		applyContext = opts.applyContext ?? readRuntimeApplyContext();
+	} catch (error) {
+		return runtimeApplyContextFailure(error);
+	}
+	let fetched: Awaited<ReturnType<typeof fetchRuntimeManifestPayload>>;
+	try {
+		fetched = await fetchRuntimeManifestPayload(applyContext, opts);
+	} catch (error) {
+		return {
+			mode: "repair",
+			stage: runtimeFetchFailureStage(error),
+			errors: [`could not fetch runtime manifest: ${toErrorMessage(error)}`],
+			...(error instanceof RuntimeManifestResponseError && error.etag ? { etag: error.etag } : {}),
+		};
+	}
+	if ("notModified" in fetched) {
+		return {
+			source: "remote-datasource",
+			sourcePath: fetched.url,
+			notModified: true,
+			etag: fetched.etag ?? opts.ifNoneMatch,
+			applyContext,
+		};
+	}
+
+	let normalized: RuntimeManifestLoad;
+	try {
+		normalized = parseHostedRuntimeBundleV2(fetched.raw, fetched.url);
+		assertRuntimeBundleAuthority(normalized.sourceRevision, fetched.etag);
+		assertRuntimeApplyIdentityMatchesManifest(normalized.manifest, applyContext);
+	} catch (error) {
+		return {
+			mode: "manifest-rejected",
+			stage: "network",
+			errors: error instanceof z.ZodError ? zodErrors(error) : [toErrorMessage(error)],
+			etag: fetched.etag,
+			rejectedGeneration: rawGeneration(fetched.raw),
+			activeGeneration: loadExistingState(paths).generation ?? null,
+		};
+	}
+	const loaded = validateLoadedManifest(normalized, paths);
+	if (!("manifest" in loaded)) {
+		return {
+			...loaded,
+			etag: fetched.etag,
+		};
+	}
+	return {
+		...loaded,
+		etag: fetched.etag,
+		applyContext,
+	};
+}
+
+function runtimeApplyContextFailure(error: unknown): RuntimeManifestFailure {
+	return {
+		mode: "repair",
+		stage: "local",
+		errors: [toErrorMessage(error)],
+	};
+}
+
+function assertRuntimeApplyIdentityMatchesManifest(
+	manifest: RuntimeManifest,
+	applyContext: RuntimeApplyContext,
+): void {
+	if (
+		applyContext.identity &&
+		applyContext.identity.generation !== resolveRuntimeApplyGeneration(manifest)
+	) {
+		throw new Error(
+			`runtime apply identity generation ${applyContext.identity.generation} does not match resolved manifest apply generation ${resolveRuntimeApplyGeneration(manifest)}`,
+		);
+	}
+}
+
+export function assertRuntimeBundleAuthority(
+	sourceRevision: string | undefined,
+	etag: string | undefined,
+): void {
+	if (!sourceRevision) return;
+	const expected = `"sha256:${sourceRevision}"`;
+	if (etag !== expected) {
+		throw new Error(
+			`runtime bundle ETag ${etag ?? "missing"} does not match its sourceRevision validator ${expected}`,
+		);
+	}
+}
+
+function runtimeFetchFailureStage(error: unknown): "network" | "auth" {
+	return error instanceof RuntimeAuthError ? "auth" : "network";
+}
+
+function loadExistingState(paths: RuntimePaths): ExistingManifestState {
+	const appliedState = readRuntimeAppliedState(paths);
+	if (!appliedState) return {};
+	return {
+		instanceId: appliedState.instanceId,
+		generation: appliedState.generation,
+	};
+}
+
+export async function loadRuntimeManifest(
+	paths: RuntimePaths,
+	opts: { applyContext?: RuntimeApplyContext } = {},
+): Promise<RuntimeManifestLoad | RuntimeManifestFailure> {
+	let applyContext: RuntimeApplyContext;
+	try {
+		applyContext = opts.applyContext ?? readRuntimeApplyContext();
+	} catch (error) {
+		return runtimeApplyContextFailure(error);
+	}
+	const remote = await loadRemoteRuntimeManifest(paths, { applyContext });
+	const fetchFailed =
+		"errors" in remote &&
+		remote.mode === "repair" &&
+		(remote.stage === "network" || remote.stage === "auth");
+	if (fetchFailed || "notModified" in remote) {
+		const cached = loadLastGoodManifest(paths, true, applyContext);
+		if ("manifest" in cached) return cached;
+		const fetchErrors =
+			"errors" in remote
+				? remote.errors
+				: [
+						"could not fetch runtime manifest: runtime manifest datasource returned 304 without If-None-Match",
+					];
+		return {
+			mode: "repair",
+			stage: "network",
+			errors: [...fetchErrors, ...cached.errors],
+		};
+	}
+	return remote;
+}
+
+// Readers never migrate. Only the serialized convergence path may persist bytes.
+function loadLastGoodManifest(
+	paths: RuntimePaths,
+	requireOfflineBoot: boolean,
+	applyContext?: RuntimeApplyContext,
+): RuntimeManifestLoad | RuntimeManifestFailure {
+	if (paths.mode === "hosted") {
+		const applied = readRuntimeAppliedState(paths);
+		if (applied) {
+			const snapshot = runtimeSnapshotPath(paths, applied.contentIdentity.sha256);
+			if (existsSync(snapshot)) {
+				const loaded = readLastGoodManifest(paths, requireOfflineBoot, applyContext, snapshot);
+				if ("manifest" in loaded) return loaded;
+			}
+		}
+	}
+	return readLastGoodManifest(paths, requireOfflineBoot, applyContext);
+}
+
+export function runtimeSnapshotPath(paths: RuntimePaths, sha256: string): string {
+	if (!/^[0-9a-f]{64}$/.test(sha256)) throw new Error("invalid runtime snapshot identity");
+	return join(dirname(paths.manifestLastGood), `${sha256}.json`);
+}
+
+export function runtimeSnapshotExists(paths: RuntimePaths): boolean {
+	if (existsSync(paths.manifestLastGood)) return true;
+	if (paths.mode !== "hosted") return false;
+	const applied = readRuntimeAppliedState(paths);
+	return applied !== null && existsSync(runtimeSnapshotPath(paths, applied.contentIdentity.sha256));
+}
+
+function writeContentSnapshot(
+	paths: RuntimePaths,
+	manifest: unknown,
+	secretValues: Record<string, string>,
+): void {
+	const directory = dirname(paths.manifestLastGood);
+	if (existsSync(directory)) assertPrivateRuntimeSnapshotPath(directory, 0o700, true);
+	const snapshot = { manifest, secretValues };
+	writeRuntimePrivateFileAtomic(
+		paths,
+		runtimeSnapshotPath(paths, runtimeContentSha256(snapshot)),
+		`${JSON.stringify(snapshot, null, 2)}\n`,
+		{ mode: 0o600, dirMode: 0o700, durable: true },
+	);
+	syncRuntimeSnapshotDirectory(paths, dirname(dirname(paths.manifestLastGood)));
+}
+
+export function syncRuntimeSnapshotDirectory(paths: RuntimePaths, directory: string): void {
+	if (paths.mode !== "hosted" || !existsSync(directory)) return;
+	const descriptor = openSync(directory, "r");
+	try {
+		fsyncSync(descriptor);
+	} finally {
+		closeSync(descriptor);
+	}
+}
+
+// Called under the converge lock. A missing history is not evidence of cache
+// policy and is never fabricated; a verified compatibility pair must migrate or fail.
+export function migrateCommittedRuntimeSnapshot(
+	paths: RuntimePaths,
+	applyContext?: RuntimeApplyContext,
+): boolean {
+	if (paths.mode !== "hosted") return true;
+	const committed = loadCommittedRuntimeManifest(paths, applyContext);
+	if (!("manifest" in committed)) return false;
+	try {
+		const applied = readRuntimeAppliedState(paths);
+		if (applied) {
+			const snapshot = runtimeSnapshotPath(paths, applied.contentIdentity.sha256);
+			if (
+				existsSync(snapshot) &&
+				"manifest" in readLastGoodManifest(paths, false, applyContext, snapshot)
+			)
+				return true;
+		}
+		writeRuntimeManifestSnapshot(paths, committed.sourceBundle, committed.secretValues ?? {});
+		return true;
+	} catch {
+		throw new Error("could not persist verified committed runtime snapshot");
+	}
+}
+
+// Keep the applied content and at most the next staged content. No new authority
+// fields: runtime-applied's existing SHA is the sole selector after a crash.
+export function pruneRuntimeSnapshots(paths: RuntimePaths, keep: readonly string[] = []): void {
+	try {
+		if (paths.mode !== "hosted" || !existsSync(dirname(paths.manifestLastGood))) return;
+		for (const name of readdirSync(dirname(paths.manifestLastGood))) {
+			if (/^[0-9a-f]{64}\.json$/.test(name) && !keep.includes(name.slice(0, -5))) {
+				rmSync(join(dirname(paths.manifestLastGood), name));
+			}
+		}
+		syncRuntimeSnapshotDirectory(paths, dirname(paths.manifestLastGood));
+	} catch {
+		throw new Error("could not remove obsolete runtime snapshots");
+	}
+}
+
+export function writeRuntimeManifestSnapshot(
+	paths: RuntimePaths,
+	manifest: unknown,
+	secretValues: Record<string, string>,
+): void {
+	try {
+		if (paths.mode === "hosted") {
+			// Preserve the exact pair authority before replacing either mirror.
+			const previous = loadCommittedRuntimeManifest(paths);
+			if ("manifest" in previous)
+				writeContentSnapshot(paths, previous.sourceBundle, previous.secretValues ?? {});
+			const nextSha = runtimeContentSha256({ manifest, secretValues });
+			const appliedSha = readRuntimeAppliedState(paths)?.contentIdentity.sha256;
+			pruneRuntimeSnapshots(paths, [nextSha, ...(appliedSha ? [appliedSha] : [])]);
+			writeContentSnapshot(paths, manifest, secretValues);
+		}
+		const options = { mode: 0o600, dirMode: 0o700, durable: paths.mode === "hosted" };
+		writeRuntimePrivateFileAtomic(
+			paths,
+			paths.manifestLastGood,
+			`${JSON.stringify(manifest, null, 2)}\n`,
+			options,
+		);
+		if (Object.keys(secretValues).length > 0) {
+			writeRuntimePrivateFileAtomic(
+				paths,
+				paths.managedSecretCacheFile,
+				`${JSON.stringify(secretValues, null, 2)}\n`,
+				options,
+			);
+		} else {
+			rmSync(paths.managedSecretCacheFile, { force: true });
+		}
+	} catch {
+		throw new Error("could not persist runtime snapshot");
+	}
+}
+
+function assertPrivateRuntimeSnapshot(paths: RuntimePaths, snapshotPath?: string): void {
+	for (const [path, mode, directory] of [
+		[dirname(paths.manifestLastGood), 0o700, true],
+		[snapshotPath ?? paths.manifestLastGood, 0o600, false],
+		...(!snapshotPath && existsSync(paths.managedSecretCacheFile)
+			? [[paths.managedSecretCacheFile, 0o600, false] as const]
+			: []),
+	] as const) {
+		assertPrivateRuntimeSnapshotPath(path, mode, directory);
+	}
+}
+
+function assertPrivateRuntimeSnapshotPath(path: string, mode: number, directory: boolean): void {
+	const uid = process.getuid?.();
+	const gid = process.getgid?.();
+	const stat = lstatSync(path);
+	if (
+		stat.isSymbolicLink() ||
+		(directory ? !stat.isDirectory() : !stat.isFile()) ||
+		(stat.mode & 0o777) !== mode ||
+		(uid !== undefined && stat.uid !== uid) ||
+		(gid !== undefined && stat.gid !== gid)
+	) {
+		throw new Error("runtime snapshot is not private platform-owned state");
+	}
+}
+
+function readLastGoodManifest(
+	paths: RuntimePaths,
+	requireOfflineBoot: boolean,
+	applyContext: RuntimeApplyContext | undefined,
+	snapshotPath?: string,
+): RuntimeManifestLoad | RuntimeManifestFailure {
+	const sourcePath = snapshotPath ?? paths.manifestLastGood;
+	if (!existsSync(sourcePath)) {
+		return {
+			mode: "repair",
+			stage: "local",
+			errors: ["last-good runtime manifest does not exist"],
+		};
+	}
+	try {
+		if (paths.mode === "hosted") assertPrivateRuntimeSnapshot(paths, snapshotPath);
+		const snapshot = snapshotPath
+			? z
+					.object({ manifest: z.unknown(), secretValues: z.record(z.string(), z.string()) })
+					.strict()
+					.parse(readJsonFile(snapshotPath))
+			: null;
+		const sourceBundle = snapshot ? snapshot.manifest : readJsonFile(paths.manifestLastGood);
+		const cachedBundle = plainRecord(sourceBundle);
+		if (!cachedBundle) throw new Error("cached runtime bundle must be an object");
+		const cached = snapshot
+			? { secretValues: normalizeSecretValues(snapshot.secretValues) }
+			: loadCachedSecretValues(paths);
+		if ("errors" in cached) return cached;
+		const parsed = parseHostedRuntimeBundleV2(
+			{ ...cachedBundle, secretValues: cached.secretValues },
+			sourcePath,
+		);
+		const appliedState = readRuntimeAppliedState(paths);
+		const restored = applyRuntimeBundleChannelsToManifestLoad(
+			{
+				...parsed,
+				source: "last-good-cache",
+				sourcePath,
+				offline: true,
+				applyContext,
+			},
+			paths,
+		);
+		const manifest = restored.manifest;
+		if (manifest.recovery.cacheManifest === false) {
+			return {
+				mode: "repair",
+				stage: "local",
+				errors: ["cached manifest does not allow snapshot persistence"],
+			};
+		}
+		if (requireOfflineBoot && manifest.recovery.allowOfflineBoot !== true) {
+			return {
+				mode: "repair",
+				stage: "local",
+				errors: ["cached manifest does not allow offline boot"],
+			};
+		}
+		const cachedApplyIdentity = appliedState ? runtimeAppliedApplyIdentity(appliedState) : null;
+		if (
+			requireOfflineBoot &&
+			!runtimeApplyIdentitiesEqual(applyContext?.identity ?? null, cachedApplyIdentity)
+		) {
+			return {
+				mode: "repair",
+				stage: "local",
+				errors: [
+					"cached strict-v2 apply identity does not match the current runtime apply identity; refusing offline boot",
+				],
+				activeGeneration: appliedState?.generation ?? null,
+			};
+		}
+		const secretRefs = manifestSecretRefs(manifest);
+		if (secretRefs.length > 0) {
+			const missingSecretRefs = manifestSecretRefsMissingValues(manifest, cached.secretValues);
+			if (missingSecretRefs.length > 0) {
+				return {
+					mode: "repair",
+					stage: "local",
+					errors: [
+						`cached manifest references secretValues (${missingSecretRefs.join(", ")}); refusing offline boot because cached secret values are missing`,
+					],
+				};
+			}
+		}
+		if (!appliedState) {
+			return {
+				mode: "repair",
+				stage: "local",
+				errors: ["cached manifest has no durable applied authority; refusing offline boot"],
+			};
+		}
+		if (
+			appliedState.generation !== manifest.generation ||
+			resolveRuntimeApplyGeneration(appliedState) !== resolveRuntimeApplyGeneration(manifest) ||
+			appliedState.instanceId !== manifest.instanceId ||
+			appliedState.contentIdentity.sha256 !==
+				runtimeContentSha256({
+					manifest: sourceBundle,
+					secretValues: cached.secretValues,
+				})
+		) {
+			return {
+				mode: "repair",
+				stage: "local",
+				errors: [
+					"cached manifest does not match the durable strict-v2 apply identity; refusing offline boot",
+				],
+				activeGeneration: appliedState?.generation ?? null,
+			};
+		}
+		return {
+			...restored,
+			manifest,
+			sourceBundle,
+		};
+	} catch {
+		return {
+			mode: "repair",
+			stage: "local",
+			errors: ["could not read committed runtime snapshot"],
+		};
+	}
+}
+
+// Internal recovery input for declarative last-good replay. This bypasses only
+// offline-boot policy; schema and applied-content checks remain mandatory.
+export function loadCommittedRuntimeManifest(
+	paths: RuntimePaths,
+	applyContext?: RuntimeApplyContext,
+): RuntimeManifestLoad | RuntimeManifestFailure {
+	return loadLastGoodManifest(paths, false, applyContext);
+}
+
+/**
+ * The root-only cached secret values, or a repair failure naming the cache path (never a value).
+ * Exported for the companion executor, which reads a companion's API key from it (06-07).
+ */
+export function loadCachedSecretValues(
+	paths: RuntimePaths,
+): { secretValues: Record<string, string> } | RuntimeManifestFailure {
+	if (!existsSync(paths.managedSecretCacheFile)) return { secretValues: {} };
+	try {
+		const raw = readJsonFile(paths.managedSecretCacheFile);
+		if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+			throw new Error("cached secret values must be a JSON object");
+		}
+		const secretValues: Record<string, string> = {};
+		for (const [ref, value] of Object.entries(raw as Record<string, unknown>)) {
+			if (typeof value !== "string") {
+				throw new Error(`cached secret value for ${ref} must be a string`);
+			}
+			secretValues[ref] = value;
+		}
+		return { secretValues: normalizeSecretValues(secretValues) };
+	} catch {
+		return {
+			mode: "repair",
+			stage: "local",
+			errors: ["could not read cached runtime secret values"],
+		};
+	}
+}
+
+export function manifestSecretRefs(manifest: RuntimeManifest): string[] {
+	const refs = new Set<string>();
+	const providers = plainRecord(manifest.projection?.providers);
+	let hasEnabledRuntime = false;
+	for (const [runtimeName, runtime] of Object.entries(manifest.runtimes)) {
+		if (!runtime.enabled) continue;
+		hasEnabledRuntime = true;
+		addSecretEnvRefs(runtime.run?.secretEnv, refs);
+		for (const service of Object.values(runtime.services ?? {})) {
+			addSecretEnvRefs(service.secretEnv, refs);
+		}
+		if (runtimeName === "openclaw" && manifest.openclawGatewayAuth) {
+			refs.add(manifest.openclawGatewayAuth.tokenRef);
+		}
+		for (const providerId of runtime.provider_ids ?? []) {
+			const provider = plainRecord(providers?.[providerId]);
+			if (!provider || isClawdiManagedProviderProjection(provider)) continue;
+			if (typeof provider.apiKeySecretRef === "string") {
+				refs.add(provider.apiKeySecretRef);
+			}
+			const auth = plainRecord(provider.auth);
+			if (typeof auth?.credentialSecretRef === "string") {
+				refs.add(auth.credentialSecretRef);
+			}
+		}
+	}
+	if (hasEnabledRuntime) {
+		for (const ref of egressProfileSecretRefs(manifest.egressProfiles)) refs.add(ref);
+		for (const credential of managedWhatsAppAuthCredentials(
+			manifest.projection?.channelCredentials,
+		)) {
+			refs.add(credential.credsJsonSecretRef);
+		}
+	}
+	// The container companion's credentials (06-08). Independent of any runtime being enabled: the
+	// companion converges on its own. Every ref the entry carries is required, so an offline boot
+	// from the cache fails closed rather than starting Postiz without its env. A `remove` entry
+	// needs none of them -- its units are only withdrawn -- so it adds nothing.
+	const postiz = manifest.companions?.postiz;
+	if (postiz?.lifecycle === "present") {
+		for (const ref of Object.values(postiz.credentials)) {
+			if (typeof ref === "string") refs.add(ref);
+		}
+	}
+	return [...refs].sort();
+}
+
+function manifestSecretRefsMissingValues(
+	manifest: RuntimeManifest,
+	secretValues: Record<string, string> | undefined,
+): string[] {
+	const normalizedValues = normalizeSecretValues(secretValues ?? {});
+	return manifestSecretRefs(manifest).filter(
+		(ref) => runtimeSecretValue(normalizedValues, ref) === null,
+	);
+}
+
+function addSecretEnvRefs(secretEnv: Record<string, string> | undefined, refs: Set<string>): void {
+	for (const ref of Object.values(secretEnv ?? {})) refs.add(ref);
+}
+
+function plainRecord(value: unknown): Record<string, unknown> | null {
+	return value && typeof value === "object" && !Array.isArray(value)
+		? (value as Record<string, unknown>)
+		: null;
+}
+
+function validateLoadedManifest(
+	normalized: RuntimeManifestLoad,
+	paths: RuntimePaths,
+): RuntimeManifestLoad | RuntimeManifestFailure {
+	const existing = loadExistingState(paths);
+	const manifest = normalized.manifest;
+	const continuityErrors: string[] = [];
+	if (existing.instanceId && existing.instanceId !== manifest.instanceId) {
+		continuityErrors.push(
+			`manifest instanceId ${manifest.instanceId} does not match applied instanceId ${existing.instanceId}`,
+		);
+	}
+	if (
+		existing.instanceId === manifest.instanceId &&
+		existing.generation !== undefined &&
+		manifest.generation < existing.generation
+	) {
+		continuityErrors.push(
+			`manifest generation ${manifest.generation} is older than applied generation ${existing.generation}`,
+		);
+	}
+	if (continuityErrors.length > 0) {
+		return {
+			mode: "manifest-rejected",
+			stage: normalized.source === "remote-datasource" ? "network" : "local",
+			errors: continuityErrors,
+			rejectedGeneration: manifest.generation,
+			activeGeneration: existing.generation ?? null,
+		};
+	}
+	return normalized;
+}

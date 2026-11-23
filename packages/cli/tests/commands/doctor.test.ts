@@ -1,0 +1,190 @@
+import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { doctor } from "../../src/commands/doctor";
+import { cleanupTmp, copyFixtureToTmp } from "../adapters/helpers";
+import { jsonResponse, mockFetch, seedAuthAndEnv } from "./helpers";
+
+let tmpHome: string;
+let origHome: string | undefined;
+
+beforeEach(() => {
+	origHome = process.env.HOME;
+	tmpHome = copyFixtureToTmp("hermes");
+	process.env.HOME = tmpHome;
+});
+
+afterEach(() => {
+	if (origHome) process.env.HOME = origHome;
+	else delete process.env.HOME;
+	process.exitCode = 0;
+	if (tmpHome) cleanupTmp(tmpHome);
+});
+
+describe("doctor --json", () => {
+	it("reports auth as ✗ when not logged in, without any fetch", async () => {
+		// Spy console.log to capture JSON output
+		const orig = console.log;
+		let captured = "";
+		console.log = (...args: unknown[]) => {
+			captured = args.map(String).join(" ");
+		};
+
+		const { captured: fetchCalls, restore } = mockFetch([]);
+		try {
+			await doctor({ json: true });
+		} finally {
+			console.log = orig;
+			restore();
+		}
+
+		const checks = JSON.parse(captured) as Array<{ name: string; ok: boolean; hint?: string }>;
+		const auth = checks.find((c) => c.name === "Auth");
+		expect(auth?.ok).toBe(false);
+		expect(auth?.hint).toContain("iforge auth login");
+
+		// API reachability is skipped when not logged in
+		const api = checks.find((c) => c.name === "API reachability");
+		expect(api?.ok).toBe(false);
+
+		// No network calls should have happened (all checks are skipped when unauthenticated)
+		expect(fetchCalls).toHaveLength(0);
+
+		// doctor sets exitCode non-zero when any check fails
+		expect(process.exitCode).toBe(1);
+	});
+
+	it("reports ✓ when logged in with reachable backend + registered environment", async () => {
+		seedAuthAndEnv(tmpHome, "hermes");
+
+		const orig = console.log;
+		let captured = "";
+		console.log = (...args: unknown[]) => {
+			captured = args.map(String).join(" ");
+		};
+
+		const { captured: fetchCalls, restore } = mockFetch([
+			{
+				method: "GET",
+				path: "/v1/auth/me",
+				response: () => jsonResponse({ id: "u1", email: "e" }),
+			},
+			{
+				method: "GET",
+				path: "/v1/vault",
+				response: () =>
+					jsonResponse({
+						items: [{ id: "vault-1", slug: "default", name: "Default" }],
+						total: 2,
+					}),
+			},
+			{
+				method: "POST",
+				path: "/v1/mcp/clawdi",
+				response: () => jsonResponse({ jsonrpc: "2.0", id: 1, result: {} }),
+			},
+		]);
+		try {
+			await doctor({ json: true });
+		} finally {
+			console.log = orig;
+			restore();
+		}
+
+		const checks = JSON.parse(captured) as Array<{ name: string; ok: boolean; detail?: string }>;
+		expect(checks.find((c) => c.name === "Auth")?.ok).toBe(true);
+		expect(checks.find((c) => c.name === "API reachability")?.ok).toBe(true);
+		expect(checks.find((c) => c.name === "Environments")?.ok).toBe(true);
+		expect(checks.find((c) => c.name === "Environments")?.detail).toContain("hermes");
+		expect(checks.find((c) => c.name === "Vault metadata")?.ok).toBe(true);
+		expect(checks.find((c) => c.name === "Vault metadata")?.detail).toContain("2 vaults reachable");
+		expect(checks.find((c) => c.name === "Clawdi MCP")?.ok).toBe(true);
+		expect(fetchCalls.some((request) => request.path.startsWith("/v1/vault/resolve"))).toBe(false);
+		expect(fetchCalls.find((request) => request.path === "/v1/mcp/clawdi")?.body).toEqual({
+			jsonrpc: "2.0",
+			id: 1,
+			method: "ping",
+			params: {},
+		});
+
+		// Hermes fixture present → that agent shows ✓, others show ✗ (not installed)
+		const hermesCheck = checks.find((c) => c.name === "Agent: Hermes");
+		expect(hermesCheck?.ok).toBe(true);
+	});
+
+	it("reports API unreachable when /v1/auth/me fails", async () => {
+		seedAuthAndEnv(tmpHome, "hermes");
+
+		const orig = console.log;
+		let captured = "";
+		console.log = (...args: unknown[]) => {
+			captured = args.map(String).join(" ");
+		};
+
+		const { restore } = mockFetch([
+			{
+				method: "GET",
+				path: "/v1/auth/me",
+				response: () => new Response("nope", { status: 503 }),
+			},
+			{
+				method: "GET",
+				path: "/v1/vault",
+				response: () => new Response("", { status: 503 }),
+			},
+			{
+				method: "POST",
+				path: "/v1/mcp/clawdi",
+				response: () => new Response("", { status: 503 }),
+			},
+		]);
+		try {
+			await doctor({ json: true });
+		} finally {
+			console.log = orig;
+			restore();
+		}
+
+		const checks = JSON.parse(captured) as Array<{ name: string; ok: boolean; hint?: string }>;
+		const api = checks.find((c) => c.name === "API reachability");
+		expect(api?.ok).toBe(false);
+		expect(api?.hint).toContain("retry");
+	});
+
+	it("rejects a malformed Clawdi MCP response", async () => {
+		seedAuthAndEnv(tmpHome, "hermes");
+
+		const orig = console.log;
+		let captured = "";
+		console.log = (...args: unknown[]) => {
+			captured = args.map(String).join(" ");
+		};
+
+		const { restore } = mockFetch([
+			{
+				method: "GET",
+				path: "/v1/auth/me",
+				response: () => jsonResponse({ id: "u1", email: "e" }),
+			},
+			{
+				method: "GET",
+				path: "/v1/vault",
+				response: () => jsonResponse({ items: [], total: 0 }),
+			},
+			{
+				method: "POST",
+				path: "/v1/mcp/clawdi",
+				response: () => jsonResponse({}),
+			},
+		]);
+		try {
+			await doctor({ json: true });
+		} finally {
+			console.log = orig;
+			restore();
+		}
+
+		const checks = JSON.parse(captured) as Array<{ name: string; ok: boolean; detail?: string }>;
+		const mcp = checks.find((check) => check.name === "Clawdi MCP");
+		expect(mcp?.ok).toBe(false);
+		expect(mcp?.detail).toBe("Error: invalid JSON-RPC response");
+	});
+});

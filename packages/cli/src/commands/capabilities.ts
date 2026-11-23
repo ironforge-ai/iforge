@@ -1,0 +1,77 @@
+import chalk from "chalk";
+import { isDesktopManagedCurrentCli } from "../lib/current-cli-invocation";
+import { getCliVersion } from "../lib/version";
+import { normalizeDeniedCommands, readHostPolicy } from "../runtime/host-policy";
+import { detectRuntimeMode } from "../runtime/paths";
+
+interface Capabilities {
+	schemaVersion: "clawdi.capabilities.v1";
+	cliVersion: string;
+	fullCliSurface: true;
+	runtimeMode: "local" | "hosted";
+	updateMode: "desktop-managed" | "local-self-update" | "system-managed-npm";
+	commands: string[];
+	restrictedByHostedPolicy: Array<{ command: string; reason?: string }>;
+	hostPolicy: {
+		source: "builtin" | "file";
+		path?: string;
+		exists: boolean;
+		valid: boolean;
+		error?: string;
+	};
+	mcp: { available: true; command: "iforge mcp" };
+	daemon: { available: true; command: "iforge daemon run" };
+}
+
+function buildCapabilities(commands: string[]): Capabilities {
+	const runtimeMode = detectRuntimeMode();
+	const hostPolicy = readHostPolicy();
+	const cliUpdateMode = hostPolicy.policy?.cliUpdateMode;
+	const updateMode = isDesktopManagedCurrentCli()
+		? "desktop-managed"
+		: runtimeMode === "hosted" || cliUpdateMode === "system-managed-npm"
+			? "system-managed-npm"
+			: "local-self-update";
+
+	return {
+		schemaVersion: "clawdi.capabilities.v1",
+		cliVersion: getCliVersion(),
+		fullCliSurface: true,
+		runtimeMode,
+		updateMode,
+		commands,
+		restrictedByHostedPolicy: normalizeDeniedCommands(hostPolicy.policy),
+		hostPolicy: {
+			source: hostPolicy.source,
+			...(hostPolicy.path ? { path: hostPolicy.path } : {}),
+			exists: hostPolicy.exists,
+			valid: hostPolicy.valid,
+			error: hostPolicy.error,
+		},
+		mcp: { available: true, command: "iforge mcp" },
+		daemon: { available: true, command: "iforge daemon run" },
+	};
+}
+
+export async function capabilitiesCommand(opts: { json?: boolean }, commands: string[]) {
+	const capabilities = buildCapabilities(commands);
+	if (opts.json || !process.stdout.isTTY) {
+		console.log(JSON.stringify(capabilities, null, 2));
+		return;
+	}
+
+	console.log(chalk.bold("iforge capabilities"));
+	console.log();
+	console.log(`  CLI version: ${capabilities.cliVersion}`);
+	console.log(`  Runtime mode: ${capabilities.runtimeMode}`);
+	console.log(`  Update mode: ${capabilities.updateMode}`);
+	console.log(`  Full CLI surface: yes`);
+	if (capabilities.restrictedByHostedPolicy.length > 0) {
+		console.log();
+		console.log(chalk.bold("  Hosted policy restrictions:"));
+		for (const entry of capabilities.restrictedByHostedPolicy) {
+			const reason = entry.reason ? chalk.gray(` — ${entry.reason}`) : "";
+			console.log(`    ${entry.command}${reason}`);
+		}
+	}
+}

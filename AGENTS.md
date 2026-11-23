@@ -1,0 +1,236 @@
+# iforge
+
+The best home for all your AI agents. Run them in the cloud or connect your
+own—with their context and tools in one place. This repository
+contains the CLI, FastAPI backend, TanStack dashboard, shared types, agent
+adapters, channels, and sync.
+
+Maintain agent-facing repository docs with
+[`docs/agent-docs-guide.md`](docs/agent-docs-guide.md).
+
+## OSS Boundary
+
+Hosted infrastructure is owned outside this repo by first-party hosted control
+planes. Do not add hosted service runbooks, private addresses, or internal
+deployment details here.
+
+## Repository Map
+
+```text
+apps/web/          TanStack Start dashboard
+backend/           FastAPI backend, async PostgreSQL, Alembic
+packages/cli/      TypeScript/Bun CLI, adapters, MCP stdio server
+packages/shared/   Shared types, constants, generated API client
+packages/whatsapp-baileys-sidecar/  WhatsApp Baileys sidecar package
+docs/              Contributor docs, ADRs, plans, scenarios
+```
+
+For architecture and ownership, read [`docs/architecture.md`](docs/architecture.md).
+
+## Local End-to-End
+
+Install dependencies once:
+
+```bash
+bun install
+```
+
+Terminal 1, backend:
+
+```bash
+docker compose up -d postgres
+cd backend
+cp .env.example .env
+uv sync
+python3 - <<'PY'
+import secrets
+for name in ("VAULT_ENCRYPTION_KEY", "ENCRYPTION_KEY", "ADMIN_API_KEY"):
+    print(f"{name}={secrets.token_hex(32)}")
+PY
+```
+
+Set those three generated values in `backend/.env`. Also set:
+
+```dotenv
+DEV_AUTH_BYPASS=true
+DEV_AUTH_TOKEN=dev-bypass
+```
+
+Run backend:
+
+```bash
+pdm migrate
+pdm dev
+```
+
+Done: `curl -sS http://localhost:8000/health` returns `{"status":"ok"}`.
+
+Terminal 2, web:
+
+```bash
+cd apps/web
+cp .env.example .env.local
+```
+
+Set:
+
+```dotenv
+VITE_IFORGE_API_URL=http://localhost:8000
+VITE_DEV_AUTH_BYPASS=true
+VITE_DEV_AUTH_TOKEN=dev-bypass
+```
+
+Run:
+
+```bash
+bun run dev
+```
+
+Done: `http://localhost:3000` opens the dashboard without Clerk login.
+
+Terminal 3, CLI:
+
+```bash
+export ADMIN_API_KEY="<value-from-backend-env>"
+curl -sS -X POST http://localhost:8000/v1/admin/auth/keys \
+  -H "X-Admin-Key: ${ADMIN_API_KEY}" \
+  -H "Content-Type: application/json" \
+  -d '{"target_clerk_id":"dev_browser","label":"local-cli"}' \
+  | jq -r .raw_key
+```
+
+Use the printed `clawdi_...` key:
+
+```bash
+bun run packages/cli/src/index.ts config set apiUrl http://localhost:8000
+bun run packages/cli/src/index.ts auth login --manual
+bun run packages/cli/src/index.ts setup
+bun run packages/cli/src/index.ts doctor
+```
+
+Done: `doctor` shows green `Auth`, `API reachability`, `Environments`, `Vault
+metadata`, and the MCP endpoint check; unavailable local agents may show `not
+installed`. The MCP check still prints under its upstream name, which D-01
+leaves alone -- this line no longer quotes it verbatim rather than quoting a
+label that does not match.
+
+Cleanup:
+
+```bash
+docker compose down
+```
+
+Use `docker compose down -v` only when intentionally wiping the local database.
+
+## Verification
+
+Workspace checks:
+
+```bash
+bun run typecheck
+bun run test  # Docker-backed clean runner
+bun run check
+```
+
+Done: all three commands exit 0 and do not modify the worktree. `bun run test`
+copies the repo into an isolated container workspace with a fake `HOME`; use
+`bun run test:local` only for opt-in host-local development loops.
+
+Backend checks:
+
+```bash
+cd backend
+uv run ruff check .
+uv run ruff format --check .
+uv run python -m compileall app scripts tests alembic
+```
+
+Backend pytest needs a migrated throwaway PostgreSQL. Use
+[`docs/backend-development.md#verification`](docs/backend-development.md#verification).
+Done: `uv run pytest -q` exits 0 against that database.
+
+ADR-0005 is mirrored byte-for-byte into the sibling `hermes-deploy` repository.
+It is also mirrored byte-for-byte into the private hosted control-plane repository (`iforge-hosted`), so an edit is re-mirrored in both places in the same change.
+`test_ownership_adr_is_mirrored_byte_for_byte` locates that checkout through
+`HERMES_DEPLOY_PATH`, which has no default because a personal filesystem path
+must never be committed here. Export it when you hold both checkouts:
+
+```bash
+HERMES_DEPLOY_PATH=/path/to/hermes-deploy uv run pytest -q tests/test_ownership_adr_contract.py
+```
+
+Done: the run reports no skips. Unset, the mirror assertion skips deliberately;
+set to a path that does not exist, it fails rather than skipping. Any edit to
+`docs/adr/0005-*.md` must be re-mirrored in the same change.
+
+Frontend checks:
+
+```bash
+bun run --cwd apps/web typecheck
+bun run --cwd apps/web test src/hosted/oss-clean.test.ts
+bunx biome check apps/web/src
+bun run --cwd apps/web build:oss
+```
+
+Done: all web commands exit 0. See
+[`docs/frontend-development.md#verification`](docs/frontend-development.md#verification).
+
+CLI checks:
+
+```bash
+bun run --cwd packages/cli typecheck
+bun run --cwd packages/cli test
+bun run --cwd packages/shared test
+bun run --cwd packages/whatsapp-baileys-sidecar typecheck
+bun run --cwd packages/whatsapp-baileys-sidecar test
+```
+
+Package `test` commands use the Docker-backed clean runner. `test:internal` is
+reserved for that runner and CI; use `test:local` only for an explicit
+host-local workspace loop. Done: command output reports passing tests/typechecks.
+
+## Owner Docs
+
+- Agent documentation: [`docs/agent-docs-guide.md`](docs/agent-docs-guide.md)
+- Backend: [`docs/backend-development.md`](docs/backend-development.md)
+- Frontend: [`docs/frontend-development.md`](docs/frontend-development.md)
+- CLI: [`docs/cli-development.md`](docs/cli-development.md)
+- API compatibility: [`docs/api-compatibility.md`](docs/api-compatibility.md)
+- Architecture: [`docs/architecture.md`](docs/architecture.md)
+- Agent identity ADR: [`docs/adr/0001-agent-identity-is-the-stable-domain-object.md`](docs/adr/0001-agent-identity-is-the-stable-domain-object.md)
+- AI Providers: [`docs/ai-providers.md`](docs/ai-providers.md)
+- Managed runtime: [`docs/managed-runtime.md`](docs/managed-runtime.md)
+- Daemon testing: [`docs/iforge-daemon-test-guide.md`](docs/iforge-daemon-test-guide.md)
+- Releases: [`docs/runbooks/release.md`](docs/runbooks/release.md)
+- Sign-up access (Clerk): [`docs/runbooks/clerk-sign-up-access.md`](docs/runbooks/clerk-sign-up-access.md)
+- Managed WhatsApp sidecars: [`docs/runbooks/whatsapp-baileys-sidecars.md`](docs/runbooks/whatsapp-baileys-sidecars.md)
+- Environment migration to `IFORGE_*`: [`docs/runbooks/iforge-env-migration.md`](docs/runbooks/iforge-env-migration.md)
+- Compose project and PostgreSQL identity migration: [`docs/runbooks/iforge-compose-postgres-migration.md`](docs/runbooks/iforge-compose-postgres-migration.md)
+
+## Compatibility Rules
+
+- `/v1/agents` is canonical for Agent identity.
+- `/v1/environments` and hidden `/api/*` routes are compatibility aliases.
+- Session payloads still use `environment_id` as the legacy wire name for the
+  stable agent id.
+- API compatibility is additive-only for released surfaces.
+- Do not bulk-rewrite `/api` strings; many belong to external protocols or
+  fixtures. Follow [`docs/api-compatibility.md`](docs/api-compatibility.md).
+- Never hand-edit `packages/shared/src/api/api.generated.ts`; regenerate it
+  with the backend workflow.
+
+Done: compatibility changes include focused backend tests for canonical and
+legacy paths.
+
+## Toolchain
+
+- JavaScript and TypeScript commands use the declared `bun@1.4.0` toolchain.
+- JavaScript and TypeScript formatting and linting use Biome.
+- Backend dependency management uses `uv`; operational commands use the PDM
+  scripts in `backend/pyproject.toml`.
+- Python formatting and linting use Ruff.
+
+## Directory Ownership
+
+- Keep UI primitives under `apps/web/src/components/ui/`.
+- Keep shared public types under `packages/shared/src/types/`.

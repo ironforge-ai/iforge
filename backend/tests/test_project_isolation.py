@@ -1,0 +1,664 @@
+"""Account-shared memory and project boundaries for bound and unbound API keys."""
+
+from __future__ import annotations
+
+import uuid
+from collections.abc import AsyncIterator
+from datetime import UTC, datetime
+
+import httpx
+import pytest
+from httpx import ASGITransport
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.core.auth import AuthContext, get_auth, get_auth_short_session
+from app.core.database import get_session
+from app.core.skill_sync_protocol import (
+    SKILL_SYNC_PROTOCOL_AGENT_AUTHORITATIVE_V1,
+    SKILL_SYNC_PROTOCOL_HEADER,
+)
+from app.main import app
+from app.models.api_key import ApiKey
+from app.models.memory import Memory
+from app.models.session import Session
+from app.models.user import User
+from app.models.vault import Vault, VaultProjectAttachment
+
+pytestmark = pytest.mark.committed_db
+
+AGENT_SKILL_SYNC_HEADERS = {
+    SKILL_SYNC_PROTOCOL_HEADER: SKILL_SYNC_PROTOCOL_AGENT_AUTHORITATIVE_V1,
+}
+
+
+async def _override_factory(db_session: AsyncSession, user: User, api_key: ApiKey | None = None):
+    async def _session_override() -> AsyncIterator[AsyncSession]:
+        yield db_session
+
+    async def _auth_override() -> AuthContext:
+        return AuthContext(user=user, api_key=api_key)
+
+    return _session_override, _auth_override
+
+
+async def _client_for(
+    db_session: AsyncSession, user: User, api_key: ApiKey | None
+) -> httpx.AsyncClient:
+    session_o, auth_o = await _override_factory(db_session, user, api_key)
+    app.dependency_overrides[get_session] = session_o
+    app.dependency_overrides[get_auth] = auth_o
+    app.dependency_overrides[get_auth_short_session] = auth_o
+    transport = ASGITransport(app=app)
+    return httpx.AsyncClient(transport=transport, base_url="http://test")
+
+
+async def test_memories_list_is_account_shared_for_deploy_keys(
+    db_session: AsyncSession,
+    seed_user: User,
+):
+    """A deploy key with memories:read sees the user's durable account memory."""
+    from tests.conftest import create_env_with_project
+
+    env_a = await create_env_with_project(
+        db_session,
+        user_id=seed_user.id,
+        machine_id="env-a",
+        machine_name="Env A",
+    )
+    env_b = await create_env_with_project(
+        db_session,
+        user_id=seed_user.id,
+        machine_id="env-b",
+        machine_name="Env B",
+        agent_type="codex",
+    )
+
+    # Two sessions, one per env.
+    sess_a = Session(
+        user_id=seed_user.id,
+        environment_id=env_a.id,
+        local_session_id="sa",
+        started_at=datetime.now(UTC),
+    )
+    sess_b = Session(
+        user_id=seed_user.id,
+        environment_id=env_b.id,
+        local_session_id="sb",
+        started_at=datetime.now(UTC),
+    )
+    db_session.add_all([sess_a, sess_b])
+    await db_session.flush()
+
+    # A memory for env-A (via session A), one for env-B, one
+    # manual (no source session at all).
+    mem_a = Memory(user_id=seed_user.id, content="from env-a", source_session_id=sess_a.id)
+    mem_b = Memory(user_id=seed_user.id, content="from env-b", source_session_id=sess_b.id)
+    mem_manual = Memory(user_id=seed_user.id, content="manual add")
+    db_session.add_all([mem_a, mem_b, mem_manual])
+    await db_session.commit()
+
+    # Environment binding records runtime identity; the explicit scope grants
+    # account-level Memory access so knowledge can move across Agents.
+    deploy_key = ApiKey(
+        user_id=seed_user.id,
+        key_hash=uuid.uuid4().hex,
+        key_prefix="clawdi_test",
+        label="test-deploy",
+        scopes=["memories:read"],
+        environment_id=env_a.id,
+    )
+    db_session.add(deploy_key)
+    await db_session.commit()
+
+    client = await _client_for(db_session, seed_user, deploy_key)
+    try:
+        resp = await client.get("/v1/memories")
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        contents = {m["content"] for m in body["items"]}
+        assert contents == {"from env-a", "from env-b", "manual add"}, contents
+        assert body["total"] == 3
+    finally:
+        await client.aclose()
+        app.dependency_overrides.clear()
+
+
+async def test_memories_list_account_pagination_for_scoped_keys(
+    db_session: AsyncSession,
+    seed_user: User,
+):
+    """Account-shared Memory pages and totals are stable across provenance."""
+    from datetime import UTC, datetime, timedelta
+
+    from tests.conftest import create_env_with_project
+
+    env_a = await create_env_with_project(
+        db_session,
+        user_id=seed_user.id,
+        machine_id="paged-env-a",
+        machine_name="Paged Env A",
+    )
+    env_b = await create_env_with_project(
+        db_session,
+        user_id=seed_user.id,
+        machine_id="paged-env-b",
+        machine_name="Paged Env B",
+        agent_type="codex",
+    )
+
+    base = datetime.now(UTC)
+
+    # 3 sessions in env-B (older), then 3 in env-A (newer). With
+    # page_size=2 + desc order, page 1 of the unfiltered set is the
+    # 2 newest env-A memories, page 2 is the third env-A + first
+    # env-B, etc. Pre-fix would return total=2 on page 1 (post-
+    # filter drops the env-B mix-ins) and the client gives up.
+    sess_b_rows: list[Session] = []
+    for i in range(3):
+        s = Session(
+            user_id=seed_user.id,
+            environment_id=env_b.id,
+            local_session_id=f"pg-sb-{i}",
+            started_at=base - timedelta(minutes=10 + i),
+        )
+        sess_b_rows.append(s)
+    sess_a_rows: list[Session] = []
+    for i in range(3):
+        s = Session(
+            user_id=seed_user.id,
+            environment_id=env_a.id,
+            local_session_id=f"pg-sa-{i}",
+            started_at=base - timedelta(minutes=i),
+        )
+        sess_a_rows.append(s)
+    db_session.add_all(sess_a_rows + sess_b_rows)
+    await db_session.flush()
+
+    # 5 env-A memories total, 5 env-B, interleaved by created_at
+    # so that any single page would mix both envs on the unfiltered
+    # query path.
+    for i in range(5):
+        db_session.add(
+            Memory(
+                user_id=seed_user.id,
+                content=f"a-mem-{i}",
+                source_session_id=sess_a_rows[i % 3].id,
+                created_at=base - timedelta(minutes=i * 2),
+            )
+        )
+        db_session.add(
+            Memory(
+                user_id=seed_user.id,
+                content=f"b-mem-{i}",
+                source_session_id=sess_b_rows[i % 3].id,
+                created_at=base - timedelta(minutes=i * 2 + 1),
+            )
+        )
+    await db_session.commit()
+
+    deploy_key = ApiKey(
+        user_id=seed_user.id,
+        key_hash=uuid.uuid4().hex,
+        key_prefix="clawdi_test",
+        label="paged-deploy",
+        scopes=["memories:read"],
+        environment_id=env_a.id,
+    )
+    db_session.add(deploy_key)
+    await db_session.commit()
+
+    client = await _client_for(db_session, seed_user, deploy_key)
+    try:
+        # Account view contains all ten interleaved memories.
+        page1 = await client.get("/v1/memories", params={"page": 1, "page_size": 2})
+        body1 = page1.json()
+        assert body1["total"] == 10
+        page1_contents = {m["content"] for m in body1["items"]}
+        assert len(page1_contents) == 2
+
+        page5 = await client.get("/v1/memories", params={"page": 5, "page_size": 2})
+        body5 = page5.json()
+        page5_contents = {m["content"] for m in body5["items"]}
+        assert len(page5_contents) == 2
+        assert body5["total"] == 10
+
+        # No overlap between pages.
+        assert page1_contents.isdisjoint(page5_contents)
+    finally:
+        await client.aclose()
+        app.dependency_overrides.clear()
+
+
+async def test_unbound_cli_key_can_pin_any_project(
+    db_session: AsyncSession,
+    seed_user: User,
+):
+    """An unbound device-flow CLI key (from `clawdi auth login`)
+    must be able to read any of the user's projects by passing
+    `?project_id=...`. Pre-fix `project_ids_visible_to` returned only
+    the most-recently-active project for ALL is_cli auth, which
+    intersected to empty when the daemon pinned a different project
+    (e.g. `clawdi daemon run --agent codex` with claude_code as the
+    default) — daemon got zero skills.
+
+    Bound deploy keys are still pinned to their env's project; this
+    test exercises only the unbound path.
+    """
+    from datetime import UTC, datetime
+
+    from app.models.skill import Skill
+    from tests.conftest import create_env_with_project
+
+    env_a = await create_env_with_project(
+        db_session,
+        user_id=seed_user.id,
+        machine_id="cli-env-a",
+        machine_name="Env A",
+    )
+    env_b = await create_env_with_project(
+        db_session,
+        user_id=seed_user.id,
+        machine_id="cli-env-b",
+        machine_name="Env B",
+        agent_type="codex",
+    )
+
+    # One skill per project.
+    db_session.add_all(
+        [
+            Skill(
+                user_id=seed_user.id,
+                project_id=env_a.default_project_id,
+                skill_key="alpha-skill",
+                name="alpha-skill",
+                description="env A's skill",
+                version=1,
+                is_active=True,
+                content_hash="a" * 64,
+                file_count=1,
+                created_at=datetime.now(UTC),
+                updated_at=datetime.now(UTC),
+            ),
+            Skill(
+                user_id=seed_user.id,
+                project_id=env_b.default_project_id,
+                skill_key="beta-skill",
+                name="beta-skill",
+                description="env B's skill",
+                version=1,
+                is_active=True,
+                content_hash="b" * 64,
+                file_count=1,
+                created_at=datetime.now(UTC),
+                updated_at=datetime.now(UTC),
+            ),
+        ]
+    )
+    await db_session.commit()
+
+    # Unbound CLI key — no environment_id, no explicit API permission
+    # list (full account access, mirrors `clawdi auth login`).
+    cli_key = ApiKey(
+        user_id=seed_user.id,
+        key_hash=uuid.uuid4().hex,
+        key_prefix="clawdi_test",
+        label="cli-unbound",
+        scopes=None,
+        environment_id=None,
+    )
+    db_session.add(cli_key)
+    await db_session.commit()
+
+    client = await _client_for(db_session, seed_user, cli_key)
+    try:
+        # Pin env-A's project explicitly — must return env-A's
+        # skill, NOT empty (the pre-fix bug).
+        resp_a = await client.get(
+            "/v1/skills",
+            params={"project_id": str(env_a.default_project_id)},
+            headers=AGENT_SKILL_SYNC_HEADERS,
+        )
+        assert resp_a.status_code == 200, resp_a.text
+        keys_a = {s["skill_key"] for s in resp_a.json()["items"]}
+        assert keys_a == {"alpha-skill"}, keys_a
+
+        # Pin env-B's project — must return env-B's skill.
+        resp_b = await client.get(
+            "/v1/skills",
+            params={"project_id": str(env_b.default_project_id)},
+            headers=AGENT_SKILL_SYNC_HEADERS,
+        )
+        keys_b = {s["skill_key"] for s in resp_b.json()["items"]}
+        assert keys_b == {"beta-skill"}, keys_b
+
+        # No pin → both visible (unbound key sees the user's full
+        # inventory, same as the dashboard JWT).
+        resp_all = await client.get("/v1/skills", headers=AGENT_SKILL_SYNC_HEADERS)
+        assert resp_all.status_code == 200, resp_all.text
+        keys_all = {s["skill_key"] for s in resp_all.json()["items"]}
+        assert keys_all == {"alpha-skill", "beta-skill"}, keys_all
+    finally:
+        await client.aclose()
+        app.dependency_overrides.clear()
+
+
+async def test_bound_deploy_key_still_pinned_to_its_env(
+    db_session: AsyncSession,
+    seed_user: User,
+):
+    """The widening for unbound CLI keys must NOT widen bound
+    deploy keys. A leaked env-A deploy key must still see only
+    env-A's project, even when it pins another project explicitly."""
+    from datetime import UTC, datetime
+
+    from app.models.skill import Skill
+    from tests.conftest import create_env_with_project
+
+    env_a = await create_env_with_project(
+        db_session,
+        user_id=seed_user.id,
+        machine_id="dep-env-a",
+        machine_name="Env A",
+    )
+    env_b = await create_env_with_project(
+        db_session,
+        user_id=seed_user.id,
+        machine_id="dep-env-b",
+        machine_name="Env B",
+        agent_type="codex",
+    )
+    db_session.add(
+        Skill(
+            user_id=seed_user.id,
+            project_id=env_b.default_project_id,
+            skill_key="env-b-only",
+            name="env-b-only",
+            description="not visible to env-A deploy key",
+            version=1,
+            is_active=True,
+            content_hash="c" * 64,
+            file_count=1,
+            created_at=datetime.now(UTC),
+            updated_at=datetime.now(UTC),
+        )
+    )
+    await db_session.commit()
+
+    deploy_key = ApiKey(
+        user_id=seed_user.id,
+        key_hash=uuid.uuid4().hex,
+        key_prefix="clawdi_test",
+        label="env-a-deploy",
+        scopes=None,
+        environment_id=env_a.id,
+    )
+    db_session.add(deploy_key)
+    await db_session.commit()
+
+    client = await _client_for(db_session, seed_user, deploy_key)
+    try:
+        # Even when explicitly pinning env-B's project, the deploy
+        # key must see nothing (env binding wins).
+        resp = await client.get(
+            "/v1/skills",
+            params={"project_id": str(env_b.default_project_id)},
+            headers=AGENT_SKILL_SYNC_HEADERS,
+        )
+        assert resp.status_code == 200
+        assert resp.json()["items"] == [], resp.json()
+
+        search = await client.get("/v1/search", params={"q": "Env"})
+        assert search.status_code == 200, search.text
+        agent_ids = {hit["id"] for hit in search.json()["results"] if hit["type"] == "agent"}
+        assert agent_ids == {str(env_a.id)}
+    finally:
+        await client.aclose()
+        app.dependency_overrides.clear()
+
+
+async def test_search_includes_account_memories_for_scoped_keys(
+    db_session: AsyncSession,
+    seed_user: User,
+):
+    """Global search follows the account-level memories:read grant."""
+    from datetime import UTC, datetime
+
+    from tests.conftest import create_env_with_project
+
+    env_a = await create_env_with_project(
+        db_session,
+        user_id=seed_user.id,
+        machine_id="search-env-a",
+        machine_name="Env A",
+    )
+    env_b = await create_env_with_project(
+        db_session,
+        user_id=seed_user.id,
+        machine_id="search-env-b",
+        machine_name="Env B",
+        agent_type="codex",
+    )
+
+    # Mark each session with a needle the search query will hit.
+    sess_a = Session(
+        user_id=seed_user.id,
+        environment_id=env_a.id,
+        local_session_id="search-sa",
+        started_at=datetime.now(UTC),
+    )
+    sess_b = Session(
+        user_id=seed_user.id,
+        environment_id=env_b.id,
+        local_session_id="search-sb",
+        started_at=datetime.now(UTC),
+    )
+    db_session.add_all([sess_a, sess_b])
+    await db_session.flush()
+
+    needle = "kalejuiceneedlex7"
+    db_session.add_all(
+        [
+            Memory(
+                user_id=seed_user.id,
+                content=f"env-a remembers {needle}",
+                source_session_id=sess_a.id,
+            ),
+            Memory(
+                user_id=seed_user.id,
+                content=f"env-b remembers {needle}",
+                source_session_id=sess_b.id,
+            ),
+            Memory(
+                user_id=seed_user.id,
+                content=f"manual note about {needle}",
+            ),
+        ]
+    )
+    await db_session.commit()
+
+    deploy_key = ApiKey(
+        user_id=seed_user.id,
+        key_hash=uuid.uuid4().hex,
+        key_prefix="clawdi_test",
+        label="test-deploy",
+        scopes=["memories:read"],
+        environment_id=env_a.id,
+    )
+    db_session.add(deploy_key)
+    await db_session.commit()
+
+    client = await _client_for(db_session, seed_user, deploy_key)
+    try:
+        resp = await client.get("/v1/search", params={"q": needle})
+        assert resp.status_code == 200, resp.text
+        memory_titles = {
+            hit["title"] for hit in resp.json().get("results", []) if hit.get("type") == "memory"
+        }
+        assert any("env-a" in title for title in memory_titles)
+        assert any("env-b" in title for title in memory_titles)
+        assert any("manual" in title for title in memory_titles)
+    finally:
+        await client.aclose()
+        app.dependency_overrides.clear()
+
+
+@pytest.mark.asyncio
+async def test_search_excludes_vault_for_scoped_keys(db_session, seed_user):
+    """Scoped keys cannot search Vault metadata visible to the same user."""
+    from tests.conftest import create_env_with_project
+
+    env = await create_env_with_project(
+        db_session, user_id=seed_user.id, machine_id="search-vault", machine_name="Search Vault"
+    )
+    needle = f"vaultneedle{uuid.uuid4().hex}"
+    vault = Vault(user_id=seed_user.id, slug=needle, name=needle)
+    db_session.add(vault)
+    await db_session.flush()
+    db_session.add(VaultProjectAttachment(vault_id=vault.id, project_id=env.default_project_id))
+    await db_session.commit()
+
+    for scopes in (None, ["sessions:write", "skills:read", "skills:write"]):
+        key = ApiKey(user_id=seed_user.id, environment_id=env.id, scopes=scopes)
+        async with await _client_for(db_session, seed_user, key) as client:
+            try:
+                response = await client.get("/v1/search", params={"q": needle})
+                assert response.status_code == 200, response.text
+                vault_ids = {
+                    hit["id"] for hit in response.json()["results"] if hit["type"] == "vault"
+                }
+                assert vault_ids == ({str(vault.id)} if scopes is None else set())
+            finally:
+                app.dependency_overrides.clear()
+
+
+@pytest.mark.asyncio
+async def test_dashboard_endpoints_reject_env_bound_deploy_keys(
+    db_session: AsyncSession,
+    seed_user: User,
+):
+    """Round-42 P2 regression: `/api/dashboard/stats` and
+    `/api/dashboard/contribution` aggregate by `user_id` only —
+    no project filter. An Agent API key (full-permission
+    api_key minted with `scopes=None` but pinned to
+    `environment_id=A`) would otherwise read account-wide
+    totals (sessions, message counts, token usage, contribution
+    graph, skill/vault/memory counts) for sibling envs B/C/D
+    that the resource-level routes explicitly hide from it.
+    Forcing `require_web_auth` (Clerk JWT only) keeps the
+    deploy-key isolation model intact."""
+    from tests.conftest import create_env_with_project
+
+    env = await create_env_with_project(
+        db_session,
+        user_id=seed_user.id,
+        machine_id="env-a",
+        machine_name="Env A",
+    )
+    deploy_key = ApiKey(
+        user_id=seed_user.id,
+        key_hash=uuid.uuid4().hex,
+        key_prefix="clawdi_test",
+        label="test-deploy",
+        # Full permission (default) — but tied to one Agent, so the
+        # dashboard's account-wide aggregate must still refuse.
+        scopes=None,
+        environment_id=env.id,
+    )
+    db_session.add(deploy_key)
+    await db_session.commit()
+
+    client = await _client_for(db_session, seed_user, deploy_key)
+    try:
+        for path in ("/v1/dashboard/stats", "/v1/dashboard/contribution"):
+            resp = await client.get(path)
+            assert resp.status_code == 403, (path, resp.status_code, resp.text)
+    finally:
+        await client.aclose()
+        app.dependency_overrides.clear()
+
+
+async def test_project_explicit_upload_403s_bound_key_targeting_other_project(
+    db_session: AsyncSession,
+    seed_user: User,
+):
+    """Round-r5 P1: a bound env-A deploy key sending
+    `POST /api/projects/{env_b.default_project_id}/skills/upload`
+    must 403, not silently accept the write into env-B.
+    `validate_project_for_caller` is the boundary for ALL phase-2
+    project-explicit writes (skills, vault, memory) — without it
+    a leaked env-A key could plant skills (or steal vault items
+    via the symmetric route) into ANY other project by editing
+    the URL. The existing `test_bound_deploy_key_still_pinned`
+    only covers READ listing; this pin closes the WRITE side.
+    """
+    import gzip
+    import io
+    import tarfile
+
+    from tests.conftest import create_env_with_project
+
+    env_a = await create_env_with_project(
+        db_session,
+        user_id=seed_user.id,
+        machine_id="upload-env-a",
+        machine_name="Env A",
+    )
+    env_b = await create_env_with_project(
+        db_session,
+        user_id=seed_user.id,
+        machine_id="upload-env-b",
+        machine_name="Env B",
+        agent_type="codex",
+    )
+
+    deploy_key = ApiKey(
+        user_id=seed_user.id,
+        key_hash=uuid.uuid4().hex,
+        key_prefix="clawdi_test",
+        label="env-a-deploy",
+        scopes=None,
+        environment_id=env_a.id,
+    )
+    db_session.add(deploy_key)
+    await db_session.commit()
+
+    # Build a minimal valid skill archive rooted at "evil/".
+    md_content = b"---\nname: evil\ndescription: cross-project smuggle attempt\n---\n# attempt\n"
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w") as tf:
+        info = tarfile.TarInfo(name="evil/SKILL.md")
+        info.size = len(md_content)
+        tf.addfile(info, io.BytesIO(md_content))
+    gz_buf = io.BytesIO()
+    with gzip.GzipFile(fileobj=gz_buf, mode="wb") as gz:
+        gz.write(buf.getvalue())
+    archive = gz_buf.getvalue()
+
+    client = await _client_for(db_session, seed_user, deploy_key)
+    try:
+        resp = await client.post(
+            f"/v1/projects/{env_b.default_project_id}/skills/upload",
+            data={"skill_key": "evil"},
+            files={"file": ("evil.tgz", archive, "application/gzip")},
+        )
+        # Boundary must reject — 403 (not 404, which would leak
+        # whether the project exists).
+        assert resp.status_code == 403, (resp.status_code, resp.text)
+    finally:
+        await client.aclose()
+        app.dependency_overrides.clear()
+
+    # Confirm no Skill row landed in env-B's project. Without the
+    # validator, the upload would have created/upserted a row
+    # there.
+    from sqlalchemy import select as _select
+
+    from app.models.skill import Skill
+
+    leaked = await db_session.execute(
+        _select(Skill).where(
+            Skill.project_id == env_b.default_project_id,
+            Skill.skill_key == "evil",
+        )
+    )
+    assert leaked.scalar_one_or_none() is None

@@ -1,0 +1,199 @@
+import {
+	buildHostedDeployCheckoutRequest,
+	buildHostedDeploySubscriptionQuoteRequest,
+	type HostedDeployCheckoutTarget,
+	type HostedDeployCheckoutUiMode,
+} from "@clawdi/shared/api";
+import type { CheckoutOperationResult } from "@/hosted/billing/billing-client";
+import type { CheckoutReturnNavigationTarget } from "@/hosted/billing/checkout-return";
+import type {
+	CheckoutRequest,
+	ComputePlanSlug,
+	ComputeSubscriptionQuoteRequest,
+	ComputeSubscriptionQuoteResponse,
+	DeployRequest,
+	ReusableSubscription,
+	SubscriptionSelection,
+} from "@/hosted/billing/contracts";
+import type { WalletDebitSummary } from "@/hosted/billing/wallet/wallet-debit-summary";
+
+export type SubscriptionFundingSource = ComputeSubscriptionQuoteRequest["funding_source"];
+export type SubscriptionBillingTermMonths = NonNullable<
+	ComputeSubscriptionQuoteRequest["billing_term_months"]
+>;
+
+export function supportedBillingTerm(value: number): SubscriptionBillingTermMonths | null {
+	return value === 1 || value === 12 ? value : null;
+}
+
+/** UI selection for the rail-neutral subscription creation flow. */
+export type SubscriptionCreateSelection = {
+	planSlug: ComputePlanSlug;
+	billingTermMonths: SubscriptionBillingTermMonths;
+	fundingSource: SubscriptionFundingSource;
+};
+
+export type SubscriptionSource =
+	| { mode: "included" }
+	| { mode: "existing"; subscriptionId: string }
+	| { mode: "new" };
+
+const NEW_SUBSCRIPTION_SOURCE: SubscriptionSource = { mode: "new" };
+
+export function resolveSubscriptionSource({
+	includedAvailable,
+	reusableSubscriptions,
+	selected,
+}: {
+	includedAvailable: boolean | undefined;
+	reusableSubscriptions: readonly ReusableSubscription[] | undefined;
+	selected: SubscriptionSource | null;
+}): SubscriptionSource | null {
+	if (includedAvailable === undefined || reusableSubscriptions === undefined) return selected;
+	if (selected?.mode === "included" && !includedAvailable) selected = null;
+	if (selected?.mode === "existing") {
+		const subscriptionId = selected.subscriptionId;
+		if (
+			!reusableSubscriptions.some((subscription) => subscription.subscription_id === subscriptionId)
+		) {
+			selected = null;
+		}
+	}
+	if (selected) return selected;
+	return !includedAvailable && reusableSubscriptions.length === 0 ? NEW_SUBSCRIPTION_SOURCE : null;
+}
+
+/** Presentation model plus the exact server assertion used at confirmation. */
+export type SubscriptionCreateQuoteView = {
+	selection: SubscriptionCreateSelection;
+	termPriceCents: number;
+	currency: string;
+	previewId: string | null;
+	expiresAt: string;
+	walletDebit: WalletDebitSummary | null;
+	serverQuote: ComputeSubscriptionQuoteResponse;
+};
+
+export type SubscriptionCreateTarget =
+	| { kind: "new_deployment"; deployConfig: DeployRequest }
+	// iforge (06.3 D-04): buy a plan without deploying; the body names no agent.
+	| { kind: "plan_only" };
+
+export type SubscriptionCreateRequestView = {
+	selection: SubscriptionCreateSelection;
+	subscriptionSelection: SubscriptionSelection;
+	target: SubscriptionCreateTarget;
+	uiMode: HostedDeployCheckoutUiMode;
+	idempotencyKey: string;
+	quote: SubscriptionCreateQuoteView | null;
+};
+
+export type SubscriptionCreateOutcomeView =
+	| {
+			flowType: "checkout";
+			checkout: Extract<CheckoutOperationResult, { flow_type: "checkout_session" }>;
+	  }
+	| {
+			flowType: "subscription_activation";
+			target: CheckoutReturnNavigationTarget;
+			currentPeriodEnd: string | null;
+			entitledUntil: string | null;
+	  };
+
+export function subscriptionCreateQuoteRequest(
+	selection: SubscriptionCreateSelection | null,
+): ComputeSubscriptionQuoteRequest | null {
+	if (!selection) return null;
+	return buildHostedDeploySubscriptionQuoteRequest(selection);
+}
+
+function decimalString(value: string | null | undefined, field: string): string {
+	if (value === null || value === undefined || value.trim() === "") {
+		throw new Error(`Subscription quote is missing ${field}.`);
+	}
+	return value;
+}
+
+export function subscriptionCreateQuoteView(
+	selection: SubscriptionCreateSelection,
+	quote: ComputeSubscriptionQuoteResponse,
+): SubscriptionCreateQuoteView {
+	const walletDebit =
+		quote.funding_source === "wallet"
+			? {
+					balanceBeforeUsd: decimalString(quote.balance_before_usd, "the wallet balance"),
+					debitAmountUsd: decimalString(quote.debit_amount_usd, "the exact wallet debit"),
+					balanceAfterUsd: decimalString(quote.balance_after_usd, "the post-debit wallet balance"),
+				}
+			: null;
+	return {
+		selection,
+		termPriceCents: quote.term_price_cents,
+		currency: quote.currency,
+		previewId: quote.preview_invoice_id ?? null,
+		expiresAt: quote.expires_at,
+		walletDebit,
+		serverQuote: quote,
+	};
+}
+
+// iforge (06.3 D-04): exhaustive target mapping so a plan_only checkout reaches the
+// shared builder as plan_only (no deploy config, no upgrade target).
+function hostedCheckoutTarget(target: SubscriptionCreateTarget): HostedDeployCheckoutTarget {
+	switch (target.kind) {
+		case "new_deployment":
+			return { kind: "new_deployment", deployRequest: target.deployConfig };
+		case "plan_only":
+			return { kind: "plan_only" };
+	}
+}
+
+export function subscriptionCreateRequest(request: SubscriptionCreateRequestView): {
+	body: CheckoutRequest;
+	idempotencyKey: string;
+} {
+	const { selection, target } = request;
+	const body: CheckoutRequest = buildHostedDeployCheckoutRequest({
+		selection,
+		subscriptionSelection: request.subscriptionSelection,
+		target: hostedCheckoutTarget(target),
+		idempotencyKey: request.idempotencyKey,
+		quote: request.quote?.serverQuote ?? null,
+		uiMode: request.uiMode,
+	});
+	return { body, idempotencyKey: request.idempotencyKey };
+}
+
+export function existingSubscriptionCreateSelection(
+	subscription: ReusableSubscription,
+): SubscriptionCreateSelection {
+	return {
+		planSlug: subscription.plan_slug,
+		billingTermMonths: subscription.billing_term_months,
+		fundingSource: subscription.funding_source,
+	};
+}
+
+export function subscriptionCreateOutcome(
+	result: CheckoutOperationResult,
+): SubscriptionCreateOutcomeView {
+	if (result.flow_type !== "subscription_activation") {
+		return { flowType: "checkout", checkout: result };
+	}
+	const deploymentId = result.deployment_id?.trim();
+	const deployRequestId = result.deploy_request_id?.trim();
+	let target: CheckoutReturnNavigationTarget;
+	if (deploymentId) {
+		target = { kind: "deployment", deploymentId };
+	} else if (deployRequestId) {
+		target = { kind: "deploy_request", deployRequestId };
+	} else {
+		throw new Error("Activation did not return an agent request.");
+	}
+	return {
+		flowType: "subscription_activation",
+		target,
+		currentPeriodEnd: result.current_period_end ?? null,
+		entitledUntil: result.entitled_until ?? null,
+	};
+}

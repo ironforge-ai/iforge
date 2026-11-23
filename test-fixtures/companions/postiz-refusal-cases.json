@@ -1,0 +1,196 @@
+[
+	{
+		"refusal": "missing-digest",
+		"case": "artifact without sha256",
+		"op": "delete",
+		"path": ["artifact", "sha256"],
+		"at": "artifact"
+	},
+	{
+		"refusal": "missing-digest",
+		"case": "redis dependency without sha256",
+		"op": "delete",
+		"path": ["dependencies", "redis", "sha256"],
+		"at": "dependencies.redis"
+	},
+	{
+		"refusal": "malformed-digest",
+		"case": "artifact digest in uppercase hex",
+		"op": "set",
+		"path": ["artifact", "sha256"],
+		"value": "01B24A4FC1055F6833122C99614805BEA702FDC0EE30C9B5D09330B521FA1EFA",
+		"at": "artifact.sha256"
+	},
+	{
+		"refusal": "malformed-digest",
+		"case": "postgres digest one character short",
+		"op": "set",
+		"path": ["dependencies", "postgres", "sha256"],
+		"value": "db8d1af12ebac7fe10c57730502a31e9b34586ac1ed32852639007dd77eda44",
+		"at": "dependencies.postgres.sha256"
+	},
+	{
+		"refusal": "tag-field",
+		"case": "tag on the postiz image",
+		"op": "set",
+		"path": ["artifact", "tag"],
+		"value": "v2.24.0",
+		"at": "artifact"
+	},
+	{
+		"refusal": "tag-field",
+		"case": "tag on the postgres image",
+		"op": "set",
+		"path": ["dependencies", "postgres", "tag"],
+		"value": "pg18",
+		"at": "dependencies.postgres"
+	},
+	{
+		"refusal": "tag-field",
+		"case": "tag on the redis image",
+		"op": "set",
+		"path": ["dependencies", "redis", "tag"],
+		"value": "7.2",
+		"at": "dependencies.redis"
+	},
+	{
+		"refusal": "tag-field",
+		"case": "tag on the cloudflared image",
+		"op": "set",
+		"path": ["dependencies", "cloudflared"],
+		"value": {
+			"image": "docker.io/cloudflare/cloudflared",
+			"sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+			"tag": "latest"
+		},
+		"at": "dependencies.cloudflared"
+	},
+	{
+		"refusal": "foreign-repository",
+		"case": "postiz image from another registry",
+		"op": "set",
+		"path": ["artifact", "image"],
+		"value": "docker.io/gitroomhq/postiz-app",
+		"at": "artifact.image"
+	},
+	{
+		"refusal": "foreign-repository",
+		"case": "postiz image carrying a floating tag in the repository string",
+		"op": "set",
+		"path": ["artifact", "image"],
+		"value": "ghcr.io/gitroomhq/postiz-app:latest",
+		"at": "artifact.image"
+	},
+	{
+		"refusal": "foreign-repository",
+		"case": "postgres slot naming upstream postgres",
+		"op": "set",
+		"path": ["dependencies", "postgres", "image"],
+		"value": "docker.io/library/postgres",
+		"at": "dependencies.postgres.image"
+	},
+	{
+		"refusal": "foreign-repository",
+		"case": "redis slot naming another repository",
+		"op": "set",
+		"path": ["dependencies", "redis", "image"],
+		"value": "ghcr.io/example/redis",
+		"at": "dependencies.redis.image"
+	},
+	{
+		"refusal": "undeclared-dependency",
+		"case": "a search-engine dependency",
+		"op": "set",
+		"path": ["dependencies", "elasticsearch"],
+		"value": {
+			"image": "docker.io/library/elasticsearch",
+			"sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+		},
+		"at": "dependencies"
+	},
+	{
+		"refusal": "unknown-top-level-field",
+		"case": "an undeclared top-level field",
+		"op": "set",
+		"path": ["registry"],
+		"value": "docker.io",
+		"at": ""
+	},
+	{
+		"refusal": "non-canonical-credential-ref",
+		"case": "a plaintext credential value",
+		"op": "set",
+		"path": ["credentials", "adminSecretRef"],
+		"value": "hunter2",
+		"at": "credentials.adminSecretRef"
+	},
+	{
+		"refusal": "non-canonical-credential-ref",
+		"case": "a credential ref in another scheme",
+		"op": "set",
+		"path": ["credentials", "appEnvSecretRef"],
+		"value": "vault://companions/postiz/app-env",
+		"at": "credentials.appEnvSecretRef"
+	},
+	{
+		"refusal": "non-canonical-credential-ref",
+		"case": "an empty secret ref",
+		"op": "set",
+		"path": ["credentials", "dbEnvSecretRef"],
+		"value": "secret://",
+		"at": "credentials.dbEnvSecretRef"
+	},
+	{
+		"refusal": "non-canonical-credential-ref",
+		"case": "an optional credential ref that is not canonical",
+		"op": "set",
+		"path": ["credentials", "tunnelTokenSecretRef"],
+		"value": "secret://has a space",
+		"at": "credentials.tunnelTokenSecretRef"
+	},
+	{
+		"refusal": "lifecycle-outside-vocabulary",
+		"case": "lifecycle delete",
+		"op": "set",
+		"path": ["lifecycle"],
+		"value": "delete",
+		"at": "lifecycle"
+	},
+	{
+		"refusal": "uppercase-hostname-label",
+		"case": "hostname with an uppercase label",
+		"op": "set",
+		"path": ["hostname"],
+		"value": "Postiz-abcdefghij12.companions.example",
+		"at": "hostname"
+	},
+	{
+		"refusal": "single-label-hostname",
+		"case": "single-label hostname",
+		"op": "set",
+		"path": ["hostname"],
+		"value": "postiz-abcdefghij12",
+		"at": "hostname"
+	},
+	{
+		"refusal": "too-many-export-requests",
+		"case": "four export requests",
+		"op": "set",
+		"path": ["exportRequests"],
+		"value": [
+			{ "jobId": "00000000-0000-4000-8000-000000000001" },
+			{ "jobId": "00000000-0000-4000-8000-000000000002" },
+			{ "jobId": "00000000-0000-4000-8000-000000000003" },
+			{ "jobId": "00000000-0000-4000-8000-000000000004" }
+		],
+		"at": "exportRequests"
+	},
+	{
+		"refusal": "wrong-port",
+		"case": "port 9120",
+		"op": "set",
+		"path": ["port"],
+		"value": 9120,
+		"at": "port"
+	}
+]

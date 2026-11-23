@@ -1,0 +1,1963 @@
+#!/usr/bin/env node
+import { Command, Option } from "commander";
+import { AGENT_TYPE_HELP_LABEL, SKILL_AGENT_TYPE_HELP_LABEL } from "./adapters/registry.js";
+import { registerServeCommand } from "./commands/serve-cli.js";
+import { loadAuthTokenFile } from "./lib/auth-token-file.js";
+import { applyBrandEnvAliases, refuseUserSuppliedInternalNames } from "./lib/brand-env.js";
+import { handleError } from "./lib/errors.js";
+import { getCliVersion } from "./lib/version.js";
+import { evaluateHostPolicyForCommand } from "./runtime/host-policy.js";
+
+// The public contract boundary. It runs before `new Command()` and before every dynamically
+// imported command module, which is what every command action depends on.
+//
+// It does NOT run before the static imports above: ES module imports are hoisted and their whole
+// transitive graph is evaluated before any statement in this file's body. So the real invariant
+// is narrower than "no module has read env yet" -- it is that no module in that static closure
+// may read a contract name at MODULE scope. Reads inside functions are fine; they happen when the
+// function is called, which is after this line. `brand-env-entrypoint.test.ts` enforces exactly
+// that, because a comment cannot.
+//
+// The boundary is EXCLUSIVE, and the order of these two calls is what makes it so. The refusal
+// MUST precede the apply: applying first copies public values into the internal register, after
+// which a name this process just wrote is indistinguishable from one the user typed, and the
+// refusal would have to either delete its own work or accept smuggled configuration.
+// `IFORGE_*` is the only spelling a user may set (D-05a); a `CLAWDI_*` name arriving without its
+// public counterpart is deleted here, before any read site can see it.
+refuseUserSuppliedInternalNames();
+applyBrandEnvAliases();
+
+const program = new Command();
+
+function commandPath(command: Command): string {
+	const names: string[] = [];
+	let current: Command | null = command;
+	while (current) {
+		const name = current.name();
+		if (name && name !== "iforge") names.push(name);
+		current = current.parent ?? null;
+	}
+	return names.reverse().join(" ");
+}
+
+function collectCsvValues(value: string, prev: string[] = []): string[] {
+	const values = value
+		.split(",")
+		.map((part) => part.trim())
+		.filter((part) => part.length > 0);
+	return prev.concat(values);
+}
+
+function collectValues(value: string, prev: string[] = []): string[] {
+	return prev.concat(value);
+}
+
+program
+	.name("iforge")
+	.description("iCloud for AI Agents — share sessions, skills, vault across agents")
+	.version(getCliVersion())
+	.addHelpText(
+		"after",
+		`
+Examples:
+  $ iforge auth login               Authenticate with iforge Cloud
+  $ iforge deploy                   Create a Hosted agent with the deploy wizard
+  $ iforge auth status --json       Inspect credential source without printing secrets
+  $ iforge setup                    Detect agents and register the current machine
+  $ iforge session list             Preview local sessions before pushing
+  $ iforge push --all               Upload everything (every agent, project, module)
+  $ iforge pull --all               Mirror sessions for all registered agents
+  $ iforge skill list --json        Machine-readable skill listing
+  $ iforge memory search "redis"    Search memories by text
+  $ iforge vault set OPENAI_API_KEY Store a secret
+  $ iforge project folder link --project engineering  Use this folder with a Project
+  $ iforge run --env-file .env.iforge -- npm run dev  Resolve iforge:// refs at runtime
+
+Environment:
+  IFORGE_API_URL           Override the iforge Cloud API endpoint
+  IFORGE_DEPLOY_API_URL    Override the Hosted deploy API endpoint
+  IFORGE_AUTH_TOKEN_ORIGIN Explicit Cloud origin binding for IFORGE_AUTH_TOKEN
+  IFORGE_DEBUG             Print stack traces on error
+  IFORGE_NO_UPDATE_CHECK   Suppress the non-blocking update check
+  IFORGE_NO_AUTO_UPDATE    Skip CLI/daemon background auto-update (also disables via \`config set autoUpdate false\`)
+  IFORGE_AUTH_TOKEN        Authenticate non-interactive Cloud API requests
+  CLAUDE_CONFIG_DIR        Custom Claude Code home (else ~/.claude)
+  CODEX_HOME               Custom Codex home (else ~/.codex)
+  HERMES_HOME              Custom Hermes home (else ~/.hermes)
+  OPENCLAW_STATE_DIR       Custom OpenClaw state dir (else auto-detect)
+  OPENCLAW_AGENT_ID        OpenClaw agent id (else "main")
+  PI_CODING_AGENT_DIR      Custom Pi agent home (else ~/.pi/agent)
+  OPENCODE_DB              Custom OpenCode SQLite path (else XDG data/opencode/opencode.db)
+  CI / GITHUB_ACTIONS / …  Disable interactive prompts in known CI
+
+Docs: https://github.com/ironforge-ai/iforge`,
+	);
+
+program.hook("preAction", (_thisCommand, actionCommand) => {
+	const command = commandPath(actionCommand);
+	const decision = evaluateHostPolicyForCommand(command);
+	if (decision.allowed) return;
+	const reason = decision.reason ?? "disabled by hosted runtime policy";
+	throw new Error(`Command \`iforge ${command}\` is disabled in hosted runtime mode: ${reason}`);
+});
+
+// ─────────────────────────────────────────────────────────────
+// deploy
+// ─────────────────────────────────────────────────────────────
+program
+	.command("deploy")
+	.description("Create a Hosted agent with an interactive, payment-aware wizard")
+	.option("--runtime <runtime>", "Runtime: hermes or openclaw")
+	.option("--provider <provider>", "AI provider: managed, unmanaged, or an exact saved provider id")
+	.option(
+		"--model <model>",
+		"Primary model id (required when a saved provider has no unique default)",
+	)
+	.option("--compute <tier>", "Compute: basic or performance")
+	.option("--term <months>", "Billing term for paid compute: 1 or 12")
+	.option("--payment <method>", "Paid compute payment: wallet or card")
+	.option("--name <name>", "Agent display name")
+	.option("--language <code>", "Language code or default")
+	.option("--timezone <timezone>", "IANA timezone or empty for runtime default")
+	.option(
+		"--request-id <uuid>",
+		"Stable UUID for safe retries (required for every non-interactive deploy)",
+	)
+	.option("-y, --yes", "Confirm the deployment and any exact Wallet debit")
+	.option("--no-wait", "Return after the server accepts the request")
+	.option("--no-open", "Print secure card checkout without opening a browser")
+	.option("--json", "Emit one machine-readable result object")
+	.addHelpText(
+		"after",
+		`
+Examples:
+  $ iforge deploy
+  $ iforge deploy --runtime hermes --provider managed --model <id> --compute basic --request-id <uuid> --yes --json
+  # Native saved provider: choose models inside the Agent
+  $ iforge deploy --provider <saved-provider-id> --compute basic --request-id <uuid> --yes --json
+  # Custom saved provider: select its model
+  $ iforge deploy --provider <saved-provider-id> --model <id> --compute basic --request-id <uuid> --yes --json
+  $ iforge deploy --compute performance --term 12 --payment wallet --request-id <uuid> --yes --json
+  $ iforge deploy --compute performance --payment card --request-id <uuid> --yes --json
+
+Card payment uses Hosted Checkout in your browser. Reuse --request-id to recover
+the same logical deployment. Every non-interactive deploy requires it before
+any create or checkout mutation. No provider secrets are accepted as flags.`,
+	)
+	.action(async (opts) => {
+		const { deployCommand } = await import("./commands/deploy.js");
+		await deployCommand(opts);
+	});
+
+// ─────────────────────────────────────────────────────────────
+// auth
+// ─────────────────────────────────────────────────────────────
+const authCmd = program.command("auth").description("Authenticate with iforge Cloud");
+
+authCmd
+	.command("login")
+	.description("Sign in once with Clerk OAuth Authorization Code + PKCE")
+	.option("--manual", "Skip the browser flow and paste an API key instead")
+	.option("--no-open", "Print the authorization URL and securely paste the callback")
+	.addOption(new Option("--desktop").hideHelp())
+	.addOption(new Option("--force").hideHelp())
+	.addHelpText(
+		"after",
+		"\nExamples:\n  $ iforge auth login\n  $ iforge auth login --no-open\n  $ iforge auth login --manual",
+	)
+	.action(
+		async (opts: { manual?: boolean; open?: boolean; desktop?: boolean; force?: boolean }) => {
+			const { authLogin, authLoginDesktop } = await import("./commands/auth.js");
+			if (opts.desktop) {
+				if (opts.manual || opts.open === false) {
+					throw new Error("Desktop sign-in does not accept interactive login options.");
+				}
+				await authLoginDesktop({ force: opts.force });
+				return;
+			}
+			if (opts.force) throw new Error("--force is only available for Desktop sign-in.");
+			await authLogin(opts);
+		},
+	);
+
+authCmd
+	.command("complete")
+	.description("Finish a login started in non-interactive mode (after browser approval)")
+	.action(async () => {
+		const { authComplete } = await import("./commands/auth.js");
+		await authComplete();
+	});
+
+authCmd
+	.command("desktop-session", { hidden: true })
+	.description("Create a short-lived desktop dashboard session")
+	.option("--json", "Emit machine-readable JSON")
+	.action(async () => {
+		const { authDesktopSessionMachine } = await import("./commands/auth.js");
+		await authDesktopSessionMachine();
+	});
+
+authCmd
+	.command("logout")
+	.description("Remove local credentials")
+	.action(async () => {
+		const { authLogout } = await import("./commands/auth.js");
+		await authLogout();
+	});
+
+authCmd
+	.command("status")
+	.description("Show credential source without printing secrets")
+	.option("--json", "Output as JSON")
+	.action(async (opts: { json?: boolean }) => {
+		const { authStatus } = await import("./commands/auth.js");
+		await authStatus(opts);
+	});
+
+// ─────────────────────────────────────────────────────────────
+// status
+// ─────────────────────────────────────────────────────────────
+program
+	.command("status")
+	.description("Show current auth and module activity")
+	.option("--json", "Output as JSON")
+	.addHelpText("after", "\nExamples:\n  $ iforge status\n  $ iforge status --json")
+	.action(async (opts) => {
+		const { status } = await import("./commands/status.js");
+		await status(opts);
+	});
+
+// ─────────────────────────────────────────────────────────────
+// wallet
+// ─────────────────────────────────────────────────────────────
+const walletCmd = program.command("wallet").description("Inspect iforge Wallet");
+
+walletCmd
+	.command("status")
+	.description("Show authenticated Wallet balance, binding, and USDC funding readiness")
+	.option("--json", "Emit machine-readable JSON")
+	.action(async (opts: { json?: boolean }) => {
+		const { runWalletStatusCommand } = await import("./commands/wallet.js");
+		await runWalletStatusCommand(opts);
+	});
+
+// ─────────────────────────────────────────────────────────────
+// config
+// ─────────────────────────────────────────────────────────────
+const configCmd = program
+	.command("config")
+	.description("Read or write CLI configuration (~/.iforge/config.json)");
+
+configCmd
+	.command("list")
+	.description("Show all configured values")
+	.action(async () => {
+		const { configList } = await import("./commands/config.js");
+		configList();
+	});
+
+configCmd
+	.command("paths", { hidden: true })
+	.description("Show local and hosted runtime paths used by the CLI")
+	.option("--json", "Output as JSON")
+	.action(async (opts: { json?: boolean }) => {
+		const { configPaths } = await import("./commands/config.js");
+		configPaths(opts);
+	});
+
+configCmd
+	.command("get <key>")
+	.description("Print the stored value for a key (exit 1 if unset)")
+	.action(async (key) => {
+		const { configGet } = await import("./commands/config.js");
+		configGet(key);
+	});
+
+configCmd
+	.command("set <key> <value>")
+	.description("Persist a config value to disk")
+	.action(async (key, value) => {
+		const { configSet } = await import("./commands/config.js");
+		configSet(key, value);
+	});
+
+configCmd
+	.command("unset <key>")
+	.description("Remove a config key from disk")
+	.action(async (key) => {
+		const { configUnset } = await import("./commands/config.js");
+		configUnset(key);
+	});
+
+// ─────────────────────────────────────────────────────────────
+// setup
+// ─────────────────────────────────────────────────────────────
+program
+	.command("setup")
+	.description("Detect installed agents, register this machine, and install daemons")
+	.option("--agent <type>", `Agent type (${AGENT_TYPE_HELP_LABEL})`)
+	.option(
+		"--vault-workspace <path>",
+		"Bind this Agent to an explicit Vault workspace (requires --agent)",
+	)
+	.option(
+		"--vault-native-agent <id>",
+		"Select the official OpenClaw agent whose workspace supplies Vault files",
+	)
+	.option("-y, --yes", "Register every detected agent without prompting")
+	.option("--no-daemon", "Skip installing/starting background sync daemons")
+	.addHelpText(
+		"after",
+		"\nExamples:\n  $ iforge setup\n  $ iforge setup --yes\n  $ iforge setup --agent claude_code\n  $ iforge setup --no-daemon",
+	)
+	.action(async (opts) => {
+		const { setup } = await import("./commands/setup.js");
+		await setup(opts);
+	});
+
+program
+	.command("teardown")
+	.description("Reverse setup: remove env file, bundled skill, and MCP entry")
+	.option("--agent <type>", `Tear down a single agent (${AGENT_TYPE_HELP_LABEL})`)
+	.option("--all", "Tear down every registered agent")
+	.option("--keep-skill", "Don't remove the bundled iforge skill from the agent")
+	.option("--keep-mcp", "Don't remove the MCP server registration")
+	.option("-y, --yes", "Skip the confirmation prompt")
+	.addHelpText(
+		"after",
+		`
+Examples:
+  $ iforge teardown --agent claude_code
+  $ iforge teardown --all --yes
+  $ iforge teardown --agent hermes --keep-skill`,
+	)
+	.action(async (opts) => {
+		const { teardown } = await import("./commands/teardown.js");
+		await teardown(opts);
+	});
+
+// ─────────────────────────────────────────────────────────────
+// push / pull (replaces `sync up` / `sync down`)
+// ─────────────────────────────────────────────────────────────
+program
+	.command("push")
+	.description("Push local data (sessions, skills) to the cloud")
+	.option(
+		"--modules <modules>",
+		"Narrow to specific modules (comma-separated: sessions,skills). Default: all.",
+	)
+	.option(
+		"--project <path>",
+		"Push sessions from a specific local project path (default: current directory)",
+	)
+	.option(
+		"--exclude-project <path>",
+		"Exclude a project path (repeatable, mutex with --project)",
+		(value: string, prev: string[] = []) => prev.concat(value),
+		[] as string[],
+	)
+	.option(
+		"--all",
+		"Push everything: every module, every registered agent, every project (each axis still narrowable via --modules / --agent / --project)",
+	)
+	.option("--agent <type>", `Narrow to one agent (${AGENT_TYPE_HELP_LABEL})`)
+	.option("--all-agents", "Push from every registered agent on this machine (implied by --all)")
+	.option("--dry-run", "Preview without uploading")
+	.addHelpText(
+		"after",
+		`
+Examples:
+  $ iforge push --all                      Push everything (every agent, project, module)
+  $ iforge push                            Push cwd project for the registered agent (or all of them if multiple)
+  $ iforge push --modules skills           Push only skills (cwd project, registered agent(s))
+  $ iforge push --agent claude_code --dry-run
+  $ iforge push --all --project ~/foo      Push every module / every agent for one specific project
+  $ iforge push --all --exclude-project ~/scratch`,
+	)
+	.action(async (opts) => {
+		const { push } = await import("./commands/push.js");
+		await push(opts);
+	});
+
+program
+	.command("pull")
+	.description(
+		"Mirror sessions, or explicitly import Skills from a Cloud-owned workspace/personal Project",
+	)
+	.option(
+		"--modules <modules>",
+		"Narrow to specific modules (comma-separated: skills,sessions). Default: all.",
+	)
+	.option(
+		"-p, --project <id-or-slug>",
+		"Import Skills from an explicit Custom/personal Project (Agent Workspaces are rejected)",
+	)
+	.option("--agent <type>", `Narrow to one agent (${AGENT_TYPE_HELP_LABEL})`)
+	.option(
+		"--all",
+		"Pull everything: every module, every registered agent (still narrowable via --modules / --agent)",
+	)
+	.option("--all-agents", "Pull for every registered agent on this machine (implied by --all)")
+	.option("--dry-run", "Preview session mirrors or explicit Skill imports without writing locally")
+	.addHelpText(
+		"after",
+		`
+Examples:
+  $ iforge pull --all                    Mirror sessions for every registered agent
+  $ iforge pull                          Mirror sessions for the registered agent(s)
+  $ iforge pull --modules sessions
+  $ iforge pull --agent claude_code --dry-run
+  $ iforge pull --modules skills --project @alice/engineering --agent codex`,
+	)
+	.action(async (opts) => {
+		const { pull } = await import("./commands/pull.js");
+		await pull(opts);
+	});
+
+// ─────────────────────────────────────────────────────────────
+// serve (daemon)
+// ─────────────────────────────────────────────────────────────
+// `serve` command tree lives in its own module so the test can
+// import the same registration the CLI uses (instead of mocking a
+// parallel tree that drifts).
+registerServeCommand(program);
+
+// ─────────────────────────────────────────────────────────────
+// ai-provider
+// ─────────────────────────────────────────────────────────────
+const aiProviderCmd = program.command("ai-provider").description("Manage AI Providers");
+
+aiProviderCmd
+	.command("list")
+	.description("List configured AI Providers")
+	.option("--json", "Emit machine-readable JSON")
+	.action(async (opts) => {
+		const { aiProviderListCommand } = await import("./commands/ai-provider.js");
+		await aiProviderListCommand(opts);
+	});
+
+aiProviderCmd
+	.command("add <provider-id>")
+	.description("Add an AI Provider to the local Provider Catalog")
+	.requiredOption("--type <type>", "Provider type")
+	.option("--label <label>", "Display label")
+	.option("--base-url <url>", "Provider base URL")
+	.option("--default-model <model>", "Model id to add to the provider catalog")
+	.option("--api-mode <mode>", "Provider API mode")
+	.requiredOption("--auth <auth>", "Auth: env:<NAME>, iforge://..., agent:codex/<profile>, or none")
+	.option("--agent-env <name>", "Env var name the target agent process should read")
+	.option(
+		"--capability <name>",
+		"Capability to mark true (repeatable or comma-separated)",
+		collectValues,
+		[],
+	)
+	.option("--set-default", "Set as the default chat provider")
+	.option("--replace", "Replace an existing provider with the same id")
+	.option("--json", "Emit machine-readable JSON")
+	.addHelpText(
+		"after",
+		`
+Examples:
+  $ iforge ai-provider add openai-main --type openai --default-model gpt-5.2 --auth env:OPENAI_API_KEY
+  $ iforge ai-provider add local --type custom_openai_compatible --base-url http://127.0.0.1:1234/v1 --api-mode openai_chat --auth none`,
+	)
+	.action(async (providerId: string, opts) => {
+		const { aiProviderAddCommand } = await import("./commands/ai-provider.js");
+		await aiProviderAddCommand(providerId, opts);
+	});
+
+aiProviderCmd
+	.command("edit <provider-id>")
+	.description("Edit an AI Provider")
+	.option("--type <type>", "Provider type")
+	.option("--label <label>", "Display label")
+	.option("--base-url <url>", "Provider base URL")
+	.option("--default-model <model>", "Model id to add to the provider catalog")
+	.option("--api-mode <mode>", "Provider API mode")
+	.option("--auth <auth>", "Auth: env:<NAME>, iforge://..., agent:codex/<profile>, or none")
+	.option("--agent-env <name>", "Env var name the target agent process should read")
+	.option(
+		"--capability <name>",
+		"Capability to mark true (repeatable or comma-separated)",
+		collectValues,
+		[],
+	)
+	.option("--set-default", "Set as the default chat provider")
+	.option("--json", "Emit machine-readable JSON")
+	.action(async (providerId: string, opts) => {
+		const { aiProviderEditCommand } = await import("./commands/ai-provider.js");
+		await aiProviderEditCommand(providerId, opts);
+	});
+
+aiProviderCmd
+	.command("remove <provider-id>")
+	.alias("rm")
+	.description("Remove an AI Provider")
+	.option("--force", "Remove even if defaults reference it")
+	.option("--json", "Emit machine-readable JSON")
+	.action(async (providerId: string, opts) => {
+		const { aiProviderRemoveCommand } = await import("./commands/ai-provider.js");
+		await aiProviderRemoveCommand(providerId, opts);
+	});
+
+aiProviderCmd
+	.command("validate [provider-id]")
+	.description("Validate the AI Provider Catalog")
+	.option("--allow-no-auth-public", "Allow no-auth providers on public URLs")
+	.option("--json", "Emit machine-readable JSON")
+	.action(async (providerId: string | undefined, opts) => {
+		const { aiProviderValidateCommand } = await import("./commands/ai-provider.js");
+		await aiProviderValidateCommand(providerId, opts);
+	});
+
+aiProviderCmd
+	.command("test <provider-id>")
+	.description("Check provider config and auth availability")
+	.option("--model <model>", "Model to validate against when a provider-specific probe supports it")
+	.option("--timeout <seconds>", "Provider probe timeout in seconds", "10")
+	.option("--live", "Also run a direct provider metadata probe")
+	.option("--probe", "Deprecated alias for --live")
+	.option("--no-probe", "Compatibility flag; live probes are disabled unless --live is passed")
+	.option("--json", "Emit machine-readable JSON")
+	.action(async (providerId: string, opts) => {
+		const { aiProviderTestCommand } = await import("./commands/ai-provider.js");
+		await aiProviderTestCommand(providerId, opts);
+	});
+
+aiProviderCmd
+	.command("connect <provider-id>")
+	.description("Connect provider auth through an OAuth/device-code flow")
+	.option("--method <method>", "Connect method", "oauth")
+	.option("--tool <tool>", "Tool login profile to connect, currently codex")
+	.option("--callback <mode>", "OAuth callback mode: loopback or manual")
+	.option("--redirect-uri <uri>", "Override OAuth redirect URI for manual callback mode")
+	.option("--timeout <seconds>", "Seconds to wait for loopback callback", "600")
+	.option("--no-open", "Do not open the browser automatically")
+	.option("--dry-run", "Show the OAuth start request without running it")
+	.option("--json", "Emit machine-readable JSON")
+	.action(async (providerId: string, opts) => {
+		const { aiProviderConnectCommand } = await import("./commands/ai-provider.js");
+		await aiProviderConnectCommand(providerId, opts);
+	});
+
+aiProviderCmd
+	.command("complete-oauth <provider-id>")
+	.description("Complete AI Provider OAuth with a pasted redirect URL or code/state")
+	.option("--redirect-url <url>", "Full OAuth redirect URL containing code and state")
+	.option("--code <code>", "OAuth authorization code")
+	.option("--state <state>", "OAuth state returned by connect")
+	.option("--redirect-uri <uri>", "Redirect URI used for the OAuth start request")
+	.option("--json", "Emit machine-readable JSON")
+	.action(async (providerId: string, opts) => {
+		const { aiProviderCompleteOAuthCommand } = await import("./commands/ai-provider.js");
+		await aiProviderCompleteOAuthCommand(providerId, opts);
+	});
+
+aiProviderCmd
+	.command("import-auth <provider-id>")
+	.description("Import a local auth profile and bind it to an AI Provider")
+	.option("--tool <tool>", "Tool profile to import, currently codex")
+	.option("--profile <name>", "Profile name", "default")
+	.option("--source <source>", "Credential source: file or keychain", "file")
+	.option("--from <path>", "Credential file to import")
+	.option("--to <path>", "Materialization target path to store with the profile")
+	.option("--keychain-service <service>", "macOS Keychain service name for --source keychain")
+	.option("--keychain-account <account>", "macOS Keychain account name for --source keychain")
+	.option("-y, --yes", "Skip confirmation prompt")
+	.option("--dry-run", "Show what would be imported without storing anything")
+	.option("--json", "Emit machine-readable JSON")
+	.action(async (providerId: string, opts) => {
+		const { aiProviderImportAuthCommand } = await import("./commands/ai-provider.js");
+		await aiProviderImportAuthCommand(providerId, opts);
+	});
+
+aiProviderCmd
+	.command("export")
+	.description("Export Provider Catalog metadata and refs")
+	.option("--out <file>", "Write to a file instead of stdout")
+	.option("--include-secrets", "Include encrypted env-backed secrets in the export")
+	.option("--secret-passphrase", "Encrypt included secrets with a passphrase from env")
+	.option(
+		"--secret-passphrase-env <name>",
+		"Env var holding the encrypted secret export passphrase",
+		"IFORGE_SECRET_EXPORT_PASSPHRASE",
+	)
+	.action(async (opts) => {
+		const { aiProviderExportCommand } = await import("./commands/ai-provider.js");
+		await aiProviderExportCommand(opts);
+	});
+
+aiProviderCmd
+	.command("import [file]")
+	.description("Import and merge a Provider Catalog file")
+	.option("--from-hermes <path>", "Import providers from a Hermes config.yaml")
+	.option("--from-openclaw <path>", "Import providers from an OpenClaw projection JSON")
+	.option("--import-secrets <target>", "Import encrypted secrets to a target, currently env-file")
+	.option("--out <file>", "Output path for --import-secrets env-file")
+	.option(
+		"--secret-passphrase-env <name>",
+		"Env var holding the encrypted secret import passphrase",
+		"IFORGE_SECRET_EXPORT_PASSPHRASE",
+	)
+	.option("--replace", "Replace existing providers with matching ids")
+	.option("--json", "Emit machine-readable JSON")
+	.action(async (file: string | undefined, opts) => {
+		const { aiProviderImportCommand } = await import("./commands/ai-provider.js");
+		await aiProviderImportCommand(file, opts);
+	});
+
+// ─────────────────────────────────────────────────────────────
+// channels
+// ─────────────────────────────────────────────────────────────
+const channelCmd = program
+	.command("channel")
+	.alias("bot")
+	.description("Manage channel bots and pair external chats to agents");
+
+channelCmd
+	.command("list")
+	.description("List your private channel bots")
+	.option("--json", "Emit machine-readable JSON")
+	.action(async (opts: { json?: boolean }) => {
+		const { channelListCommand } = await import("./commands/channel.js");
+		await channelListCommand(opts);
+	});
+
+channelCmd
+	.command("available")
+	.description("List available channel bots")
+	.option("--json", "Emit machine-readable JSON")
+	.action(async (opts: { json?: boolean }) => {
+		const { channelAvailableCommand } = await import("./commands/channel.js");
+		await channelAvailableCommand(opts);
+	});
+
+channelCmd
+	.command("get <channel-id>")
+	.description("Show channel bot details")
+	.option("--json", "Emit machine-readable JSON")
+	.action(async (channelId: string, opts: { json?: boolean }) => {
+		const { channelGetCommand } = await import("./commands/channel.js");
+		await channelGetCommand(channelId, opts);
+	});
+
+channelCmd
+	.command("create <provider> <name>")
+	.description("Create a private channel bot")
+	.option("--agent <agent-id>", "Create an initial bot-agent link")
+	.option("--provider-token <token>", "Provider token or upstream credential")
+	.option("--provider-token-env <name>", "Read provider token from an env var")
+	.option("--config <json>", "Provider config JSON object")
+	.option("--secret <name=value>", "Encrypted provider secret; repeatable", collectValues)
+	.option(
+		"--secret-env <name=env>",
+		"Encrypted provider secret read from an env var; repeatable",
+		collectValues,
+	)
+	.option("--json", "Emit machine-readable JSON")
+	.addHelpText(
+		"after",
+		"\nExample:\n  $ TELEGRAM_BOT_TOKEN=123:abc iforge channel create telegram ops-bot --agent <agent-id> --provider-token-env TELEGRAM_BOT_TOKEN",
+	)
+	.action(async (provider: string, name: string, opts) => {
+		const { channelCreateCommand } = await import("./commands/channel.js");
+		await channelCreateCommand(provider, name, opts);
+	});
+
+channelCmd
+	.command("links <channel-id>")
+	.description("List your bot-agent links for a channel")
+	.option("--json", "Emit machine-readable JSON")
+	.action(async (channelId: string, opts: { json?: boolean }) => {
+		const { channelLinksCommand } = await import("./commands/channel.js");
+		await channelLinksCommand(channelId, opts);
+	});
+
+channelCmd
+	.command("link <channel-id>")
+	.description("Link an accessible bot to one of your agents")
+	.requiredOption("--agent <agent-id>", "Target agent id")
+	.option("--json", "Emit machine-readable JSON")
+	.addHelpText("after", "\nExample:\n  $ iforge channel link <channel-id> --agent <agent-id>")
+	.action(async (channelId: string, opts) => {
+		const { channelLinkCommand } = await import("./commands/channel.js");
+		await channelLinkCommand(channelId, opts);
+	});
+
+channelCmd
+	.command("rotate-token <channel-id>")
+	.description("Rotate the agent SDK token for one of your bot-agent links")
+	.requiredOption("--link <link-id>", "Bot-agent link id")
+	.option("--json", "Emit machine-readable JSON")
+	.addHelpText("after", "\nExample:\n  $ iforge channel rotate-token <channel-id> --link <link-id>")
+	.action(async (channelId: string, opts) => {
+		const { channelRotateTokenCommand } = await import("./commands/channel.js");
+		await channelRotateTokenCommand(channelId, opts);
+	});
+
+channelCmd
+	.command("pair-code <channel-id>")
+	.description("Create a one-time code to pair an external chat to an agent link")
+	.option("--agent <agent-id>", "Create or reuse a link for this agent")
+	.option("--link <link-id>", "Use an existing bot-agent link")
+	.option("--ttl <seconds>", "Pair code TTL in seconds", "300")
+	.option("--json", "Emit machine-readable JSON")
+	.addHelpText(
+		"after",
+		"\nExample:\n  $ iforge channel pair-code <channel-id> --agent <agent-id>\n  $ iforge channel pair-code <channel-id> --link <link-id>",
+	)
+	.action(async (channelId: string, opts) => {
+		const { channelPairCodeCommand } = await import("./commands/channel.js");
+		await channelPairCodeCommand(channelId, opts);
+	});
+
+channelCmd
+	.command("send <channel-id>")
+	.description("Queue an outbound message to a paired chat or explicit chat id")
+	.option("--binding <binding-id>", "Paired chat binding id")
+	.option("--chat <external-chat-id>", "External provider chat id")
+	.requiredOption("--text <text>", "Message text")
+	.option("--json", "Emit machine-readable JSON")
+	.addHelpText(
+		"after",
+		'\nExample:\n  $ iforge channel send <channel-id> --binding <binding-id> --text "deploy done"',
+	)
+	.action(async (channelId: string, opts) => {
+		const { channelSendCommand } = await import("./commands/channel.js");
+		await channelSendCommand(channelId, opts);
+	});
+
+channelCmd
+	.command("bindings <channel-id>")
+	.description("List your paired external chats for a channel")
+	.option("--json", "Emit machine-readable JSON")
+	.action(async (channelId: string, opts: { json?: boolean }) => {
+		const { channelBindingsCommand } = await import("./commands/channel.js");
+		await channelBindingsCommand(channelId, opts);
+	});
+
+channelCmd
+	.command("sync-commands <channel-id>")
+	.description("Sync provider slash commands for one of your private bots")
+	.option("--guild <guild-id>", "Discord guild id for guild-scoped command sync")
+	.option("--commands <json>", "Command spec JSON array; defaults to clawdi_pair and clawdi_unpair")
+	.option("--json", "Emit machine-readable JSON")
+	.addHelpText(
+		"after",
+		"\nExample:\n  $ iforge channel sync-commands <channel-id>\n  $ iforge channel sync-commands <channel-id> --guild <discord-guild-id>",
+	)
+	.action(async (channelId: string, opts) => {
+		const { channelSyncCommandsCommand } = await import("./commands/channel.js");
+		await channelSyncCommandsCommand(channelId, opts);
+	});
+
+channelCmd
+	.command("delete <channel-id>")
+	.description("Archive one of your private channel bots")
+	.option("--yes", "Confirm deletion without prompting")
+	.option("--json", "Emit machine-readable JSON")
+	.addHelpText("after", "\nExample:\n  $ iforge channel delete <channel-id> --yes")
+	.action(async (channelId: string, opts: { yes?: boolean; json?: boolean }) => {
+		const { channelDeleteCommand } = await import("./commands/channel.js");
+		await channelDeleteCommand(channelId, opts);
+	});
+
+// ─────────────────────────────────────────────────────────────
+// managed runtime
+// ─────────────────────────────────────────────────────────────
+const runtimeCmd = program
+	.command("runtime", { hidden: true })
+	.description("Managed Hosted runtime control plane");
+
+runtimeCmd
+	.command("init", { hidden: true })
+	.description("Converge a hosted runtime from controller desired state")
+	.option("--non-interactive", "Required for hosted boot; never prompt")
+	.option("--json", "Output as JSON")
+	.action(async (opts: { nonInteractive?: boolean; json?: boolean }) => {
+		const { runtimeInit } = await import("./commands/runtime.js");
+		await runtimeInit(opts);
+	});
+
+runtimeCmd
+	.command("watch", { hidden: true })
+	.description("Watch hosted runtime desired state and apply live changes")
+	.option("--interval-ms <ms>", "Polling interval in milliseconds")
+	.option("--self-heal-ms <ms>", "Maximum interval before forcing a full manifest fetch")
+	.option("--once", "Run one watch iteration and exit")
+	.option("--json", "Emit machine-readable JSON events")
+	.action(
+		async (opts: { intervalMs?: string; selfHealMs?: string; once?: boolean; json?: boolean }) => {
+			const { runtimeWatch } = await import("./commands/runtime.js");
+			await runtimeWatch(opts);
+		},
+	);
+
+runtimeCmd
+	.command("provider-handoff", { hidden: true })
+	.description("Apply an explicitly authorized provider identity journal CAS")
+	.requiredOption("--handoff-id <id>", "Current Cloud handoff receipt ID")
+	.action(async (opts: { handoffId: string }) => {
+		const { providerIdentityHandoff } = await import("./runtime/provider-handoff.js");
+		await providerIdentityHandoff(opts.handoffId);
+	});
+
+runtimeCmd
+	.command("verify", { hidden: true })
+	.description("Validate hosted runtime CLI modules and cached manifest")
+	.option("--json", "Emit machine-readable JSON")
+	.action(async (opts: { json?: boolean }) => {
+		const { runtimeVerify } = await import("./commands/runtime-doctor.js");
+		await runtimeVerify(opts);
+	});
+
+runtimeCmd
+	.command("sidecar", { hidden: true })
+	.description("Run the hosted runtime egress sidecar")
+	.action(async () => {
+		const { runtimeSidecar } = await import("./runtime/egress-sidecar.js");
+		await runtimeSidecar();
+	});
+
+runtimeCmd
+	.command("status", { hidden: true })
+	.description("Show managed Hosted runtime boot status")
+	.option("--json", "Emit machine-readable JSON")
+	.action(async (opts: { json?: boolean }) => {
+		const { runtimeStatus } = await import("./commands/runtime-doctor.js");
+		await runtimeStatus(opts);
+	});
+
+runtimeCmd
+	.command("doctor", { hidden: true })
+	.description("Diagnose hosted runtime policy, paths, and last boot state")
+	.option("--json", "Output as JSON")
+	.action(async (opts: { json?: boolean }) => {
+		const { runtimeDoctor } = await import("./commands/runtime-doctor.js");
+		await runtimeDoctor(opts);
+	});
+
+// ─────────────────────────────────────────────────────────────
+// vault
+// ─────────────────────────────────────────────────────────────
+const vaultCmd = program
+	.command("vault")
+	.description("Manage secrets")
+	.addHelpText(
+		"after",
+		`
+Scope:
+  Vaults are account-level key bundles. Projects attach to a Vault to use the
+  same shared key set. set/import update the Vault for every attached Project.
+  rm deletes a key from the Vault; detach only removes one Project's access.
+  Key paths are KEY, vault/KEY, or vault/section/KEY.`,
+	);
+
+vaultCmd
+	.command("materialize")
+	.alias("pull")
+	.description("Bind one Vault to a local dotenv file, or pull its saved binding")
+	.requiredOption(
+		"--out <absolute-path>",
+		"Explicit local dotenv target (must be Git-ignored in a repository)",
+	)
+	.option("--vault <uuid>", "Exact Vault identity; required on first pull")
+	.option("--project <uuid>", "Exact Project attachment; required on first pull")
+	.option("--section <name>", "Limit to one section (empty string selects unsectioned keys)")
+	.action(async (opts) => {
+		const { vaultMaterialize } = await import("./commands/vault-materialize.js");
+		await vaultMaterialize(opts);
+	});
+
+vaultCmd
+	.command("set <key>")
+	.description("Store a secret")
+	.option(
+		"-p, --project <id-or-slug>",
+		"Target a specific project (default: your default-write project)",
+	)
+	.option("--value <value>", "Secret value; use --prompt or --stdin to avoid shell history")
+	.option("--stdin", "Read the secret value from stdin")
+	.option("--prompt", "Prompt for the secret value without echoing input")
+	.option("--allow-empty", "Allow storing an empty secret value intentionally")
+	.addHelpText(
+		"after",
+		"\nExamples:\n  $ iforge vault set OPENAI_API_KEY --prompt\n  $ iforge vault set DEPLOY_KEY --project engineering --prompt\n  $ printf 'secret' | iforge vault set api-service/env/DEPLOY_KEY --stdin",
+	)
+	.action(async (key, opts) => {
+		const { vaultSet } = await import("./commands/vault.js");
+		await vaultSet(key, {
+			...opts,
+			project: opts.project,
+			value: opts.value,
+			stdin: opts.stdin,
+			prompt: opts.prompt,
+			allowEmpty: opts.allowEmpty,
+		});
+	});
+
+vaultCmd
+	.command("list")
+	.description("List stored keys and exact references")
+	.option(
+		"-p, --project <id-or-slug>",
+		"List vaults in a specific project (default: all visible projects)",
+	)
+	.option("--json", "Output as JSON")
+	.action(async (opts) => {
+		const { vaultList } = await import("./commands/vault.js");
+		await vaultList(opts);
+	});
+
+vaultCmd
+	.command("import <file>")
+	.description("Import from .env file")
+	.option("-y, --yes", "Skip the confirmation prompt (for CI / scripted imports)")
+	.option("--vault <slug>", "Target vault slug", "default")
+	.option("--section <name>", "Target vault section")
+	.option(
+		"-p, --project <id-or-slug>",
+		"Target a specific project (default: your default-write project)",
+	)
+	.addHelpText(
+		"after",
+		"\nExamples:\n  $ iforge vault import .env.production\n  $ iforge vault import .env.staging --project engineering --yes\n  $ iforge vault import --vault prod --section stripe --project engineering --yes .env.stripe",
+	)
+	.action(async (file, opts) => {
+		const { vaultImport } = await import("./commands/vault.js");
+		await vaultImport(file, {
+			...opts,
+			project: opts.project,
+			section: opts.section,
+			vault: opts.vault,
+		});
+	});
+
+vaultCmd
+	.command("attach <vault>")
+	.description("Make an existing Vault available in a Project")
+	.requiredOption("-p, --project <id-or-slug>", "Project that should use this Vault")
+	.addHelpText(
+		"after",
+		"\nExamples:\n  $ iforge vault attach providers --project redpill-providers",
+	)
+	.action(async (vault, opts) => {
+		const { vaultAttach } = await import("./commands/vault.js");
+		await vaultAttach(vault, { project: opts.project });
+	});
+
+vaultCmd
+	.command("detach <vault>")
+	.alias("unlink")
+	.description("Remove a Project's access to a Vault without deleting keys")
+	.requiredOption("-p, --project <id-or-slug>", "Project that should stop using this Vault")
+	.addHelpText(
+		"after",
+		"\nExamples:\n  $ iforge vault detach providers --project env-abc123\n  $ iforge vault unlink providers --project old-agent",
+	)
+	.action(async (vault, opts) => {
+		const { vaultDetach } = await import("./commands/vault.js");
+		await vaultDetach(vault, { project: opts.project });
+	});
+
+vaultCmd
+	.command("rm <key>")
+	.alias("delete")
+	.description("Delete a key from a Vault")
+	.option(
+		"-p, --project <id-or-slug>",
+		"Select the Project used to locate the Vault (default: your default-write project)",
+	)
+	.option("-y, --yes", "Skip the confirmation prompt")
+	.option(
+		"--global",
+		"Allow deleting a key from a Vault attached to multiple Projects (affects every Project using it)",
+	)
+	.addHelpText(
+		"after",
+		"\nExamples:\n  $ iforge vault rm OPENAI_API_KEY\n  $ iforge vault delete prod/stripe/SECRET_KEY --project engineering --yes\n  $ iforge vault rm OPENAI_API_KEY --project engineering --global --yes",
+	)
+	.action(async (key, opts) => {
+		const { vaultRm } = await import("./commands/vault.js");
+		await vaultRm(key, { ...opts, project: opts.project, yes: opts.yes, global: opts.global });
+	});
+
+vaultCmd
+	.command("resolve <key>")
+	.description("Resolve one vault key")
+	.option(
+		"-p, --project <project>",
+		"Project to resolve from (default: your default-write project)",
+	)
+	.option("-a, --agent <agent-id-or-type>", "Resolve through Workspace and linked Projects")
+	.option(
+		"--allow-conflicts",
+		"Allow first-match wins for Workspace and linked-Project Vault conflicts",
+	)
+	.option("--debug", "Show project precedence and skipped matches")
+	.option("--dry-run", "Check where the key resolves without printing the plaintext value")
+	.option("--json", "Output the full resolve response as JSON")
+	.addHelpText(
+		"after",
+		"\nExamples:\n" +
+			"  $ iforge vault resolve OPENAI_API_KEY                       # default-write project\n" +
+			"  $ iforge vault resolve OPENAI_API_KEY --project personal --debug\n" +
+			"  $ iforge vault resolve OPENAI_API_KEY --agent <agent-id> --debug\n" +
+			"  $ iforge vault resolve OPENAI_API_KEY --agent codex --allow-conflicts --json",
+	)
+	.action(async (key, opts) => {
+		const { vaultResolveCommand } = await import("./commands/vault-resolve.js");
+		await vaultResolveCommand(key, { ...opts, project: opts.project });
+	});
+
+program
+	.command("read")
+	.description("Read one iforge:// secret reference")
+	.argument("<reference>", "Reference to read")
+	.option("-p, --project <project>", "Project to resolve from")
+	.option("-a, --agent <agent-id-or-type>", "Resolve through Workspace and linked Projects")
+	.option(
+		"--allow-conflicts",
+		"Allow first-match wins for Workspace and linked-Project Vault conflicts",
+	)
+	.option("--debug", "Show project precedence without printing secrets in diagnostics")
+	.option("--dry-run", "Check the reference without printing the plaintext value")
+	.option("--json", "Output the full resolve response as JSON")
+	.addHelpText(
+		"after",
+		"\nExamples:\n" +
+			"  $ iforge read iforge://project/<project-id>/vault/prod/section/stripe/field/secret_key\n" +
+			"  $ iforge read iforge://prod/db/url --project engineering --json",
+	)
+	.action(async (reference, opts) => {
+		const { readCommand } = await import("./commands/read.js");
+		await readCommand(reference, { ...opts, project: opts.project });
+	});
+
+program
+	.command("inject")
+	.description("Render iforge:// references in a template")
+	.option("--in <file>", "Input template path, or - for stdin", "-")
+	.option("--out <file>", "Output path, or - for stdout", "-")
+	.option("--force", "Overwrite an existing output file")
+	.option("-p, --project <project>", "Project to resolve from")
+	.option("-a, --agent <agent-id-or-type>", "Resolve through Workspace and linked Projects")
+	.option(
+		"--allow-conflicts",
+		"Allow first-match wins for Workspace and linked-Project Vault conflicts",
+	)
+	.option("--no-project-folder", "Skip linked-folder Project lookup")
+	.option("--dry-run", "Show references that would resolve without writing output")
+	.addHelpText(
+		"after",
+		"\nExamples:\n" +
+			"  $ iforge inject --dry-run --in .env.iforge --out .env.local\n" +
+			"  $ iforge inject --force --in .env.iforge --out .env.local\n" +
+			"  $ iforge inject --in config.template.json --out -",
+	)
+	.action(async (opts) => {
+		const { injectCommand } = await import("./commands/inject.js");
+		await injectCommand({ ...opts, project: opts.project });
+	});
+
+// ─────────────────────────────────────────────────────────────
+// skill
+// ─────────────────────────────────────────────────────────────
+const skillCmd = program.command("skill").description("Manage skills");
+
+skillCmd
+	.command("list")
+	.description("List uploaded skills")
+	.option(
+		"-p, --project <id-or-slug>",
+		"List skills in a specific project (default: all visible projects)",
+	)
+	.option("--json", "Output as JSON")
+	.action(async (opts) => {
+		const { skillList } = await import("./commands/skill.js");
+		await skillList(opts);
+	});
+
+skillCmd
+	.command("add <path>")
+	.description("Upload a skill directory or single .md file")
+	.option("-a, --agent <type>", `Upload to an Agent Workspace (${SKILL_AGENT_TYPE_HELP_LABEL})`)
+	.option(
+		"-p, --project <id-or-slug>",
+		"Upload to an explicit project (UUID, slug, or name). Mutex with --agent.",
+	)
+	.option("-y, --yes", "Skip the confirmation prompt")
+	.addHelpText(
+		"after",
+		"\nExamples:\n  $ iforge skill add ./my-skill --project engineering   # Project\n  $ iforge skill add ./my-skill --agent codex            # Agent Workspace",
+	)
+	.action(async (path, opts) => {
+		const { skillAdd } = await import("./commands/skill.js");
+		await skillAdd(path, { ...opts, project: opts.project });
+	});
+
+skillCmd
+	.command("install <repo>")
+	.description("Install a skill from GitHub (owner/repo or owner/repo/path)")
+	.option("-a, --agent <type>", `Install to a single agent (${SKILL_AGENT_TYPE_HELP_LABEL})`)
+	.option(
+		"-p, --project <id-or-slug>",
+		"Install into an explicit owned project (UUID, slug, or name). Mutex with --agent.",
+	)
+	.addHelpText(
+		"after",
+		`
+Examples:
+  $ iforge skill install vercel-labs/agent-skills
+  $ iforge skill install owner/repo/path/to/skill
+  $ iforge skill install owner/repo --agent claude_code
+  $ iforge skill install owner/repo --project engineering`,
+	)
+	.action(async (repo, opts) => {
+		const { skillInstall } = await import("./commands/skill.js");
+		await skillInstall(repo, opts);
+	});
+
+skillCmd
+	.command("rm <key>")
+	.description("Remove a skill from the cloud")
+	.option("-a, --agent <type>", `Remove from an Agent Workspace (${SKILL_AGENT_TYPE_HELP_LABEL})`)
+	.option(
+		"-p, --project <id-or-slug>",
+		"Remove from an explicit owned project (UUID, slug, or name). Mutex with --agent.",
+	)
+	.action(async (key, opts) => {
+		const { skillRm } = await import("./commands/skill.js");
+		await skillRm(key, opts);
+	});
+
+skillCmd
+	.command("init [name]")
+	.description("Scaffold a new SKILL.md template in the current or named directory")
+	.addHelpText("after", "\nExamples:\n  $ iforge skill init\n  $ iforge skill init my-skill")
+	.action(async (name) => {
+		const { skillInit } = await import("./commands/skill.js");
+		skillInit(name);
+	});
+
+// ─────────────────────────────────────────────────────────────
+// session
+// ─────────────────────────────────────────────────────────────
+const sessionCmd = program
+	.command("session")
+	.description("Inspect local and uploaded agent sessions");
+
+sessionCmd
+	.command("list")
+	.description("List local agent sessions (use before `iforge push` to preview)")
+	.option("--agent <type>", `Single agent (${AGENT_TYPE_HELP_LABEL})`)
+	.option("--all-agents", "List sessions from every registered agent (default)")
+	.option("--project <path>", "Restrict to one project path")
+	.option("--all", "List sessions from all projects (default when --project not set)")
+	.option("--since <date>", "Only list sessions started after this date")
+	.option("--limit <n>", "Cap results", "100")
+	.option("--json", "Output as JSON")
+	.addHelpText(
+		"after",
+		`
+Examples:
+  $ iforge session list
+  $ iforge session list --json
+  $ iforge session list --agent claude_code --project ~/work/foo`,
+	)
+	.action(async (opts) => {
+		const { sessionList } = await import("./commands/session.js");
+		await sessionList(opts);
+	});
+
+sessionCmd
+	.command("search <query>")
+	.description("Search uploaded session summaries, messages, projects, and IDs")
+	.option("--agent <type>", "Filter by agent type")
+	.option("--since <date>", "Only sessions active after this date")
+	.option("--limit <n>", "Cap results (1-200)", "25")
+	.option("--json", "Output as JSON")
+	.addHelpText(
+		"after",
+		'\nExamples:\n  $ iforge session search authentication\n  $ iforge session search "workspace setup" --agent codex --limit 10',
+	)
+	.action(async (query, opts) => {
+		const { sessionSearch } = await import("./commands/session.js");
+		await sessionSearch(query, opts);
+	});
+
+sessionCmd
+	.command("read <session-id>")
+	.description("Read one uploaded session and its message content")
+	.option("--json", "Output metadata and messages as JSON")
+	.addHelpText("after", "\nUse the cloud session UUID printed by `iforge session search`.")
+	.action(async (sessionId, opts) => {
+		const { sessionRead } = await import("./commands/session.js");
+		await sessionRead(sessionId, opts);
+	});
+
+sessionCmd
+	.command("export <session-id>")
+	.description("Export an uploaded Cloud session as Markdown to stdout")
+	.option("--json", "Export owner metadata and messages as JSON instead")
+	.action(async (id, opts) => {
+		const { sessionExport } = await import("./commands/session.js");
+		await sessionExport(id, opts);
+	});
+
+sessionCmd
+	.command("share <session-id>")
+	.description("Publish an immutable public snapshot (user-level auth)")
+	.option("-y, --yes", "Confirm public publication without prompting")
+	.option("--through <position>", "Include messages through this zero-based position")
+	.option("--response <position>", "Share only the assistant response at this zero-based position")
+	.option("--json", "Output link metadata as JSON")
+	.action(async (id, opts) => {
+		const { sessionShareCreate } = await import("./commands/session.js");
+		await sessionShareCreate(id, opts);
+	});
+sessionCmd
+	.command("shares [session-id]")
+	.description("List active snapshot and legacy links")
+	.option("--page <n>", "Page number", "1")
+	.option("--limit <n>", "Page size (1-100)", "25")
+	.option("--json", "Output as JSON")
+	.action(async (id, opts) => {
+		const { sessionShareList } = await import("./commands/session.js");
+		await sessionShareList(id, opts);
+	});
+sessionCmd
+	.command("unshare <share-id>")
+	.option("--legacy", "Revoke a legacy live link (kind=live in session shares)")
+	.option("-y, --yes", "Confirm revocation without prompting")
+	.description("Revoke the exact snapshot or legacy link ID from session shares")
+	.option("--json", "Output as JSON")
+	.action(async (id, opts) => {
+		const { sessionShareRevoke } = await import("./commands/session.js");
+		await sessionShareRevoke(id, opts);
+	});
+
+sessionCmd
+	.command("extract <session-id>")
+	.description("Extract memories from a session via the cloud's configured LLM")
+	.option("--json", "Output result as JSON")
+	.addHelpText(
+		"after",
+		`
+Examples:
+  $ iforge session extract a1b2c3d4-...
+  $ iforge session extract a1b2c3d4-... --json
+  # Loop the recent 10 sessions (the onboarding skill does this):
+  $ iforge session list --limit 10 --json | \\
+      jq -r '.[].id' | \\
+      xargs -I{} iforge session extract {} --json`,
+	)
+	.action(async (sessionId, opts) => {
+		const { sessionExtract } = await import("./commands/session.js");
+		await sessionExtract(sessionId, opts);
+	});
+
+// ─────────────────────────────────────────────────────────────
+// memory
+// ─────────────────────────────────────────────────────────────
+const memoryCmd = program.command("memory").description("Manage memories");
+
+memoryCmd
+	.command("list")
+	.description("List memories")
+	.option("--json", "Output as JSON")
+	.option("--limit <n>", "Max number of memories")
+	.option("--category <cat>", "Filter by category (fact/preference/pattern/decision/context)")
+	.action(async (opts) => {
+		const { memoryList } = await import("./commands/memory.js");
+		await memoryList(opts);
+	});
+
+memoryCmd
+	.command("search <query>")
+	.description("Search memories by text")
+	.option("--json", "Output as JSON")
+	.option("--limit <n>", "Max number of memories")
+	.option("--category <cat>", "Filter by category")
+	.addHelpText(
+		"after",
+		'\nExamples:\n  $ iforge memory search redis\n  $ iforge memory search "typing styles" --limit 5',
+	)
+	.action(async (query, opts) => {
+		const { memorySearch } = await import("./commands/memory.js");
+		await memorySearch(query, opts);
+	});
+
+memoryCmd
+	.command("add <content>")
+	.description("Add a memory")
+	.option(
+		"--category <cat>",
+		"One of: fact, preference, pattern, decision, context (default: fact)",
+	)
+	.action(async (content, opts) => {
+		const { memoryAdd } = await import("./commands/memory.js");
+		await memoryAdd(content, opts);
+	});
+
+memoryCmd
+	.command("update <id> <content>")
+	.description("Replace exact memory content, preserving metadata; use the full ID")
+	.option("--json", "Output as JSON")
+	.action(async (id, content, opts) => {
+		const { memoryUpdate } = await import("./commands/memory.js");
+		await memoryUpdate(id, content, opts);
+	});
+
+memoryCmd
+	.command("rm <id>")
+	.description("Delete a memory")
+	.action(async (id) => {
+		const { memoryRm } = await import("./commands/memory.js");
+		await memoryRm(id);
+	});
+
+// ─────────────────────────────────────────────────────────────
+// doctor / update
+// ─────────────────────────────────────────────────────────────
+program
+	.command("doctor")
+	.description("Diagnose auth, agents, vault, and MCP connectivity")
+	.option("--json", "Output as JSON")
+	.addHelpText("after", "\nExamples:\n  $ iforge doctor\n  $ iforge doctor --json")
+	.action(async (opts) => {
+		const { doctor } = await import("./commands/doctor.js");
+		await doctor(opts);
+	});
+
+program
+	.command("capabilities", { hidden: true })
+	.description("Show CLI feature surface and hosted policy restrictions")
+	.option("--json", "Output as JSON")
+	.action(async (opts: { json?: boolean }) => {
+		const { capabilitiesCommand } = await import("./commands/capabilities.js");
+		await capabilitiesCommand(
+			opts,
+			program.commands.map((command) => command.name()),
+		);
+	});
+
+program
+	.command("update")
+	.description("Install the latest CLI through the current installation owner")
+	.option("--check", "Only check for updates, don't install")
+	.option("--json", "Output as JSON")
+	.addOption(new Option("--background-worker").hideHelp())
+	.addOption(new Option("--current-version <version>").hideHelp())
+	.addOption(new Option("--channel <channel>").hideHelp())
+	.addOption(new Option("--latest <version>").hideHelp())
+	.addOption(new Option("--native-identity").hideHelp())
+	.addOption(new Option("--native-activate").hideHelp())
+	.addOption(new Option("--native-stage <path>").hideHelp())
+	.addOption(new Option("--native-prefix <path>").hideHelp())
+	.addOption(new Option("--native-version <version>").hideHelp())
+	.addOption(new Option("--native-target <target>").hideHelp())
+	.addOption(new Option("--native-lock-timeout-ms <milliseconds>").hideHelp())
+	.action(async (opts) => {
+		if (opts.nativeIdentity) {
+			const { nativeIdentityOutput } = await import("./lib/native-activation.js");
+			console.log(nativeIdentityOutput());
+			return;
+		}
+		if (opts.nativeActivate) {
+			const { activateStagedNativeRelease } = await import("./lib/native-activation.js");
+			const { isNativeTarget } = await import("./lib/native-release-manifest.js");
+			if (
+				!opts.nativeStage ||
+				!opts.nativePrefix ||
+				!opts.nativeVersion ||
+				!opts.nativeTarget ||
+				!isNativeTarget(opts.nativeTarget)
+			) {
+				throw new Error("native activation requires a valid stage, prefix, version, and target");
+			}
+			const timeoutMs =
+				opts.nativeLockTimeoutMs === undefined ? undefined : Number(opts.nativeLockTimeoutMs);
+			if (timeoutMs !== undefined && (!Number.isFinite(timeoutMs) || timeoutMs < 0)) {
+				throw new Error("native activation lock timeout must be a non-negative number");
+			}
+			let result: Awaited<ReturnType<typeof activateStagedNativeRelease>>;
+			try {
+				result = await activateStagedNativeRelease(
+					{
+						stageDir: opts.nativeStage,
+						prefix: opts.nativePrefix,
+						version: opts.nativeVersion,
+						target: opts.nativeTarget,
+					},
+					timeoutMs === undefined ? undefined : { timeoutMs },
+				);
+			} catch (error) {
+				const { PrivateDirectoryLockTimeoutError } = await import(
+					"./lib/private-directory-lock.js"
+				);
+				if (error instanceof PrivateDirectoryLockTimeoutError) {
+					process.exitCode = 75;
+					return;
+				}
+				throw error;
+			}
+			console.log(result.launcher);
+			return;
+		}
+		const { runBackgroundUpdateWorker, update } = await import("./commands/update.js");
+		if (opts.backgroundWorker) {
+			if (!opts.currentVersion || !opts.channel) {
+				throw new Error("background update worker requires current version and channel");
+			}
+			const result = await runBackgroundUpdateWorker({
+				currentVersion: opts.currentVersion,
+				channel: opts.channel,
+				latest: opts.latest,
+			});
+			if (result === "failed") process.exitCode = 1;
+			return;
+		}
+		await update(opts);
+	});
+
+// ─────────────────────────────────────────────────────────────
+// mcp / run
+// ─────────────────────────────────────────────────────────────
+program
+	.command("mcp")
+	.description("Start MCP server (stdio transport, used by agents)")
+	.option("--api-url <url>", "Override IFORGE_API_URL for this MCP process")
+	.option("--auth-token-file <path>", "Read IFORGE_AUTH_TOKEN from an owner-only file")
+	.action(async (opts: { apiUrl?: string; authTokenFile?: string }) => {
+		const apiUrl = opts.apiUrl?.trim();
+		if (apiUrl) process.env.CLAWDI_API_URL = apiUrl;
+		loadAuthTokenFile(opts.authTokenFile);
+		const { startMcpServer } = await import("./mcp/server.js");
+		await startMcpServer();
+	});
+
+program
+	.command("run")
+	.description("Run a command with iforge:// references resolved")
+	.option("-p, --project <id-or-slug>", "Resolve references from an explicit Project")
+	.option("-a, --agent <agent-id-or-type>", "Resolve through Workspace and linked Projects")
+	.option(
+		"--env-file <file>",
+		"Load dotenv-like file and resolve iforge:// references",
+		(value, previous: string[]) => [...previous, value],
+		[],
+	)
+	.option("--no-inherit-env", "Do not inherit the parent process environment")
+	.option("--all-vault-env", "Legacy mode: inject every vault env value from the selected Project")
+	.option(
+		"--allow-conflicts",
+		"Allow first-match wins for Workspace and linked-Project Vault conflicts",
+	)
+	.option("--no-project-folder", "Skip linked-folder Project lookup")
+	.option("--dry-run", "Show reference resolution plan without launching the command")
+	.addOption(
+		new Option(
+			"--runtime-service <runtime+service>",
+			"Run an internal hosted runtime service",
+		).hideHelp(),
+	)
+	.argument("<command...>", "Command to run")
+	.addHelpText(
+		"after",
+		`
+Examples:
+  $ iforge project folder link --project engineering
+  $ iforge run --dry-run --env-file .env.iforge -- npm run dev
+  $ iforge run --env-file .env.iforge -- npm run dev
+  ✓ Resolved 2 iforge references
+
+  $ iforge run --project @alice/engineering --env-file .env.iforge -- npm run dev
+  $ iforge run --all-vault-env -- npm run dev
+  $ iforge run --no-project-folder -- python main.py
+
+Scope resolution:
+  Exact iforge://project/... references carry their own project.
+  Otherwise --project wins, then --agent, then linked folder, then default-write project.`,
+	)
+	.action(async (args, opts) => {
+		const { run } = await import("./commands/run.js");
+		await run(args, opts);
+	});
+
+const projectCmd = program
+	.command("project")
+	.description("Manage projects, people, invites, links, and shared access")
+	.addHelpText(
+		"after",
+		`
+Folder-link workflow:
+  $ iforge project folder link --project engineering
+  $ iforge project folder status
+  $ iforge run -- npm run deploy
+
+Notes:
+	  project list shows user-created and shared Projects by default.
+	  Use project list --include-workspaces to inspect Agent Workspaces.`,
+	);
+
+projectCmd
+	.command("create <name>")
+	.description("Create a project")
+	.option("--slug <slug>", "Optional stable slug (lowercase letters, numbers, hyphens)")
+	.option("--json", "Emit machine-readable JSON (agent contract)")
+	.addHelpText(
+		"after",
+		"\nExamples:\n" +
+			'  $ iforge project create "Engineering toolkit"\n' +
+			'  $ iforge project create "Client Alpha" --slug client-alpha --json',
+	)
+	.action(async (name: string, opts: { slug?: string; json?: boolean }) => {
+		const { projectCreateCommand } = await import("./commands/project-create.js");
+		await projectCreateCommand(name, opts);
+	});
+
+projectCmd
+	.command("list")
+	.description("List owned projects and projects shared with you")
+	.option("--json", "Emit machine-readable JSON (agent contract)")
+	.option("--shared-with-me", "Show only projects shared with you")
+	.option("--owned", "Show only projects you own")
+	.option("--include-workspaces", "Include Agent Workspaces")
+	.addOption(new Option("--include-envs").hideHelp())
+	.addHelpText(
+		"after",
+		"\nExamples:\n  $ iforge project list\n  $ iforge project list --include-workspaces\n  $ iforge project list --shared-with-me --json",
+	)
+	.action(
+		async (opts: {
+			json?: boolean;
+			sharedWithMe?: boolean;
+			owned?: boolean;
+			includeEnvs?: boolean;
+			includeWorkspaces?: boolean;
+		}) => {
+			const { projectListCommand } = await import("./commands/project-list.js");
+			await projectListCommand({
+				...opts,
+				includeEnvs: opts.includeWorkspaces === true || opts.includeEnvs === true,
+			});
+		},
+	);
+
+projectCmd
+	.command("show <project>")
+	.description("Show project content, role, owner, and next actions")
+	.option("--json", "Emit machine-readable JSON (agent contract)")
+	.action(async (project: string, opts: { json?: boolean }) => {
+		const { projectShowCommand } = await import("./commands/project-show.js");
+		await projectShowCommand(project, opts);
+	});
+
+const projectFolderCmd = projectCmd
+	.command("folder")
+	.description("Link local folders to Projects for automatic vault env selection");
+
+projectFolderCmd
+	.command("link [path]")
+	.description("Use this folder with a Project")
+	.requiredOption("-p, --project <id-or-slug>", "Project UUID, slug, or owner-qualified slug")
+	.addHelpText(
+		"after",
+		`
+Examples:
+  $ iforge project folder link --project engineering
+  $ iforge project folder link ~/work/client-a --project @alice/engineering`,
+	)
+	.action(async (path: string | undefined, opts: { project: string }) => {
+		const { projectFolderLinkCommand } = await import("./commands/project-folders.js");
+		await projectFolderLinkCommand(path, opts);
+	});
+
+projectFolderCmd
+	.command("unlink [path]")
+	.description("Stop using this folder with its linked Project")
+	.addHelpText(
+		"after",
+		`
+Examples:
+  $ iforge project folder unlink
+  $ iforge project folder unlink ~/work/client-a`,
+	)
+	.action(async (path: string | undefined) => {
+		const { projectFolderUnlinkCommand } = await import("./commands/project-folders.js");
+		await projectFolderUnlinkCommand(path);
+	});
+
+projectFolderCmd
+	.command("status [path]")
+	.description("Show which Project iforge run will use for a folder")
+	.addHelpText(
+		"after",
+		`
+Examples:
+  $ iforge project folder status
+  $ iforge project folder status ~/work/client-a`,
+	)
+	.action(async (path: string | undefined) => {
+		const { projectFolderStatusCommand } = await import("./commands/project-folders.js");
+		await projectFolderStatusCommand(path);
+	});
+
+projectCmd
+	.command("share [project]")
+	.description("Create a viewer project share link")
+	.option("-l, --label <text>", "Optional label shown in the share-links list")
+	.action(async (project: string | undefined, opts: { label?: string }) => {
+		const { projectShareCommand } = await import("./commands/project-share.js");
+		await projectShareCommand(project, opts);
+	});
+
+projectCmd
+	.command("share-links <project>")
+	.description("List or revoke viewer project links")
+	.option("--revoke <id-or-prefix>", "Revoke a specific link")
+	.action(async (project: string, opts: { revoke?: string }) => {
+		const { projectShareLinksCommand } = await import("./commands/project-share-links.js");
+		await projectShareLinksCommand(project, opts);
+	});
+
+projectCmd
+	.command("invite <project>")
+	.description("Invite a person to viewer project access")
+	.requiredOption("-e, --email <addr>", "Email address to invite")
+	.action(async (project: string, opts: { email: string }) => {
+		const { projectInviteCommand } = await import("./commands/project-invite.js");
+		await projectInviteCommand(project, opts);
+	});
+
+projectCmd
+	.command("invites <project>")
+	.description("List or cancel pending project invites")
+	.option("--cancel <id>", "Cancel one of the pending invitations on this project")
+	.addHelpText(
+		"after",
+		"\n  Recipient side (listing / accepting / declining invitations addressed to you)\n" +
+			"  lives under `iforge inbox`.",
+	)
+	.action(async (project: string, opts: { cancel?: string }) => {
+		const { projectInvitesCommand } = await import("./commands/project-invites.js");
+		await projectInvitesCommand(project, opts);
+	});
+
+projectCmd
+	.command("members <project>")
+	.description("List or remove people with project access")
+	.option("--remove <email-or-user-id>", "Remove one accepted member")
+	.option("--json", "Emit machine-readable JSON (agent contract)")
+	.addHelpText(
+		"after",
+		"\nExample:\n  $ iforge project members engineering --remove bob@example.com",
+	)
+	.action(async (project: string, opts: { remove?: string; json?: boolean }) => {
+		const { projectMembersCommand } = await import("./commands/project-members.js");
+		await projectMembersCommand(project, opts);
+	});
+
+projectCmd
+	.command("leave <project>")
+	.description("Leave a project shared with you")
+	.option("--json", "Emit machine-readable JSON (agent contract)")
+	.addHelpText("after", "\nExample:\n  $ iforge project leave @alice-cdbf/engineering")
+	.action(async (project: string, opts: { json?: boolean }) => {
+		const { projectLeaveCommand } = await import("./commands/project-members.js");
+		await projectLeaveCommand(project, opts);
+	});
+
+projectCmd
+	.command("unshare <project>")
+	.description("Owner: revoke links, cancel invites, and remove accepted viewers")
+	.option("--json", "Emit machine-readable JSON (agent contract)")
+	.addHelpText("after", "\nExample:\n  $ iforge project unshare engineering")
+	.action(async (project: string, opts: { json?: boolean }) => {
+		const { projectUnshareCommand } = await import("./commands/project-members.js");
+		await projectUnshareCommand(project, opts);
+	});
+
+const agentCmd = program.command("agent").description("Manage agents");
+
+const agentSkillsCmd = agentCmd
+	.command("skills")
+	.description("Manage remote Cloud Agent Skills (not local --agent types)");
+agentSkillsCmd
+	.command("list <agent-id>")
+	.description("List remote desired Skills, capabilities and observed convergence")
+	.option("--json", "Output as JSON")
+	.action(async (id, opts) => {
+		const { agentSkillsList } = await import("./commands/agent-skills.js");
+		await agentSkillsList(id, opts);
+	});
+agentSkillsCmd
+	.command("read <agent-id> <skill-key>")
+	.description("Read remote Skill detail using its exact inventory key")
+	.option("--json", "Output as JSON")
+	.action(async (id, key, opts) => {
+		const { agentSkillsRead } = await import("./commands/agent-skills.js");
+		await agentSkillsRead(id, key, opts);
+	});
+agentSkillsCmd
+	.command("install <agent-id>")
+	.description("Request a public GitHub Skill or Library reference; inspect list for application")
+	.option("--github <repo>", "Public GitHub owner/repo or URL")
+	.option("--path <directory>", "Skill directory within the GitHub repository")
+	.option("--library <skill-id>", "Cloud Library Skill UUID")
+	.option("--request-id <uuid>", "GitHub mutation idempotency key (generated if omitted)")
+	.option(
+		"--resource-version <version>",
+		"Original resource version for exact replay with --request-id",
+	)
+	.option("--json", "Output as JSON")
+	.action(async (id, opts) => {
+		const { agentSkillsInstall } = await import("./commands/agent-skills.js");
+		await agentSkillsInstall(id, opts);
+	});
+agentSkillsCmd
+	.command("rm <agent-id> <skill-key>")
+	.description("Request removal by exact remote inventory key; linked/bundled Skills are read-only")
+	.option("--request-id <uuid>", "GitHub mutation idempotency key (generated if omitted)")
+	.option(
+		"--resource-version <version>",
+		"Original resource version for exact replay with --request-id",
+	)
+	.option("--json", "Output as JSON")
+	.action(async (id, key, opts) => {
+		const { agentSkillsRemove } = await import("./commands/agent-skills.js");
+		await agentSkillsRemove(id, key, opts);
+	});
+
+agentCmd
+	.command("detect")
+	.description("Detect supported local agents without changing them")
+	.option("--json", "Emit machine-readable JSON")
+	.action(async (opts: { json?: boolean }) => {
+		const { agentDetectCommand } = await import("./commands/agent-detect.js");
+		await agentDetectCommand(opts);
+	});
+
+agentCmd
+	.command("reconnect [agent-id]")
+	.description("Recover a local Agent binding without creating a new cloud identity")
+	.option("--agent <type>", `Agent type (${AGENT_TYPE_HELP_LABEL})`)
+	.option("-y, --yes", "Skip confirmation when the target is unambiguous")
+	.option("--confirm-takeover", "Confirm disconnecting a recently active installation")
+	.option("--no-daemon", "Skip installing/starting background sync daemons")
+	.addOption(new Option("--desktop-list").hideHelp())
+	.addHelpText(
+		"after",
+		"\nExamples:\n  $ iforge agent reconnect --agent codex\n  $ iforge agent reconnect <agent-id>\n  $ iforge agent reconnect <agent-id> --no-daemon",
+	)
+	.action(async (agentId: string | undefined, opts) => {
+		const { agentReconnect } = await import("./commands/agent-reconnect.js");
+		await agentReconnect(agentId, opts);
+	});
+
+const agentCredentialsCmd = agentCmd
+	.command("credentials")
+	.description("Sync local CLI credential profiles");
+
+agentCredentialsCmd
+	.command("import <tool>")
+	.description("Import a personal local CLI credential profile into iforge Vault")
+	.option("-p, --project <id-or-slug>", "Target a specific project")
+	.option("--profile <name>", "Profile name", "default")
+	.option("--source <source>", "Credential source: file or keychain", "file")
+	.option("--from <path>", "Credential file to import (required for tools without an adapter)")
+	.option("--to <path>", "Materialization target path to store with the profile")
+	.option("--keychain-service <service>", "macOS Keychain service name for --source keychain")
+	.option("--keychain-account <account>", "macOS Keychain account name for --source keychain")
+	.option("-y, --yes", "Skip confirmation prompt")
+	.option("--dry-run", "Show what would be imported without storing anything")
+	.option("--json", "Emit machine-readable JSON")
+	.addHelpText(
+		"after",
+		`
+Examples:
+  $ iforge agent credentials import claude-code
+  $ iforge agent credentials import claude-code --source keychain --keychain-service <service> --keychain-account <account>
+  $ iforge agent credentials import gh
+  $ iforge agent credentials import aws --from ~/.aws/credentials --to ~/.aws/credentials
+
+Codex model-provider auth:
+  $ iforge ai-provider import-auth openai-codex --tool codex`,
+	)
+	.action(async (tool: string, opts) => {
+		const { agentCredentialsImportCommand } = await import("./commands/agent-credentials.js");
+		await agentCredentialsImportCommand(tool, opts);
+	});
+
+agentCredentialsCmd
+	.command("materialize <tool>")
+	.description("Recreate a personal local CLI credential profile on this machine")
+	.option("-p, --project <id-or-slug>", "Read from a specific project")
+	.option("--profile <name>", "Profile name", "default")
+	.option("--to <path>", "Override destination path (only for single-file profiles)")
+	.option("-y, --yes", "Skip confirmation prompt")
+	.option("--no-backup", "Overwrite existing files without creating .bak-* copies")
+	.option("--dry-run", "Show what would be written without changing files")
+	.option("--json", "Emit machine-readable JSON")
+	.addHelpText(
+		"after",
+		`
+Examples:
+  $ iforge agent credentials materialize claude-code
+  $ iforge agent credentials materialize gh
+  $ iforge agent credentials materialize aws --profile work --to ~/.aws/credentials`,
+	)
+	.action(async (tool: string, opts) => {
+		const { agentCredentialsMaterializeCommand } = await import("./commands/agent-credentials.js");
+		await agentCredentialsMaterializeCommand(tool, opts);
+	});
+
+const agentProjectsCmd = agentCmd
+	.command("projects")
+	.description("View Workspace and linked Projects");
+
+agentProjectsCmd
+	.command("list <agent-id>")
+	.description("Show Workspace and linked-Project Vault priority")
+	.option("--json", "Emit machine-readable JSON (agent contract)")
+	.action(async (agentId, opts) => {
+		const { agentProjectsListCommand } = await import("./commands/agent-projects.js");
+		await agentProjectsListCommand(agentId, opts);
+	});
+
+agentProjectsCmd
+	.command("link <agent-id>")
+	.alias("attach")
+	.description("Link a Project for Vault resolution")
+	.requiredOption("-p, --project <id-or-slug>", "Project UUID, slug, name, or @owner/slug")
+	.option("--order <n>", "Vault resolution priority (>=1)")
+	.action(async (agentId, opts) => {
+		const { agentProjectsAddContextCommand } = await import("./commands/agent-projects.js");
+		await agentProjectsAddContextCommand(agentId, opts);
+	});
+
+agentProjectsCmd
+	.command("unlink <agent-id>")
+	.alias("detach")
+	.description("Unlink a Project from Vault resolution")
+	.requiredOption("-p, --project <id-or-slug>", "Project UUID, slug, name, or @owner/slug")
+	.action(async (agentId, opts) => {
+		const { agentProjectsRemoveContextCommand } = await import("./commands/agent-projects.js");
+		await agentProjectsRemoveContextCommand(agentId, opts);
+	});
+
+agentProjectsCmd
+	.command("move <agent-id>")
+	.description("Update Vault resolution priority")
+	.option(
+		"--item <id:order>",
+		"Linked Project relation id and target Vault priority (repeatable)",
+		collectValues,
+		[] as string[],
+	)
+	.addHelpText(
+		"after",
+		"\nExample:\n  $ iforge agent projects move <agent-id> --item <id>:1 --item <id>:2",
+	)
+	.action(async (agentId, opts) => {
+		const { agentProjectsReorderCommand } = await import("./commands/agent-projects.js");
+		await agentProjectsReorderCommand(agentId, opts);
+	});
+
+// ─────────────────────────────────────────────────────────────
+// inbox — incoming invitations and share URLs awaiting my action.
+// ─────────────────────────────────────────────────────────────
+const inboxCmd = program
+	.command("inbox")
+	.description("Incoming project invites and share links")
+	.option("--json", "Emit machine-readable JSON (agent contract)")
+	.action(async (opts) => {
+		// `iforge inbox` (no subcommand) → list pending invitations
+		const { inboxListCommand } = await import("./commands/inbox.js");
+		await inboxListCommand(opts);
+	});
+
+inboxCmd
+	.command("accept [id-or-url]")
+	.description("Accept an invitation, or stage/join a share link based on auth state")
+	.option("--invite <id>", "Explicit invitation UUID (bypass shape detection)")
+	.option("--url <link>", "Explicit share URL (bypass shape detection)")
+	.option(
+		"-a, --agent <agent-id>",
+		"Link the accepted Project to one or more Agents (repeat or comma-separate)",
+		collectCsvValues,
+		[] as string[],
+	)
+	.option("--use-as <attached>", "Link to --agent (compatibility value: attached)")
+	.option("--json", "Emit machine-readable JSON (agent contract)")
+	.addHelpText(
+		"after",
+		`
+Examples:
+  Human-friendly (polymorphic):
+    $ iforge inbox accept https://clawdi.ai/share/abc...
+    $ iforge inbox accept 1a2b3c4d-...    # invitation id
+
+  Accept and link to Agent:
+    $ iforge inbox accept --url <link> --agent <agent-id>
+    $ iforge inbox accept --invite <id> --agent <agent-id>`,
+	)
+	.action(async (idOrUrl, opts) => {
+		const { inboxAcceptCommand } = await import("./commands/inbox.js");
+		await inboxAcceptCommand(idOrUrl, opts);
+	});
+
+inboxCmd
+	.command("join <project-id>")
+	.description("Explicitly join one locally staged project share")
+	.option(
+		"-a, --agent <agent-id>",
+		"Link the joined Project to one or more Agents (repeat or comma-separate)",
+		collectCsvValues,
+		[] as string[],
+	)
+	.option("--use-as <attached>", "Link to --agent (compatibility value: attached)")
+	.option("--json", "Emit machine-readable JSON (agent contract)")
+	.addHelpText(
+		"after",
+		`
+Example:
+  $ iforge auth login
+  $ iforge inbox join <project-id>
+  $ iforge pull --project <project-id>`,
+	)
+	.action(async (projectId, opts) => {
+		const { inboxJoinCommand } = await import("./commands/inbox.js");
+		await inboxJoinCommand(projectId, opts);
+	});
+
+inboxCmd
+	.command("decline <id>")
+	.description("Decline a pending invitation")
+	.action(async (id) => {
+		const { inboxDeclineCommand } = await import("./commands/inbox.js");
+		await inboxDeclineCommand(id);
+	});
+
+inboxCmd
+	.command("forget <project-id>")
+	.description("Local-only: remove a share record and its cached files")
+	.action(async (projectId) => {
+		const { inboxForgetCommand } = await import("./commands/inbox.js");
+		await inboxForgetCommand(projectId);
+	});
+
+// Auto-update tick: prints any "✓ Updated to v…" notice from a previous
+// run's background install, and (when due) kicks off another detached
+// install. Best-effort and fully off-the-hot-path — see commands/update.ts.
+(async () => {
+	try {
+		const { maybeAutoUpdate } = await import("./commands/update.js");
+		await maybeAutoUpdate();
+	} catch {
+		// auto-update is opportunistic; never let it kill the CLI invocation
+	}
+	await program.parseAsync().catch(handleError);
+})();

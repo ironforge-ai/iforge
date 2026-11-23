@@ -1,0 +1,864 @@
+# Changelog
+
+*Every entry at or below CLI v0.13.43 was published while this product carried a
+different name. Only the name changed; the releases themselves are unchanged, and
+their tags, package versions and dates are recorded here exactly as they shipped.*
+
+This changelog tracks notable user-facing iforge releases. It is written for
+people using or upgrading iforge, so it intentionally omits internal deployment,
+database migration, CI, and implementation details.
+
+- iforge app/backend/web releases use `iforge-YYYY-MM-DD` for the first UTC
+  release of a day, then `iforge-YYYY-MM-DD-2`, `-3`, and so on for
+  additional releases that same day. Older releases published under the previous
+  name use `clawdi-YYYY-MM-DD` or the dotted `clawdi-v...` CalVer tag format.
+- CLI/npm releases use `iforge-cli-vX.Y.Z`. Older releases published under the
+  previous name use `clawdi-cli-vX.Y.Z`.
+
+## iforge CLI v0.13.43
+
+Package: `clawdi@0.13.43`
+
+### Fixed
+
+- Hosted runtime platform roots keep their systemd-defined access modes:
+  the CLI no longer re-asserts modes on `/etc/clawdi`, `/var/lib/clawdi`,
+  `/var/cache/clawdi`, or `/run/clawdi` when it writes files inside them, so
+  the root-owned `0700` configuration and cache boundaries stay closed to
+  the tenant user.
+
+## iforge CLI v0.13.42
+
+Package: `clawdi@0.13.42`
+
+### Fixed
+
+- Transparent egress on every tenant: the runtime now publishes
+  `transparent-egress.env` owned by root with a mode that lets the numeric
+  egress identity read it, so the mitmproxy add-on can load the tenant's
+  mTLS and copy rules instead of failing convergence.
+
+## iforge CLI v0.13.41
+
+Package: `clawdi@0.13.41`
+
+### Fixed
+
+- Hosted convergence now refuses to run unless the resolved runtime identity
+  matches the tenant contract, so a stray `HOME` can no longer redirect a tenant
+  into the wrong home or let installers run as root.
+- The shared `/run/clawdi` root is owned solely by the boot preparation unit,
+  and convergence can no longer recreate a missing platform root.
+- External runtime probes, installs, and uninstalls are bounded, so a wedged
+  third-party CLI fails convergence instead of hanging it.
+
+## iforge CLI v0.13.40
+
+Package: `clawdi@0.13.40`
+
+### Changed
+
+- The hosted runtime context is now the single file `/etc/clawdi/runtime-context.json`
+  instead of a directory containing one identically named file.
+- Hosted platform data follows FHS and systemd conventions: configuration under
+  `/etc/clawdi`, durable state under `/var/lib/clawdi`, disposable data under
+  `/var/cache/clawdi`, and runtime data under `/run/clawdi`. systemd owns these
+  roots through its directory directives, and every status file now lives in one
+  place. Tenant tools use their own npm and XDG defaults.
+
+## iforge CLI v0.13.38
+
+Package: `clawdi@0.13.38`
+
+### Fixed
+
+- Hosted runtime convergence now uses one probed privilege-drop strategy for
+  runtime-user CA checks, systemd operations, installers, and launched services,
+  without depending on `gosu`.
+
+## iforge CLI v0.13.36
+
+Package: `clawdi@0.13.36`
+
+### Changed
+
+- Hosted runtime manifests now use the exact `clawdiCli.packageSpec` as their
+  sole desired CLI version, with exact installation, verification, atomic
+  activation, and self-re-exec completed before manifest convergence.
+
+## iforge CLI v0.13.13
+
+Package: `clawdi@0.13.13`
+
+### Changed
+
+- Agent filesystem Skills are now the authoritative local copies and appear in
+  Cloud as read-only projections. Cloud-owned workspace and personal Project
+  Skills remain explicitly importable.
+- The local MCP process now forwards complete tool definitions and results
+  without rebuilding dynamic schemas.
+
+### Fixed
+
+- Bundled platform Skills and MCP resources no longer appear as user-managed
+  inventory.
+- Mixed-version Skill sync now pauses safely instead of overwriting or deleting
+  Agent-owned files.
+
+## iforge CLI v0.13.12
+
+Package: `clawdi@0.13.12`
+
+### Fixed
+
+- Made Hosted runtime reconciliation recover live systemd drift without
+  redundant restarts, reject stale generations, verify managed installer state,
+  and keep rollback snapshots within root-controlled paths.
+- Reduced deployment readiness latency while bounding retry load.
+
+## iforge CLI v0.13.11
+
+Package: `clawdi@0.13.11`
+
+### Added
+
+- Added the recommended native curl installer for macOS x64/arm64 and Linux
+  x64/arm64 systems, including glibc and musl builds with bundled skills and
+  egress resources.
+
+### Changed
+
+- CLI updates now follow the current installation owner: native installs use
+  checksum-verified exact release assets, npm/Bun installs use exact npm
+  versions, and Hosted remains a separate exact-version npm authority.
+
+### Fixed
+
+- Improved local update transaction fencing, daemon restart lifecycle,
+  share-token handling, and immutable release recovery.
+
+## iforge CLI v0.12.10-beta.57
+
+Package: `clawdi@0.12.10-beta.57`
+
+### Fixed
+
+- Managed Telegram method and file requests now keep agent-link credentials out
+  of Cloud request URLs while preserving standard Telegram Bot API client
+  behavior.
+- Managed runtime CA trust bundles are readable only by root and the runtime
+  user's primary group, including after an existing bundle is replaced.
+
+## iforge CLI v0.12.10-beta.55
+
+Package: `clawdi@0.12.10-beta.55`
+
+### Changed
+
+- Hosted manifests no longer carry host-owned user, home, workspace,
+  persistence, or runtime path fields. Hosted runtime paths derive HOME,
+  installer home, persistent home, workspace, and process working directories
+  from the `/home/clawdi` runtime contract, while local workspaces remain
+  `$HOME/clawdi`.
+
+## iforge CLI v0.12.10-beta.54
+
+Published immutable package: `clawdi@0.12.10-beta.54`
+
+### Fixed
+
+- Fixed a hosted runtime reboot deadlock: persistently enabled runtime user
+  units referenced a convergence-generated environment file that only exists
+  after boot-time convergence, tripping the systemd start limit and blocking
+  the official installer's restart. Units now declare the dependency with
+  `ConditionPathExists`, convergence clears failed unit state, and the
+  converged drop-in and environment file are written before the official
+  installer runs, so deployments created by earlier CLI versions self-heal on
+  their next restart without manual intervention.
+- Hosted convergence no longer fails on hosts without a reachable systemd user
+  bus when reloading the user manager before official service installs.
+- Vault reads and writes now use a stable identity across operations.
+- Runtime bridge assets are cached by content hash for reliable serving.
+
+## iforge CLI v0.12.10-beta.53
+
+Package: `clawdi@0.12.10-beta.53`
+
+### Changed
+
+- Added explicit unmanaged provider convergence for runtime-only OpenClaw and
+  Hermes deployments, including exact empty-provider health and safe removal of
+  only iforge-owned runtime projections.
+- Decoupled the fixed Hosted Codex terminal tool from runtime provider choice.
+  The CLI now maintains its single default config and process-scoped managed
+  egress shim without leaking provider material into unmanaged runtime units.
+  Hosted Codex is installed and verified at the audited exact
+  `@openai/codex@0.142.4` version.
+- Restricted managed provider egress credential replacement to requests carrying
+  the exact iforge placeholder marker, so user bearer tokens and unauthenticated
+  requests to the same host remain untouched.
+
+## iforge CLI v0.12.10-beta.52
+
+Release: https://github.com/Clawdi-AI/clawdi/releases/tag/clawdi-cli-v0.12.10-beta.52
+
+Package: `clawdi@0.12.10-beta.52`
+
+### Changed
+
+- Finalized the immutable Agent v2 CLI bundle with a single applied-state
+  authority and fail-closed hosted runtime convergence.
+
+## iforge CLI v0.12.10-beta.51
+
+Release: https://github.com/Clawdi-AI/clawdi/releases/tag/clawdi-cli-v0.12.10-beta.51
+
+Package: `clawdi@0.12.10-beta.51`
+
+### Changed
+
+- Added the strict hosted locale contract for supported response languages and
+  IANA timezones. The CLI now preserves user-authored agent identity files while
+  maintaining a delimited locale instruction block, projects runtime-native
+  timezone settings, and restarts only affected runtime services.
+- Added immediate hosted runtime manifest convergence from environment-scoped
+  SSE notifications while retaining 15-second ETag polling and five-minute
+  self-healing when the notification channel is unavailable.
+- Made the hosted manifest fail closed on unknown fields and require explicit
+  `runtime`, `minimumCliVersion`, `controlPlane.cloudApiUrl`, and the canonical
+  `environmentId` identity, without inference, `appId`, datasource, or
+  deployment fallbacks.
+- Restricted runtime bindings, provider transport fields, runtime paths, and
+  OpenClaw Control UI origins to the canonical Hosted wire shape.
+- Required explicit Hosted system user, home, workspace, persistent paths, and
+  runtime home/workspace paths instead of deriving image-default locations.
+- Required a non-empty unique Hosted runtime provider selection and a structured
+  primary model constrained to that selection.
+- Required the selected Hosted runtime to include exactly
+  `install: {source: "official"}` while the CLI remains the sole owner of the
+  official installer URL and argument vector.
+- Required Hosted provider `kind` to be exactly `openai-compatible`, and
+  rejected singular Hosted provider `model` and empty provider objects while
+  accepting Cloud's healthy, `provider_not_found`, and
+  `provider_secret_unavailable` projections with required non-empty error
+  messages. Generic runtime desired state
+  keeps its existing provider and installer behavior.
+- Restricted remote Hosted CLI package selection to exact
+  `clawdi@<semver>` without build metadata, using strict SemVer prerelease
+  identifier rules and the Cloud 200-character limit. Managed bootstrap tgz paths are
+  accepted only through strict Hosted test fixtures. Runtime desired state no
+  longer resolves floating package tags.
+- Standardized npm publication on `beta` for prereleases and `latest` for
+  stable releases, with no package-level tag override. Hosted runtime updates
+  consume the public exact version from the Cloud manifest and never resolve a
+  dist-tag.
+
+### Fixed
+
+- Kept headless runtime convergence independent of a systemd user manager while
+  still requiring the manager for official runtime service installation.
+- Restored SSE subscriptions after authentication failure or terminal task
+  completion while retaining polling as the bounded retry cadence.
+
+## iforge CLI v0.12.10-beta.50
+
+Release: https://github.com/Clawdi-AI/clawdi/releases/tag/clawdi-cli-v0.12.10-beta.50
+
+Package: `clawdi@0.12.10-beta.50`
+
+### Changed
+
+- Made the Cloud hosted manifest the fail-closed authority for the ongoing
+  managed CLI channel. Hosted manifests must explicitly provide
+  the strict `clawdiCli` source, package spec, and official npm registry; they
+  can no longer implicitly select `clawdi@latest` or inherit npm registry
+  configuration.
+- Made agent-v2 publishing repository-autonomous: build, test, pack, install,
+  and SHA-verify one immutable tarball, then publish prereleases to the standard
+  npm `beta` channel with trusted-publisher OIDC.
+
+## iforge CLI v0.12.10-beta.49
+
+Release: https://github.com/Clawdi-AI/clawdi/releases/tag/clawdi-cli-v0.12.10-beta.49
+
+Package: `clawdi@0.12.10-beta.49`
+
+### Changed
+
+- Added managed self-update support for beta builds through the standard npm
+  `beta` channel while Hosted rollout remains pinned to an exact CLI version.
+
+## iforge CLI v0.12.10-beta.48
+
+Release: https://github.com/Clawdi-AI/clawdi/releases/tag/clawdi-cli-v0.12.10-beta.48
+
+Package: `clawdi@0.12.10-beta.48`
+
+### Changed
+
+- Made hosted policy and runtime datasource validation CLI-owned contracts, so
+  runtime images no longer carry command policy, control-plane URLs, or CLI
+  release-channel metadata.
+
+## iforge CLI v0.12.10-beta.47
+
+Release: https://github.com/Clawdi-AI/clawdi/releases/tag/clawdi-cli-v0.12.10-beta.47
+
+Package: `clawdi@0.12.10-beta.47`
+
+### Changed
+
+- Made the CLI the owner of hosted egress module paths, numeric UID/GID
+  permissions, and name-free privilege dropping. Runtime images no longer need
+  a dedicated named egress account.
+
+## iforge CLI v0.12.10-beta.46
+
+Release: https://github.com/Clawdi-AI/clawdi/releases/tag/clawdi-cli-v0.12.10-beta.46
+
+Package: `clawdi@0.12.10-beta.46`
+
+### Fixed
+
+- Isolated hosted runtime npm metadata lookups in the managed CLI cache so
+  root bootstrap does not leave root-owned npm files in the runtime user's
+  home directory.
+
+## iforge CLI v0.12.10-beta.45
+
+Release: https://github.com/Clawdi-AI/clawdi/releases/tag/clawdi-cli-v0.12.10-beta.45
+
+Package: `clawdi@0.12.10-beta.45`
+
+### Changed
+
+- Finalized the hosted runtime desired-state contract for the unified egress
+  sidecar.
+
+## iforge CLI v0.12.10-beta.44
+
+Release: https://github.com/Clawdi-AI/clawdi/releases/tag/clawdi-cli-v0.12.10-beta.44
+
+Package: `clawdi@0.12.10-beta.44`
+
+### Changed
+
+- Renamed the hosted runtime MITM command and manifest surface to the runtime
+  sidecar and egress contract.
+
+## iforge CLI v0.12.10-beta.26
+
+Release: https://github.com/Clawdi-AI/clawdi/releases/tag/clawdi-cli-v0.12.10-beta.26
+
+Package: `clawdi@0.12.10-beta.26`
+
+### Fixed
+
+- Fixed CLI auto-update for beta builds so beta daemons follow the npm `beta`
+  dist-tag instead of only checking `latest`.
+
+## iforge CLI v0.12.10-beta.25
+
+Release: https://github.com/Clawdi-AI/clawdi/releases/tag/clawdi-cli-v0.12.10-beta.25
+
+Package: `clawdi@0.12.10-beta.25`
+
+### Fixed
+
+- Fixed Hermes skill sync so archived dot-directories such as `.archive` are
+  ignored instead of being uploaded as invalid skill keys.
+
+## iforge CLI v0.12.10-beta.0
+
+Release: https://github.com/Clawdi-AI/clawdi/releases/tag/clawdi-cli-v0.12.10-beta.0
+
+Package: `clawdi@0.12.10-beta.0`
+
+### Changed
+
+- Added a hosted runtime CLI prerelease for controlled validation. This release
+  keeps the hosted runtime flow behind explicit runtime commands and hosted
+  controller manifests, so existing `clawdi` CLI users and the iforge
+  app/backend/web release line are not changed by default.
+- Cleaned up the runtime manifest contract so the CLI accepts one controller
+  response shape and one local desired-state shape, with stricter validation for
+  runtime paths, secrets, egress profiles, and manifest expiry.
+
+## iforge CLI v0.12.9
+
+Release: https://github.com/Clawdi-AI/clawdi/releases/tag/clawdi-cli-v0.12.9
+
+Package: `clawdi@0.12.9`
+
+### Fixed
+
+- Fixed `iforge runtime apply` so WhatsApp Baileys credential directories are
+  made private even when the directory already existed with wider permissions.
+
+## iforge 2026-06-09
+
+Release: https://github.com/Clawdi-AI/clawdi/releases/tag/clawdi-2026-06-09
+
+### Security
+
+- Tightened native channel provider endpoint and agent webhook URL validation.
+  iforge now rejects private, loopback, unresolved, HTTP, and WS targets, and
+  revalidates webhook targets before delivery to reduce DNS-rebinding risk.
+
+### Fixed
+
+- Fixed Telegram and BlueBubbles agent webhook delivery so `4xx` responses no
+  longer acknowledge pending inbound messages as successful deliveries.
+- Fixed Telegram agent webhook redelivery so non-webhook pending messages do
+  not block later webhook-mode inbox rows.
+
+## iforge CLI v0.12.8
+
+Release: https://github.com/Clawdi-AI/clawdi/releases/tag/clawdi-cli-v0.12.8
+
+Package: `clawdi@0.12.8`
+
+### Fixed
+
+- Fixed skill uploads from local directories with names that need cleanup, such
+  as long names or names containing punctuation. `iforge skill add`,
+  `iforge skill init`, and daemon sync now use the same skill key rules as
+  iforge Cloud, so generated skill keys are accepted without manual renaming.
+
+## iforge CLI v0.12.7
+
+Release: https://github.com/Clawdi-AI/clawdi/releases/tag/clawdi-cli-v0.12.7
+
+Package: `clawdi@0.12.7`
+
+### Fixed
+
+- Fixed `iforge run` for Cloud-saved BYOK AI providers inside iforge agents.
+  Commands launched through `iforge run` now receive the saved provider key at
+  runtime without writing plaintext keys to shell files or local config.
+
+## iforge CLI v0.12.6
+
+Release: https://github.com/Clawdi-AI/clawdi/releases/tag/clawdi-cli-v0.12.6
+
+Package: `clawdi@0.12.6`
+
+### Fixed
+
+- Fixed AI Provider apply for BYOK Codex Responses providers so OpenClaw uses
+  the same Codex Responses route as iforge-managed AI providers.
+- Fixed `iforge ai-provider test --live` for managed providers running inside a
+  iforge agent. The command now uses the injected runtime environment key before
+  falling back to backend credential resolution.
+
+## iforge CLI v0.12.1
+
+Release: https://github.com/Clawdi-AI/clawdi/releases/tag/clawdi-cli-v0.12.1
+
+Package: `clawdi@0.12.1`
+
+### Fixed
+
+- Fixed Codex AI Provider apply so provider-bound Codex OAuth profiles write
+  the selected default model even when they use Codex's built-in OpenAI
+  provider configuration.
+
+## iforge 2026-06-05
+
+Release: https://github.com/Clawdi-AI/clawdi/releases/tag/clawdi-2026-06-05
+
+### Fixed
+
+- Fixed Codex AI Provider OAuth setup in development environments whose web
+  dashboard runs on a configured HTTP origin other than loopback. Unconfigured
+  hosts and ports are still rejected.
+
+## iforge CLI v0.12.0
+
+Release: https://github.com/Clawdi-AI/clawdi/releases/tag/clawdi-cli-v0.12.0
+
+Package: `clawdi@0.12.0`
+
+### Added
+
+- Added source-to-target AI Provider apply flows. `iforge ai-provider apply
+  openai-codex` now materializes one Codex OAuth source into every matching
+  local target by default: Codex, Hermes, and OpenClaw.
+- Added target-native Codex OAuth writes for Hermes and OpenClaw, including
+  Hermes credential-pool state and OpenClaw auth profiles.
+
+### Changed
+
+- Replaced the previous `--engine` selector with `--target`; use
+  `--target codex|hermes|openclaw|all` when you need to apply a source to a
+  specific runtime.
+- Codex OAuth application now uses the upstream target contracts instead of
+  env-style API-key projection for subscription OAuth.
+
+### Fixed
+
+- Fixed OpenClaw Codex OAuth profiles to use OpenClaw's canonical
+  `openai:<profile>` auth profile IDs and `auth.order.openai` configuration.
+- Tightened AI Provider apply/export/test output redaction so OAuth tokens and
+  env-backed secrets stay out of generated non-secret config and command
+  output.
+
+## iforge CLI v0.11.0
+
+Release: https://github.com/Clawdi-AI/clawdi/releases/tag/clawdi-cli-v0.11.0
+
+Package: `clawdi@0.11.0`
+
+### Changed
+
+- `iforge daemon` now installs one singleton launchd/systemd unit that syncs
+  every registered local agent. User-facing per-agent daemon install, restart,
+  uninstall, logs, and `--all` controls were removed; use
+  `iforge daemon status --agent <type>` when you need a focused status view.
+- Existing per-agent daemon units are migrated automatically. Re-running
+  `iforge setup` or `iforge daemon install` installs the singleton and removes
+  old per-agent supervisor units.
+
+### Added
+
+- Added `iforge daemon ping` and `iforge daemon rotate-token` for local daemon
+  control checks and token rotation.
+- Added headless daemon RPC methods for sync, vault, auth, update, and
+  long-running operation status/log inspection.
+- Added HTTP JSON-RPC host/port binding for daemon control. It listens on
+  `127.0.0.1:17654` by default and supports custom host/port configuration.
+
+### Security
+
+- Daemon control RPC now requires bearer-token auth on every request. The
+  generated token is stored owner-only, can be rotated with
+  `iforge daemon rotate-token`, and is checked with timing-safe comparison.
+- HTTP RPC listeners bind to loopback by default. Non-loopback binds require
+  explicit `--allow-remote` opt-in and should only be used behind SSH
+  tunneling, private networking, or TLS termination.
+- Vault plaintext RPC calls require explicit confirmation; plaintext rendering
+  cannot be sent to background operation logs.
+
+## iforge CLI v0.10.1
+
+Release: https://github.com/Clawdi-AI/clawdi/releases/tag/clawdi-cli-v0.10.1
+
+Package: `clawdi@0.10.1`
+
+### Fixed
+
+- Fixed `iforge update` choosing Bun just because `bun` was on `PATH`. The
+  updater now prefers the package manager that owns the currently running
+  `clawdi` binary, so npm-installed CLIs update with npm and Bun-installed CLIs
+  update with Bun.
+- Reduced live-sync daemon noise during transient Cloud SSE reconnects and
+  heartbeat timeouts. Short reconnect bursts are now classified as transient;
+  only sustained failures are written to `last_sync_error` or logged as warning
+  signals.
+- Fixed AI Provider OpenClaw import round-trips, stale runtime env display after
+  auth edits, and local no-auth endpoint validation parity between CLI and
+  backend.
+- Clarified that Codex provider auth should use `iforge ai-provider
+  import-auth/connect/materialize-auth`; lower-level `agent credentials` commands
+  remain a compatibility backup/restore surface.
+
+## iforge 2026-06-03-2
+
+Release: https://github.com/Clawdi-AI/clawdi/releases/tag/clawdi-2026-06-03-2
+
+### Fixed
+
+- Fixed session sync failures when an agent runtime reported structured provider
+  configuration or very long strings in the `model` field. iforge now extracts a
+  usable model id when possible and caps stored model labels to the database
+  limit instead of returning a 500.
+
+### Security
+
+- Hardened backend database error logging so SQL bound parameter values are not
+  written to logs when an unexpected database exception occurs.
+
+## iforge CLI v0.10.0
+
+Release: https://github.com/Clawdi-AI/clawdi/releases/tag/clawdi-cli-v0.10.0
+
+Package: `clawdi@0.10.0`
+
+### Added
+
+- Added account-global AI Provider management with `iforge ai-provider`, so
+  users can define OpenAI, Anthropic, OpenRouter, Gemini, Mistral, and
+  OpenAI-compatible endpoints once and reuse them across agents.
+- Added `iforge ai-provider apply --engine codex|hermes|openclaw` to generate
+  native agent configuration from the Provider Catalog. Codex uses a dedicated
+  profile file, Hermes receives a structured `config.yaml` merge, and OpenClaw
+  uses its native config patch command.
+- Added Codex OAuth connection and provider-bound credential profile import /
+  materialization, including loopback callback handling with manual paste
+  fallback.
+- Added encrypted Provider Catalog export/import for env-backed secrets. Plain
+  API keys are never included in default exports.
+
+### Security
+
+- BYOK model requests remain direct from the runtime to the selected provider;
+  iforge stores metadata and secret references but does not proxy model traffic.
+- AI Provider catalog, generated agent config, exported secret env files, and
+  materialized credential files are written with owner-only permissions.
+
+## iforge 2026-06-03
+
+Release: https://github.com/Clawdi-AI/clawdi/releases/tag/clawdi-2026-06-03
+
+### Added
+
+- Added backend AI Provider APIs for account-global provider metadata, managed
+  provider API keys, Codex OAuth start/complete, and CLI-only credential
+  resolution.
+
+## iforge CLI v0.9.0
+
+Release: https://github.com/Clawdi-AI/clawdi/releases/tag/clawdi-cli-v0.9.0
+
+Package: `clawdi@0.9.0`
+
+### Added
+
+- Added `iforge vault attach` and `iforge vault detach` / `unlink` so users can
+  add or remove one Project's access to an existing Vault without copying or
+  deleting the underlying keys.
+
+### Changed
+
+- Deleting a key from a Vault attached to multiple Projects now requires
+  explicit global confirmation. The CLI refuses `iforge vault rm` unless
+  `--global` is passed, and the API requires `global_delete=true`. Scripts
+  that intentionally delete keys from shared Vaults must add the new explicit
+  confirmation.
+- `iforge vault rm` now fails clearly in non-interactive shells when `--yes` is
+  missing instead of waiting on a prompt that cannot be answered.
+
+### Security
+
+- Memory creation now rejects likely plaintext API keys, bearer tokens, and
+  similar secrets in the CLI, MCP server, dashboard, and backend, and points
+  users to Vault references instead. Automations that stored plaintext secrets
+  in memory should store the secret in Vault and save only a `clawdi://`
+  reference in memory.
+
+## iforge CLI v0.8.6
+
+Release: https://github.com/Clawdi-AI/clawdi/releases/tag/clawdi-cli-v0.8.6
+
+Package: `clawdi@0.8.6`
+
+### Fixed
+
+- Fixed the npm package metadata for `clawdi@0.8.5`, which accidentally used
+  Bun workspace catalog syntax for the `zod` runtime dependency and caused
+  plain `npm install clawdi@0.8.5` installs to fail.
+
+## iforge CLI v0.8.5
+
+Release: https://github.com/Clawdi-AI/clawdi/releases/tag/clawdi-cli-v0.8.5
+
+Package: `clawdi@0.8.5`
+
+### Fixed
+
+- `iforge mcp` now exposes Composio connector tools through the Composio MCP
+  bridge with original tool names and typed input schemas, so downstream agents
+  such as Hermes and OpenClaw can discover and call connector tools correctly.
+
+## iforge 2026-05-24
+
+Release: https://github.com/Clawdi-AI/clawdi/releases/tag/clawdi-2026-05-24
+
+### Fixed
+
+- Connector MCP traffic now routes through a backend Composio bridge instead of
+  the old reduced proxy path, preserving Composio tool metadata while keeping
+  connector credentials server-side.
+
+## iforge CLI v0.8.4
+
+Release: https://github.com/Clawdi-AI/clawdi/releases/tag/clawdi-cli-v0.8.4
+
+Package: `clawdi@0.8.4`
+
+### Fixed
+
+- Improved Vault resolve errors when a CLI talks to a backend that has not yet
+  enabled shared Project Vault runtime reads for Viewers.
+
+## iforge CLI v0.8.3
+
+Release: https://github.com/Clawdi-AI/clawdi/releases/tag/clawdi-cli-v0.8.3
+
+Package: `clawdi@0.8.3`
+
+### Fixed
+
+- Agent MCP setup now converges on the local `iforge mcp` stdio server for
+  Hermes and OpenClaw. Hermes setup removes stale `clawdi-mcp` HTTP entries and
+  mixed HTTP/stdio blocks that could create duplicate or confusing iforge tool
+  namespaces; OpenClaw setup now writes the matching `clawdi` MCP server through
+  `openclaw mcp set`.
+
+## iforge CLI v0.8.2
+
+Release: https://github.com/Clawdi-AI/clawdi/releases/tag/clawdi-cli-v0.8.2
+
+Package: `clawdi@0.8.2`
+
+### Added
+
+- Added non-interactive vault writes with `iforge vault set --value <value>`
+  and `iforge vault set --stdin`.
+- Added `--vault`, `--section`, and `--project` targeting to
+  `iforge vault import`, so `.env` imports can populate sectioned vault paths.
+- Added `iforge vault rm` / `iforge vault delete` for scripted cleanup.
+- Added `iforge project list --include-envs` to show auto-created machine
+  Projects when needed.
+
+### Changed
+
+- Vault write commands now print the concrete target vault, section, and Project
+  before writing, then print exact `clawdi://project/...` references after
+  writes.
+- `iforge project list` now hides auto-created machine Projects by default and
+  reports how many were hidden.
+- The bundled `clawdi` skill now points agents at the new vault CLI workflow
+  for scripted secret migration and cleanup.
+
+### Fixed
+
+- `iforge vault import` now warns about skipped invalid dotenv identifiers
+  instead of reporting only that no keys were found.
+
+## iforge CLI v0.8.1
+
+Release: https://github.com/Clawdi-AI/clawdi/releases/tag/clawdi-cli-v0.8.1
+
+Package: `clawdi@0.8.1`
+
+### Changed
+
+- Updated CLI vault commands for account-owned Vaults that can be attached to
+  multiple Projects. JSON output now includes `project_ids`, while exact
+  references continue to include the Project ID used for resolution.
+- `iforge project show`, `iforge skill list`, `iforge pull`, and
+  `iforge vault list` now page through cloud results instead of showing only
+  the first page.
+- Share-link preview copy now says Vault metadata unlocks after sign-in while
+  keeping plaintext out of web preview flows.
+
+## iforge 2026.05.21.2
+
+Release: https://github.com/Clawdi-AI/clawdi/releases/tag/clawdi-v2026.05.21.2
+
+### Added
+
+- Added dashboard Projects and Project detail surfaces for viewing resources,
+  metadata, sharing state, and Agent attachments.
+- Added dashboard Project sharing flows, including share links, direct invites,
+  member management, public share acceptance, and notifications.
+- Added Vault import and Project attachment controls in the dashboard, including
+  Vault metadata views for shared Project viewers.
+
+### Changed
+
+- Clarified the Project model across the dashboard: user-created Projects can be
+  shared, the Global Project is the account default, and Agent Projects are
+  managed per connected agent.
+- Vaults are now account-owned resources that can be attached to multiple
+  Projects. Existing `project_id` API consumers and legacy exact
+  `clawdi://project/.../vault/...` references remain compatible.
+
+### Security
+
+- Shared Project recipients remain Viewers without write access. Vault
+  plaintext stays hidden in web flows; CLI/API-key runtime reads can use shared
+  Vault values, while bound Agent keys use shared values through explicit Agent
+  Project attachments.
+
+## iforge CLI v0.8.0
+
+Release: https://github.com/Clawdi-AI/clawdi/releases/tag/clawdi-cli-v0.8.0
+
+Package: `clawdi@0.8.0`
+
+### Added
+
+- Added `iforge daemon` as the primary command for managing background sync.
+  The old `iforge serve` command remains available as a legacy alias.
+- Added default daemon installation during `iforge setup`, so every registered
+  local agent gets live sync unless setup is run with `--no-daemon`.
+- Added background auto-update for installed daemons. Daemons check for newer
+  CLI releases, install them silently, and let launchd/systemd restart onto the
+  new version.
+
+### Changed
+
+- CLI and daemon auto-update now install the latest available release, including
+  major versions.
+- `iforge update` installs by default; use `--check` to report only.
+
+### Fixed
+
+- Reduced daemon idle and burst overhead by coalescing retry-queue persistence,
+  waking the queue only when work arrives, and debouncing skill watcher events.
+- Closed background auto-update log descriptors in the parent CLI process.
+
+## iforge 2026.05.20.1
+
+Release: https://github.com/Clawdi-AI/clawdi/releases/tag/clawdi-v2026.05.20.1
+
+### Added
+
+- Added first-class `clawdi://` secret references for project-scoped vault
+  secrets.
+- Added dry-run secret previews that show where a secret resolves from without
+  printing plaintext.
+- Added support for syncing local CLI credential profiles for Codex, Claude
+  Code, and GitHub CLI.
+
+### Changed
+
+- Improved vault conflict and provenance handling for multi-project and agent
+  workflows.
+- Kept local CLI credential profiles separate from runtime vault secrets.
+
+### Security
+
+- Shared Project viewers can use shared runtime vault values, but cannot store or
+  materialize another user's local CLI credential profiles.
+- Vault storage remains server-managed encryption, not zero-knowledge.
+
+## iforge CLI v0.7.0
+
+Release: https://github.com/Clawdi-AI/clawdi/releases/tag/clawdi-cli-v0.7.0
+
+Package: `clawdi@0.7.0`
+
+### Added
+
+- Added `clawdi://` secret reference workflows across `read`, `inject`, and
+  `run --env-file`.
+- Added exact Project-scoped references such as
+  `clawdi://project/<project>/vault/<vault>/field/<field>`.
+- Added bulk reference resolution for templates and env files.
+- Added local credential profile sync for Codex, Claude Code, and GitHub CLI.
+- Added dry-run previews that show provenance without requesting plaintext.
+
+### Changed
+
+- `iforge inject` writes generated secret files owner-only.
+- `iforge run --env-file` can resolve explicit references without broad
+  all-vault env injection.
+
+### Security
+
+- Secret reference previews do not print secret values.
+- Local CLI credential profiles are restored only for the authenticated user
+  who stored them.

@@ -1,0 +1,229 @@
+# Scenario 2: Vault + Claude Code (CLI-First)
+
+> HISTORICAL - early 2026-04 vault scenario. Current vault behavior is in
+> [`../architecture.md#vault`](../architecture.md#vault) and
+> [`../using-iforge-with-claude-code.md`](../using-iforge-with-claude-code.md).
+
+**Date:** 2026-04-15
+**Context:** Vault is Layer 2 infrastructure — secrets never enter LLM context.
+
+---
+
+## Overview
+
+Vault stores API keys and secrets centrally. Distribution is CLI-first via `iforge run` (env injection into child process). No MCP tool, no `.env` files scattered across machines.
+
+---
+
+## The Problem
+
+A typical project needs many API keys:
+
+```
+OPENAI_API_KEY        — Claude Code model calls
+ANTHROPIC_API_KEY     — same
+STRIPE_SECRET_KEY     — payment API
+AWS_ACCESS_KEY_ID     — deploy, S3
+DATABASE_URL          — database connection
+RESEND_API_KEY        — email service
+```
+
+Current pain points:
+- One `.env` file per project, scattered everywhere
+- Switch machines → reconfigure everything
+- Claude Code, Cursor, Codex each need their own setup
+- `.env` accidentally committed to git
+- Sharing secrets in a team — Slack DMs, insecure
+
+---
+
+## How Vault Solves This
+
+### Step 1: Store Secrets (CLI or Dashboard)
+
+**Via CLI (primary for developers):**
+
+```bash
+# Add a single key interactively
+iforge vault set OPENAI_API_KEY --prompt
+> Enter value: ****
+✓ Stored OPENAI_API_KEY
+
+# Add non-interactively
+printf '%s\n' "$STRIPE_SECRET_KEY" | iforge vault set payments/env/STRIPE_SECRET_KEY --stdin
+✓ Stored payments/env/STRIPE_SECRET_KEY
+
+# Import from existing .env file
+iforge vault import .env --yes
+✓ Imported 6 keys to vault "default" in default-write project "personal" (...)
+
+# Import into a vault section
+iforge vault import --vault payments --section stripe --project personal --yes .env.stripe
+✓ Imported 6 keys to vault "payments" section "stripe" in explicit project "personal" (...)
+
+# List stored keys (values never shown)
+iforge vault list
+Project personal (...)
+  Vault default
+    OPENAI_API_KEY
+      iforge://project/.../vault/default/field/OPENAI_API_KEY
+  Vault payments
+    stripe/STRIPE_SECRET_KEY
+      iforge://project/.../vault/payments/section/stripe/field/STRIPE_SECRET_KEY
+
+# Remove a key
+iforge vault rm api-service/database/DATABASE_URL --yes
+✓ Deleted api-service/database/DATABASE_URL from vault "api-service" section "database" in default-write project "personal" (...)
+```
+
+**Via Dashboard (for visual management):**
+
+```
+Dashboard → Vault → Add Key / Import .env
+
+  Same operations, plus:
+  - Audit log viewer (who read what key, when, from which agent)
+  - Per-key access control (which agent tokens can read this key)
+  - BYO vault connection (1Password, HashiCorp Vault, Infisical)
+```
+
+Both CLI and Dashboard write to the same backend — keys added via CLI appear in Dashboard and vice versa.
+
+### Step 2: Auto-Inject at Launch
+
+```bash
+$ iforge run -- claude
+```
+
+What happens:
+
+```
+iforge run -- claude
+  │
+  ├── 1. Fetch vault keys from iforge API (HTTPS)
+  ├── 2. Set as child process env vars:
+  │       OPENAI_API_KEY=sk-xxx
+  │       STRIPE_SECRET_KEY=stripe-secret-placeholder
+  │       ...
+  └── 3. exec(claude)
+
+Claude Code process:
+  process.env.OPENAI_API_KEY = "sk-xxx"       ✓ SDK uses directly
+  process.env.STRIPE_SECRET_KEY = "stripe-secret-placeholder" ✓ project code uses directly
+
+LLM context:
+  Cannot see any secret values  ✓ Secure
+```
+
+---
+
+## Usage Scenarios
+
+### A: Selective Key Injection
+
+```bash
+# Only AI-related keys
+iforge run --keys ai/* -- claude
+
+# Only dev environment
+iforge run --keys dev/* -- claude
+
+# Exact keys
+iforge run --keys OPENAI_API_KEY,DATABASE_URL -- claude
+```
+
+### B: Writing Code That Uses Secrets
+
+```
+User: Write a function to create a Stripe subscription
+
+Claude Code:
+  → writes stripe.subscriptions.create(...) code
+  → code uses os.environ["STRIPE_SECRET_KEY"]
+  → tests run immediately — env var already present
+  → LLM never sees the actual key value
+```
+
+### C: Alternative Distribution Methods
+
+```bash
+# Option 2: Pull to local .env file (persists on disk)
+iforge env pull
+# → generates .clawdi.env (0600 permissions)
+# → .gitignore automatically includes .clawdi.env
+
+# Option 3: Export to current shell (least secure, for quick debugging)
+eval $(iforge env export)
+
+# Option 4: direnv integration (.envrc)
+# Auto-load on cd into directory, auto-unload on leave
+source <(iforge env export --format=export)
+```
+
+### D: CI/CD Pipelines
+
+```yaml
+# GitHub Actions
+jobs:
+  deploy:
+    steps:
+      - run: |
+          iforge run --keys api-service/* -- ./deploy.sh
+        env:
+          IFORGE_AUTH_TOKEN: ${{ secrets.IFORGE_AUTH_TOKEN }}
+```
+
+Only one secret (`IFORGE_AUTH_TOKEN`) in GitHub Secrets. All other keys pulled from Vault at runtime.
+
+---
+
+## Security Model
+
+### Why Better Than .env Files
+
+```
+.env files:
+  ├── Plaintext on disk
+  ├── Any process that can read files sees them
+  ├── git add . can accidentally commit
+  └── LLM can cat .env and see contents
+
+iforge run:
+  ├── Secrets only in child process memory, never on disk
+  ├── Parent shell env untouched
+  ├── Process exits → env vars gone
+  ├── LLM context never contains secret values
+  └── Audit log records who read what key and when
+```
+
+### Encryption at Rest (Server Side)
+
+```
+Cloud KMS (AWS KMS / GCP KMS / confidential compute KMS)
+  └── Master Key (never leaves KMS)
+       └── User KEK (per user, encrypted by master)
+             └── DEK (per secret, encrypted by KEK)
+                   └── Secret Value (ciphertext in Postgres)
+```
+
+Stolen database dump → useless (everything encrypted).
+Stolen app server → useless (can't call KMS without credentials).
+User A compromised → User B unaffected (separate KEKs).
+
+---
+
+## Vault vs Connectors
+
+| | Vault | Connectors |
+|---|---|---|
+| Stores | Static secret strings | OAuth connections (token + refresh) |
+| Distribution | Env var injection, `os.environ["KEY"]` | MCP tool call `connector_call(...)` |
+| LLM visibility | Never (Layer 2) | Yes, by design (Layer 1) |
+| Typical content | API keys, DB URLs, secrets | GitHub/Notion/Linear operation results |
+| Consumer | SDK / application code | LLM agent |
+
+---
+
+## Key Principle
+
+**Secrets are infrastructure, not context.** The LLM uses secrets indirectly (SDK reads env vars, HTTP calls go through proxies) but never sees raw values in its conversation history.

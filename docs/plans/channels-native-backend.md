@@ -1,0 +1,139 @@
+# Native Channels Backend Status
+
+Status: implemented baseline, including WhatsApp native runtime
+Date: 2026-08-01
+
+This document records the implemented native-channel boundary. Product
+semantics live in
+[`../designs/native-channels-product-model.md`](../designs/native-channels-product-model.md).
+
+## Shared Backend
+
+FastAPI and PostgreSQL own:
+
+- channel accounts and encrypted provider credentials;
+- bot-Agent Links and Link bearer authority;
+- pair codes, actor-scoped bindings, and provider aliases;
+- durable inbox messages and delivery outbox rows;
+- provider-specific ingress validation and authorized outbound workers;
+- debug events, retry state, and Link revocation.
+
+A `(channel account, external chat)` has at most one active binding. Agent-facing
+requests resolve one active Link and must match that binding. Provider-wide
+credentials stay account-scoped; Agent credentials and replay state stay
+Link-scoped.
+
+Telegram and Discord keep their existing native backend adapters.
+Generic delivery, retention, and ownership code must not acquire WhatsApp-only
+payload assumptions.
+
+## WhatsApp Boundary
+
+WhatsApp uses two intentionally distinct socket roles:
+
+1. `packages/whatsapp-baileys-sidecar` owns the one physical stock Baileys
+   socket for a real account. It keeps durable linked-device auth, Signal keys,
+   retry state, reconnect and QR/pair lifecycle, and an exclusive account-state
+   owner lock.
+2. The stock OpenClaw or Hermes native plugin owns a synthetic Link-scoped
+   Baileys socket. Its synthetic credential never contains the physical auth
+   directory, provider credential, or real account token.
+
+The package name retains `sidecar` only to avoid manifest, dependency, and CI
+churn. It is the physical-provider transport, not a second Agent runtime and not
+an OpenClaw/Hermes application connector.
+
+Provider ingress follows:
+
+```text
+physical Baileys messages.upsert
+  -> disk-backed provider event handoff
+  -> FastAPI account/JID alias and binding resolution
+  -> committed channel_messages row
+  -> sidecar event acknowledgement
+  -> Link-scoped Noise inbox replay
+  -> native plugin
+```
+
+Agent egress follows:
+
+```text
+native plugin
+  -> synthetic Noise session
+  -> Link + synthetic identity + binding authorization
+  -> committed channel_messages/channel_deliveries row
+  -> delivery worker
+  -> account's registered physical provider transport
+```
+
+Allowed raw BinaryNode and bounded IQ operations bypass the application delivery
+shape only after the same Link and binding checks. They are retained for
+receipts, key/group queries, and protocol fidelity. There is no public raw-node,
+IQ, provider-event, or transport HTTP API; those operations are on the private
+bearer-authenticated contract between FastAPI and the physical transport.
+
+## Preserved WhatsApp State
+
+- `channel_agent_credentials`: Link-scoped synthetic auth, identity, Signal,
+  group sender-key, and retry material.
+- `channel_whatsapp_auth_certs`: synthetic Noise authority public/private state
+  used by the emulator and internal runtime credential projection.
+- `channel_bindings` and `channel_binding_aliases`: account-scoped PN/LID/JID
+  ownership.
+- `channel_messages` and `channel_deliveries`: durable provider/Agent boundary.
+- configured provider transports: one registration per account plus the
+  sidecar's exclusive durable-state lock.
+
+The internal runtime-channel response may mint or reuse one synthetic credential
+under the account row lock. Ordinary channel APIs do not expose credential mint/list,
+credential revocation, or auth-certificate authority endpoints.
+
+## Removed WhatsApp Compatibility Surface
+
+The product no longer includes the former hosted compatibility layer for
+Meta Cloud/Graph request shapes, webhook delivery assumptions, payload
+conversion, provider media upload/reupload, media proxying, or the shared
+application-runtime relay. The old public tenant credential and auth-certificate
+routes, Web credential cache, CLI credential-mint flow, Hermes application
+adapter projection, and custom OpenClaw/Hermes connector artifacts are also
+absent.
+
+Baileys proto bytes and BinaryNode bytes cross the provider boundary directly.
+The backend inspects only the narrow ids and attributes needed for Link,
+binding, alias, and relay policy.
+
+## Compatibility Constraints
+
+The pinned `7.0.0-rc13` artifacts `baileys` and
+`@whiskeysockets/baileys` lack the required configurable Noise
+trust authority, so the CLI owns an expected-name and SemVer-major-7 static
+compatibility patch for those two Baileys aliases. Every audited before/after
+context hunk must match uniquely and exactly with fuzz zero; unrelated bytes
+outside those hunks are preserved. It
+reads strictly validated namespaced metadata from stock `creds.additionalData`;
+no OpenClaw or Hermes source is patched. These are explicitly downstream CLI
+patch capabilities, not native upstream managed capabilities. Executable rc13
+seam and stock auth-persistence tests complement the fixed OpenClaw/Hermes
+native-plugin E2E script. A real live-account drill has not been executed.
+
+Runtime projection materializes Link-scoped synthetic auth, reconciles the
+audited patch, and installs the WhatsApp egress profile. Fuzzy replacement,
+runtime monkey-patching, package override, broad fork, and custom adapters
+remain outside the accepted design.
+
+## Acceptance Evidence
+
+- one `makeWASocket` production owner and no legacy connector source;
+- physical-provider SQLite auth/Signal/retry/inbox state, exclusive ownership,
+  HTTP contract, and typecheck;
+- provider ingress persistence, alias resolution, durable outbound delivery,
+  raw-node policy, bounded IQ forwarding, and Link revocation tests;
+- executable patched rc13 WebSocket, HTTP, Noise trust, malformed-metadata, and
+  stock consumer auth save/reconstruction coverage plus fixed-artifact stock
+  native-plugin E2E;
+- backend revoked/cross-Link authority denial;
+- source invariants for no WhatsApp Graph/Cloud production path and no custom
+  runtime adapter or runtime master enablement switch.
+
+The file-by-file decision record is
+[`../designs/whatsapp-native-baileys-cleanup-audit.md`](../designs/whatsapp-native-baileys-cleanup-audit.md).

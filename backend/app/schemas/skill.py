@@ -1,0 +1,192 @@
+from datetime import datetime
+from typing import Literal
+from uuid import UUID
+
+from pydantic import BaseModel, Field, field_validator
+
+from app.services.tar_utils import validate_skill_name
+
+PersistedSkillAuthority = Literal["agent_sync", "cloud"]
+PersistedProjectKind = Literal["environment", "personal", "workspace"]
+
+
+class SkillInstallRequest(BaseModel):
+    # `repo` and `path` flow into `fetch_skill_from_github` and the
+    # GitHub API URL path. Constraining to safe characters blocks
+    # newline / control-char log-injection. Length caps mirror
+    # GitHub's limits.
+    repo: str = Field(pattern=r"^[A-Za-z0-9._\-]{1,100}/[A-Za-z0-9._\-]{1,100}$")
+    # Pydantic's regex engine doesn't support lookahead, so the
+    # `..` traversal guard lives in a field validator below.
+    path: str | None = Field(default=None, pattern=r"^[A-Za-z0-9._\-/]{0,200}$")
+
+    @field_validator("path")
+    @classmethod
+    def _no_traversal(cls, v: str | None) -> str | None:
+        # Reject any segment that's exactly `..`. A bare `..` segment
+        # (e.g. `path = "..", "../foo", "foo/..", "a/../b"`) would let
+        # a marketplace install reach beyond the repo via the GitHub
+        # API URL path. Single dots are allowed because legitimate
+        # skill paths use `.config/skills` and similar.
+        if v is None:
+            return v
+        if any(seg == ".." for seg in v.split("/")):
+            raise ValueError("path must not contain `..` segments")
+        return v
+
+
+class SkillSummaryResponse(BaseModel):
+    id: str
+    skill_key: str
+    name: str
+    description: str | None
+    version: int
+    source: str
+    authority: PersistedSkillAuthority = "cloud"
+    source_repo: str | None
+    agent_types: list[str] | None
+    file_count: int | None
+    content_hash: str
+    is_active: bool
+    created_at: datetime
+    updated_at: datetime
+    content: str | None = None
+    # Project + machine surface so the dashboard can render a
+    # per-machine grouped list, target the project-explicit URLs
+    # (delete / re-upload) without a separate fetch, and show
+    # which machine owns the skill. `machine_name` is null for
+    # skills in the user's Personal project (no Agent environment origin).
+    project_id: str | None = None
+    project_name: str | None = None
+    project_kind: PersistedProjectKind | None = None
+    machine_name: str | None = None
+    environment_id: str | None = None
+
+
+class SkillDetailResponse(BaseModel):
+    id: str
+    skill_key: str
+    name: str
+    description: str | None
+    version: int
+    source: str
+    authority: PersistedSkillAuthority = "cloud"
+    source_repo: str | None
+    file_count: int | None
+    content: str | None
+    agent_types: list[str] | None
+    created_at: datetime
+    # Source-of-truth hash the dashboard editor uses for optimistic-
+    # display purposes (compare to last-known to detect external
+    # writes mid-edit).
+    content_hash: str = ""
+    updated_at: datetime | None = None
+    # Project + machine context for the detail page. Lets the editor
+    # build the `/v1/projects/{project_id}/skills/upload` URL for save
+    # without an extra round-trip, and lets the page caption say
+    # "on my-mac" so multi-machine users can tell which copy
+    # they're looking at.
+    project_id: str | None = None
+    project_name: str | None = None
+    project_kind: PersistedProjectKind | None = None
+    machine_name: str | None = None
+    environment_id: str | None = None
+
+
+class SkillUploadResponse(BaseModel):
+    skill_key: str
+    name: str
+    version: int
+    file_count: int
+    # Echo the resulting content_hash so `clawdi daemon` processes
+    # can chain the next push with `If-Match: <this hash>` without
+    # an extra round-trip. Empty (legacy) is fine for old callers
+    # that don't read it.
+    content_hash: str = ""
+
+
+class ProjectSkillRefreshRequest(BaseModel):
+    skill_key: str = Field(min_length=1, max_length=200)
+    source_agent_id: UUID
+
+
+class SkillCreateRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=64)
+    description: str = Field(min_length=1, max_length=1024)
+    instructions: str = Field(min_length=1, max_length=200 * 1024)
+
+    @field_validator("name")
+    @classmethod
+    def validate_name(cls, value: str) -> str:
+        return validate_skill_name(value)
+
+    @field_validator("description")
+    @classmethod
+    def validate_description(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("description is required")
+        return value
+
+    @field_validator("instructions")
+    @classmethod
+    def normalize_instructions(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("instructions are required")
+        return normalized
+
+
+class SkillContentUpdateRequest(SkillCreateRequest):
+    content_hash: str = Field(
+        min_length=64,
+        max_length=64,
+        pattern=r"^[a-f0-9]{64}$",
+    )
+
+
+class SkillDeleteResponse(BaseModel):
+    status: Literal["deleted"]
+
+
+class SkillInstallResponse(BaseModel):
+    skill_key: str
+    name: str
+    description: str | None
+    version: int
+    file_count: int
+    repo: str
+
+
+class AgentSkillDesiredResponse(BaseModel):
+    skill_key: str
+    name: str
+    description: str | None = None
+    source: Literal["github", "library", "project", "bundled"]
+    authority: Literal["hosted", "cloud"]
+    read_only: bool
+    skill_id: UUID | None = None
+    project_id: UUID | None = None
+    content_hash: str | None = None
+    source_identity: str
+    source_skill_key: str | None = None
+    desired_state: Literal["present"] = "present"
+    convergence: Literal["installed", "failed", "not_observed"] = "not_observed"
+    observation_error_code: str | None = None
+    observed_at: datetime | None = None
+
+
+class AgentSkillRemovalFailure(BaseModel):
+    skill_key: str
+    observation_error_code: str
+
+
+class AgentSkillDesiredListResponse(BaseModel):
+    agent_id: UUID
+    skills: list[AgentSkillDesiredResponse]
+    removal_failures: list[AgentSkillRemovalFailure] = Field(default_factory=list)
+
+
+class AgentSkillReferenceResponse(BaseModel):
+    agent_id: UUID
+    skill_id: UUID
+    desired_state: Literal["present", "absent"]

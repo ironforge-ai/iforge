@@ -1,0 +1,1987 @@
+from __future__ import annotations
+
+from datetime import UTC, datetime, timedelta
+from typing import Any
+from urllib.parse import quote
+from uuid import UUID
+
+from fastapi import (
+    APIRouter,
+    BackgroundTasks,
+    Depends,
+    HTTPException,
+    Query,
+    Request,
+    Response,
+    status,
+)
+from fastapi.responses import JSONResponse
+from sqlalchemy import and_, func, or_, select, union_all
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.core.auth import (
+    AuthContext,
+    require_user_auth,
+    require_user_auth_unbound,
+)
+from app.core.database import get_session
+from app.models.channel import (
+    BINDING_STATUS_ACTIVE,
+    BINDING_STATUS_ARCHIVED,
+    BOT_AGENT_LINK_STATUS_ACTIVE,
+    CHANNEL_PROVIDER_DISCORD,
+    CHANNEL_PROVIDER_TELEGRAM,
+    CHANNEL_PROVIDER_WHATSAPP,
+    CHANNEL_PROVIDERS,
+    CHANNEL_STATUS_ACTIVE,
+    CHANNEL_VISIBILITY_PRIVATE,
+    CHANNEL_VISIBILITY_PUBLIC,
+    DELIVERY_STATUS_FAILED,
+    DELIVERY_STATUS_IN_PROGRESS,
+    DELIVERY_STATUS_PENDING,
+    DELIVERY_STATUS_SUCCEEDED,
+    ChannelAccount,
+    ChannelBinding,
+    ChannelBotAgentLink,
+    ChannelDebugEvent,
+    ChannelDelivery,
+    ChannelMessage,
+)
+from app.routes.channel_routers.discord import (
+    cleanup_discord_guild_commands_after_authority_revoked,
+)
+from app.routes.channel_routers.shared import (
+    account_response,
+    binding_response,
+    channel_visibility,
+    discord_binding_guild_id,
+    message_response,
+)
+from app.routes.channel_routers.telegram import (
+    reconcile_telegram_binding_unpair_from_ui,
+    reconcile_telegram_link_unlink,
+)
+from app.schemas.channel import (
+    ChannelAccountCreate,
+    ChannelAccountCreatedResponse,
+    ChannelAccountResponse,
+    ChannelActivityItemResponse,
+    ChannelActivityListResponse,
+    ChannelAgentLinkCreate,
+    ChannelAgentLinkResponse,
+    ChannelAgentLinkWithAccountResponse,
+    ChannelBindingDeleteResponse,
+    ChannelBindingResponse,
+    ChannelBotPoolAccess,
+    ChannelBotPoolCapabilities,
+    ChannelBotPoolItem,
+    ChannelBotPoolResponse,
+    ChannelCommandSyncRequest,
+    ChannelCommandSyncResponse,
+    ChannelHealthItemResponse,
+    ChannelHealthListResponse,
+    ChannelMessageResponse,
+    ChannelPairCodeCreate,
+    ChannelPairCodeResponse,
+    ChannelRuntimeStatus,
+    ChannelSendMessageRequest,
+)
+from app.services.agent_bindings import get_owned_agent_or_404
+from app.services.audit import record_control_plane_audit
+from app.services.channel_config import (
+    discord_interactions_config_error,
+    discord_public_account_is_eligible,
+    validate_channel_account_config_urls,
+    validate_required_discord_interactions_config,
+)
+from app.services.channel_debug_events import (
+    public_channel_debug_details_response,
+    public_channel_delivery_error,
+    public_channel_operation_error,
+)
+from app.services.channels import (
+    PAIR_COMMAND,
+    RUNTIME_CHANNEL_PROVIDERS,
+    TELEGRAM_BOT_TOKEN_PATTERN,
+    archive_bot_agent_link,
+    archive_channel_account,
+    bot_agent_link_has_strict_v2_authority,
+    build_channel_account,
+    channel_bot_link_limit,
+    channel_webhook_url,
+    configure_discord_application,
+    configure_telegram_provider_webhook,
+    consume_pending_inbound_messages_for_bindings,
+    create_pair_code,
+    discord_bot_install_url,
+    discord_config_without_unverified_install_state,
+    discord_install_config_is_current,
+    discord_reserved_commands_are_current,
+    discord_user_install_url,
+    encrypt_optional_token,
+    enqueue_channel_outbound_message,
+    ensure_bot_agent_link_provider_cardinality_or_409,
+    ensure_discord_application_identity_available,
+    ensure_hosted_agent_provider_link_available,
+    generate_agent_token,
+    generate_webhook_secret,
+    get_accessible_channel_account,
+    get_or_create_bot_agent_link,
+    get_owned_bot_agent_link,
+    get_owned_private_channel_account,
+    get_strict_v2_hosted_channel_agent_or_409,
+    get_usable_channel_account,
+    hash_token,
+    list_owned_active_bot_agent_links,
+    list_owned_active_bot_agent_links_for_agent,
+    list_strict_v2_hosted_channel_agent_ids,
+    lock_channel_binding_identity,
+    mark_discord_reserved_commands_current,
+    mark_telegram_reserved_commands_current,
+    normalize_telegram_bot_username,
+    rearm_discord_command_reconciliation,
+    rotate_bot_agent_link_token,
+    store_channel_secrets,
+    sync_channel_commands,
+    telegram_reserved_commands_are_current,
+)
+from app.services.http_cache import if_none_match_contains, strong_json_etag
+from app.services.runtime_observed_evidence import (
+    RuntimeObservedEvidence,
+    load_runtime_observed_evidence,
+)
+from app.services.sync_events import queue_environment_runtime_manifest_changed
+from app.services.whatsapp_baileys import ensure_whatsapp_agent_credential
+from app.services.whatsapp_device_onboarding import (
+    require_whatsapp_custom_link_ready,
+    require_whatsapp_logout_for_archive,
+)
+from app.services.whatsapp_native_transport import (
+    WhatsAppSidecarError,
+    whatsapp_phone_number_from_pn_jid,
+)
+from app.services.whatsapp_sidecar_registry import get_active_whatsapp_sidecar_clients
+
+router = APIRouter(prefix="/channels", tags=["channels"])
+
+_CHANNEL_HEALTH_ERROR_WINDOW = timedelta(hours=24)
+
+
+async def _queue_agent_link_runtime_changed(
+    db: AsyncSession,
+    *,
+    account: ChannelAccount,
+    link: ChannelBotAgentLink,
+) -> None:
+    if account.provider not in RUNTIME_CHANNEL_PROVIDERS:
+        return
+    await queue_environment_runtime_manifest_changed(db, link.user_id, link.agent_id)
+
+
+async def _ensure_whatsapp_runtime_material(
+    db: AsyncSession,
+    *,
+    account: ChannelAccount,
+    link: ChannelBotAgentLink,
+) -> bool:
+    if account.provider == CHANNEL_PROVIDER_WHATSAPP:
+        return (
+            await ensure_whatsapp_agent_credential(db, account=account, link=link)
+        ).material_changed
+    return False
+
+
+def _agent_link_response(
+    link: ChannelBotAgentLink,
+    *,
+    agent_token: str | None = None,
+    runtime_status: ChannelRuntimeStatus = "connecting",
+) -> ChannelAgentLinkResponse:
+    return ChannelAgentLinkResponse(
+        id=link.id,
+        account_id=link.account_id,
+        agent_id=link.agent_id,
+        status=link.status,
+        runtime_status=runtime_status,
+        created_at=link.created_at,
+        agent_token=agent_token,
+    )
+
+
+def _agent_link_with_account_response(
+    link: ChannelBotAgentLink,
+    account: ChannelAccount,
+    *,
+    binding_count: int = 0,
+    runtime_status: ChannelRuntimeStatus = "connecting",
+) -> ChannelAgentLinkWithAccountResponse:
+    return ChannelAgentLinkWithAccountResponse(
+        **_agent_link_response(link, runtime_status=runtime_status).model_dump(),
+        account=account_response(account),
+        binding_count=binding_count,
+    )
+
+
+def _agent_link_runtime_status(
+    evidence: RuntimeObservedEvidence | None,
+) -> ChannelRuntimeStatus:
+    if evidence is not None and evidence.status == "ok" and evidence.converged:
+        return "connected"
+    return "connecting"
+
+
+def _activity_message_response(
+    account: ChannelAccount,
+    message: ChannelMessage,
+    delivery: ChannelDelivery | None,
+) -> ChannelActivityItemResponse:
+    return ChannelActivityItemResponse(
+        kind="message",
+        id=message.id,
+        account_id=message.account_id,
+        provider=account.provider,
+        direction=message.direction,
+        external_chat_id=message.external_chat_id,
+        message_id=message.id,
+        delivery_id=delivery.id if delivery is not None else None,
+        delivery_status=delivery.status if delivery is not None else None,
+        delivery_attempts=delivery.attempts if delivery is not None else None,
+        delivery_max_attempts=delivery.max_attempts if delivery is not None else None,
+        delivery_next_attempt_at=delivery.next_attempt_at if delivery is not None else None,
+        delivery_last_error=(
+            public_channel_delivery_error(delivery.last_error) if delivery is not None else None
+        ),
+        provider_message_id=message.provider_message_id,
+        text=message.text,
+        created_at=message.created_at,
+        updated_at=message.updated_at,
+    )
+
+
+def _activity_debug_event_response(
+    account: ChannelAccount,
+    event: ChannelDebugEvent,
+) -> ChannelActivityItemResponse:
+    return ChannelActivityItemResponse(
+        kind="debug_event",
+        id=event.id,
+        account_id=account.id,
+        provider=event.provider,
+        direction=event.direction,
+        external_chat_id=event.external_chat_id,
+        stage=event.stage,
+        outcome=event.outcome,
+        status_code=event.status_code,
+        error=public_channel_operation_error(event.error),
+        details=public_channel_debug_details_response(event.details),
+        created_at=event.created_at,
+        updated_at=event.updated_at,
+    )
+
+
+def _bot_pool_item(
+    account: ChannelAccount,
+    *,
+    user_id: UUID,
+    link_count: int = 0,
+) -> ChannelBotPoolItem:
+    access = _bot_pool_access(account, user_id=user_id)
+    max_links = channel_bot_link_limit(account)
+    available = max_links is None or link_count < max_links
+    return ChannelBotPoolItem(
+        **account_response(account).model_dump(),
+        access=access,
+        capabilities=_bot_pool_capabilities(access, available=available),
+        link_count=link_count,
+        max_links=max_links,
+        available=available,
+    )
+
+
+def _bot_pool_access(account: ChannelAccount, *, user_id: UUID) -> ChannelBotPoolAccess:
+    if account.user_id == user_id and account.visibility == CHANNEL_VISIBILITY_PRIVATE:
+        return "owner"
+    return "public"
+
+
+def _bot_pool_capabilities(
+    access: ChannelBotPoolAccess,
+    *,
+    available: bool,
+) -> ChannelBotPoolCapabilities:
+    can_manage_account = access == "owner"
+    return ChannelBotPoolCapabilities(
+        link_agent=available,
+        pair_chat=available,
+        send_message=True,
+        manage_account=can_manage_account,
+        sync_commands=can_manage_account,
+    )
+
+
+async def _active_bot_agent_link_counts(
+    db: AsyncSession,
+    *,
+    account_ids: list[UUID],
+) -> dict[UUID, int]:
+    if not account_ids:
+        return {}
+    result = await db.execute(
+        select(ChannelBotAgentLink.account_id, func.count())
+        .where(
+            ChannelBotAgentLink.account_id.in_(account_ids),
+            ChannelBotAgentLink.status == BOT_AGENT_LINK_STATUS_ACTIVE,
+            ChannelBotAgentLink.archived_at.is_(None),
+        )
+        .group_by(ChannelBotAgentLink.account_id)
+    )
+    return {account_id: int(count) for account_id, count in result.all()}
+
+
+@router.get("", response_model=list[ChannelAccountResponse])
+async def list_channels(
+    request: Request,
+    auth: AuthContext = Depends(require_user_auth_unbound),
+    db: AsyncSession = Depends(get_session),
+) -> Response:
+    result = await db.execute(
+        select(ChannelAccount)
+        .where(
+            ChannelAccount.archived_at.is_(None),
+            ChannelAccount.user_id == auth.user_id,
+            ChannelAccount.visibility == CHANNEL_VISIBILITY_PRIVATE,
+        )
+        .order_by(
+            ChannelAccount.provider,
+            ChannelAccount.visibility,
+            ChannelAccount.name,
+            ChannelAccount.id,
+        )
+    )
+    payload = [
+        account_response(account).model_dump(mode="json") for account in result.scalars().all()
+    ]
+    etag = strong_json_etag(payload)
+    headers = {"ETag": etag, "Cache-Control": "no-store"}
+    if if_none_match_contains(request.headers.get("if-none-match"), etag):
+        return Response(status_code=status.HTTP_304_NOT_MODIFIED, headers=headers)
+    return JSONResponse(payload, headers=headers)
+
+
+@router.get("/bot-pool")
+async def list_channel_bot_pool(
+    auth: AuthContext = Depends(require_user_auth),
+    db: AsyncSession = Depends(get_session),
+) -> ChannelBotPoolResponse:
+    result = await db.execute(
+        select(ChannelAccount)
+        .where(
+            ChannelAccount.archived_at.is_(None),
+            ChannelAccount.status == CHANNEL_STATUS_ACTIVE,
+            or_(
+                and_(
+                    ChannelAccount.user_id == auth.user_id,
+                    ChannelAccount.visibility == CHANNEL_VISIBILITY_PRIVATE,
+                ),
+                and_(
+                    ChannelAccount.visibility == CHANNEL_VISIBILITY_PUBLIC,
+                    ChannelAccount.user_id.is_(None),
+                ),
+            ),
+        )
+        .order_by(ChannelAccount.provider, ChannelAccount.created_at, ChannelAccount.id)
+    )
+    providers: dict[str, list[ChannelBotPoolItem]] = {
+        provider: [] for provider in CHANNEL_PROVIDERS
+    }
+    accounts = list(result.scalars().all())
+    link_counts = await _active_bot_agent_link_counts(
+        db,
+        account_ids=[account.id for account in accounts],
+    )
+    for account in accounts:
+        if (
+            account.provider == CHANNEL_PROVIDER_DISCORD
+            and account.visibility == CHANNEL_VISIBILITY_PUBLIC
+            and not discord_public_account_is_eligible(account)
+        ):
+            # Historical/incomplete shared Discord accounts remain manageable
+            # through admin APIs but are never offered as usable bot-pool
+            # infrastructure.
+            continue
+        providers.setdefault(account.provider, []).append(
+            _bot_pool_item(
+                account,
+                user_id=auth.user_id,
+                link_count=link_counts.get(account.id, 0),
+            )
+        )
+    return ChannelBotPoolResponse(providers=providers)
+
+
+@router.get("/health")
+async def list_channel_health(
+    auth: AuthContext = Depends(require_user_auth),
+    db: AsyncSession = Depends(get_session),
+) -> ChannelHealthListResponse:
+    accounts = await _health_accounts(db, user_id=auth.user_id)
+    return ChannelHealthListResponse(
+        items=await _channel_health_items(
+            db,
+            accounts=accounts,
+            user_id=auth.user_id,
+        ),
+    )
+
+
+@router.post("", status_code=status.HTTP_201_CREATED)
+async def create_channel(
+    body: ChannelAccountCreate,
+    auth: AuthContext = Depends(require_user_auth),
+    db: AsyncSession = Depends(get_session),
+) -> ChannelAccountCreatedResponse:
+    if body.provider not in CHANNEL_PROVIDERS:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="unsupported provider")
+    await validate_channel_account_config_urls(provider=body.provider, config=body.config)
+    if body.provider == CHANNEL_PROVIDER_DISCORD:
+        if body.provider_token is None:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Discord channels require a bot token.",
+            )
+        validate_required_discord_interactions_config(body.config)
+    if (
+        body.provider == CHANNEL_PROVIDER_TELEGRAM
+        and body.provider_token is not None
+        and not TELEGRAM_BOT_TOKEN_PATTERN.fullmatch(body.provider_token)
+    ):
+        # Reject pasted usernames or mangled tokens before Telegram does; its
+        # rejection is otherwise reported as a provider outage.
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Enter a valid Telegram bot token from @BotFather.",
+        )
+    initial_agent_id = (
+        None
+        if (
+            (body.provider == CHANNEL_PROVIDER_WHATSAPP and "agent_id" not in body.model_fields_set)
+            or ("agent_id" in body.model_fields_set and body.agent_id is None)
+        )
+        else await _resolve_initial_agent_id(
+            db,
+            auth=auth,
+            requested_agent_id=body.agent_id,
+            provider=body.provider,
+        )
+    )
+
+    ciphertext, nonce = encrypt_optional_token(body.provider_token)
+    webhook_secret = generate_webhook_secret()
+    account_config = (
+        discord_config_without_unverified_install_state(body.config)
+        if body.provider == CHANNEL_PROVIDER_DISCORD
+        else body.config
+    )
+    account = build_channel_account(
+        owner_user_id=auth.user_id,
+        provider=body.provider,
+        name=body.name,
+        visibility=CHANNEL_VISIBILITY_PRIVATE,
+        encrypted_provider_token=ciphertext,
+        provider_token_nonce=nonce,
+        webhook_secret_hash=hash_token(webhook_secret),
+        config=account_config,
+    )
+    if initial_agent_id is not None:
+        # Runtime authority and provider support checks must precede Telegram
+        # setWebhook or any other provider I/O.
+        await get_strict_v2_hosted_channel_agent_or_409(
+            db,
+            user_id=auth.user_id,
+            agent_id=initial_agent_id,
+            lock_runtime_fence=True,
+        )
+        await ensure_hosted_agent_provider_link_available(
+            db,
+            account=account,
+            agent_id=initial_agent_id,
+            user_id=auth.user_id,
+            replace_existing_provider_link=body.replace_existing_provider_link,
+        )
+    db.add(account)
+    try:
+        await db.flush()
+        if body.provider == CHANNEL_PROVIDER_TELEGRAM and body.provider_token:
+            bot_username = await configure_telegram_provider_webhook(
+                provider_token=body.provider_token,
+                webhook_url=channel_webhook_url(account.id, body.provider),
+                webhook_secret=webhook_secret,
+            )
+            if bot_username is not None:
+                config = dict(account.config) if isinstance(account.config, dict) else {}
+                config["bot_username"] = bot_username
+                account.config = config
+        link: ChannelBotAgentLink | None = None
+        link_agent_token: str | None = None
+        if initial_agent_id is not None:
+            link_agent_token = generate_agent_token(body.provider)
+            link, created_token = await get_or_create_bot_agent_link(
+                db,
+                account=account,
+                agent_id=initial_agent_id,
+                user_id=auth.user_id,
+                agent_token=link_agent_token,
+                replace_existing_provider_link=body.replace_existing_provider_link,
+            )
+            link_agent_token = created_token or link_agent_token
+            await _ensure_whatsapp_runtime_material(db, account=account, link=link)
+            await _queue_agent_link_runtime_changed(db, account=account, link=link)
+        await store_channel_secrets(db, account=account, secrets_by_name=body.secrets)
+        record_control_plane_audit(
+            db,
+            actor_type="user",
+            actor_user_id=auth.user_id,
+            target_user_id=auth.user_id,
+            action="channel.account.create",
+            resource_type="channel_account",
+            resource_id=str(account.id),
+            channel_account_id=account.id,
+            channel_agent_link_id=link.id if link else None,
+            source="api.channels",
+            details={
+                "provider": account.provider,
+                "visibility": account.visibility,
+                "initial_agent_id": str(initial_agent_id) if initial_agent_id else None,
+                "replace_existing_provider_link": body.replace_existing_provider_link,
+                "has_provider_credential": body.provider_token is not None,
+                "secret_names": sorted((body.secrets or {}).keys()),
+            },
+        )
+        await db.commit()
+    except IntegrityError as exc:
+        await db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="channel name already exists for this provider",
+        ) from exc
+    await db.refresh(account)
+    return ChannelAccountCreatedResponse(
+        **account_response(account).model_dump(),
+        webhook_secret=webhook_secret,
+        agent_link_id=link.id if link else None,
+        agent_id=link.agent_id if link else None,
+        agent_token=link_agent_token,
+    )
+
+
+@router.get("/agent-links")
+async def list_agent_channel_links(
+    agent_id: UUID,
+    auth: AuthContext = Depends(require_user_auth),
+    db: AsyncSession = Depends(get_session),
+) -> list[ChannelAgentLinkWithAccountResponse]:
+    await get_owned_agent_or_404(db, user_id=auth.user_id, agent_id=agent_id)
+    rows = await list_owned_active_bot_agent_links_for_agent(
+        db,
+        user_id=auth.user_id,
+        agent_id=agent_id,
+    )
+    runtime_evidence = await load_runtime_observed_evidence(
+        db,
+        environment_ids=[agent_id],
+        owner_user_id=auth.user_id,
+    )
+    runtime_status = _agent_link_runtime_status(runtime_evidence.get(agent_id))
+    return [
+        _agent_link_with_account_response(
+            link,
+            account,
+            binding_count=binding_count,
+            runtime_status=runtime_status,
+        )
+        for link, account, binding_count in rows
+    ]
+
+
+@router.get("/{account_id}/activity")
+async def list_channel_activity(
+    account_id: UUID,
+    external_chat_id: str | None = Query(default=None, min_length=1, max_length=300),
+    limit: int = Query(default=50, ge=1, le=200),
+    auth: AuthContext = Depends(require_user_auth),
+    db: AsyncSession = Depends(get_session),
+) -> ChannelActivityListResponse:
+    account = await get_usable_channel_account(db, account_id=account_id, user_id=auth.user_id)
+    message_filters = [
+        ChannelMessage.account_id == account.id,
+        ChannelMessage.user_id == auth.user_id,
+    ]
+    debug_filters = [
+        ChannelDebugEvent.account_id == account.id,
+        ChannelDebugEvent.user_id == auth.user_id,
+    ]
+    if external_chat_id is not None:
+        message_filters.append(ChannelMessage.external_chat_id == external_chat_id)
+        debug_filters.append(ChannelDebugEvent.external_chat_id == external_chat_id)
+
+    message_rows = (
+        await db.execute(
+            select(ChannelMessage, ChannelDelivery)
+            .outerjoin(ChannelDelivery, ChannelDelivery.message_id == ChannelMessage.id)
+            .where(*message_filters)
+            .order_by(ChannelMessage.created_at.desc(), ChannelMessage.id.desc())
+            .limit(limit)
+        )
+    ).all()
+    debug_events = (
+        (
+            await db.execute(
+                select(ChannelDebugEvent)
+                .where(*debug_filters)
+                .order_by(ChannelDebugEvent.created_at.desc(), ChannelDebugEvent.id.desc())
+                .limit(limit)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    items = [
+        _activity_message_response(account, message, delivery) for message, delivery in message_rows
+    ]
+    items.extend(_activity_debug_event_response(account, event) for event in debug_events)
+    items.sort(key=lambda item: (item.created_at, str(item.id)), reverse=True)
+    return ChannelActivityListResponse(items=items[:limit])
+
+
+@router.get("/{account_id}")
+async def get_channel(
+    account_id: UUID,
+    auth: AuthContext = Depends(require_user_auth),
+    db: AsyncSession = Depends(get_session),
+) -> ChannelAccountResponse:
+    account = await get_accessible_channel_account(db, account_id=account_id, user_id=auth.user_id)
+    return account_response(account)
+
+
+@router.delete("/{account_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_channel(
+    account_id: UUID,
+    auth: AuthContext = Depends(require_user_auth),
+    db: AsyncSession = Depends(get_session),
+) -> None:
+    account = await get_owned_private_channel_account(
+        db,
+        account_id=account_id,
+        user_id=auth.user_id,
+    )
+    active_links = list(
+        (
+            await db.execute(
+                select(ChannelBotAgentLink).where(
+                    ChannelBotAgentLink.account_id == account.id,
+                    ChannelBotAgentLink.status == BOT_AGENT_LINK_STATUS_ACTIVE,
+                    ChannelBotAgentLink.archived_at.is_(None),
+                )
+            )
+        ).scalars()
+    )
+    await require_whatsapp_logout_for_archive(
+        db,
+        account=account,
+        registry=get_active_whatsapp_sidecar_clients(),
+    )
+    await archive_channel_account(db, account=account)
+    for link in active_links:
+        await _queue_agent_link_runtime_changed(db, account=account, link=link)
+    record_control_plane_audit(
+        db,
+        actor_type="user",
+        actor_user_id=auth.user_id,
+        target_user_id=auth.user_id,
+        action="channel.account.archive",
+        resource_type="channel_account",
+        resource_id=str(account.id),
+        channel_account_id=account.id,
+        source="api.channels",
+        details={"provider": account.provider, "visibility": account.visibility},
+    )
+    await db.commit()
+
+
+async def _whatsapp_pair_deep_link(
+    account: ChannelAccount,
+    *,
+    pairing_command: str,
+) -> str | None:
+    if (
+        account.provider != CHANNEL_PROVIDER_WHATSAPP
+        or account.visibility != CHANNEL_VISIBILITY_PUBLIC
+        or account.user_id is not None
+    ):
+        return None
+    config = account.config if isinstance(account.config, dict) else {}
+    configured_revision = config.get("sidecar_config_revision")
+    if config.get("connection_mode") != "baileys_managed" or not isinstance(
+        configured_revision, str
+    ):
+        return None
+    stored_phone_number = config.get("phone_number")
+    if isinstance(stored_phone_number, str):
+        trusted_phone_number = whatsapp_phone_number_from_pn_jid(
+            f"{stored_phone_number}@s.whatsapp.net"
+        )
+        if trusted_phone_number is not None:
+            return f"https://wa.me/{trusted_phone_number}?text={quote(pairing_command, safe='')}"
+    registry = get_active_whatsapp_sidecar_clients()
+    if registry is None or registry.session_revision(account.id) != configured_revision:
+        return None
+    client = registry.session_client(account.id)
+    if client is None:
+        return None
+    try:
+        health = await client.health()
+    except WhatsAppSidecarError:
+        return None
+    if not health.registered:
+        return None
+    phone_number = whatsapp_phone_number_from_pn_jid(health.account_jid)
+    if phone_number is None:
+        return None
+    return f"https://wa.me/{phone_number}?text={quote(pairing_command, safe='')}"
+
+
+@router.post("/{account_id}/pair-codes", status_code=status.HTTP_201_CREATED)
+async def create_channel_pair_code(
+    account_id: UUID,
+    body: ChannelPairCodeCreate,
+    auth: AuthContext = Depends(require_user_auth),
+    db: AsyncSession = Depends(get_session),
+) -> ChannelPairCodeResponse:
+    account = await get_usable_channel_account(db, account_id=account_id, user_id=auth.user_id)
+    await require_whatsapp_custom_link_ready(
+        account,
+        registry=get_active_whatsapp_sidecar_clients(),
+    )
+    if (
+        account.provider == CHANNEL_PROVIDER_TELEGRAM
+        and account.encrypted_provider_token
+        and account.provider_token_nonce
+        and not telegram_reserved_commands_are_current(account)
+    ):
+        await sync_channel_commands(account=account)
+        mark_telegram_reserved_commands_current(account)
+    if account.provider == CHANNEL_PROVIDER_DISCORD:
+        await ensure_discord_application_identity_available(db, account=account)
+        config_error = discord_interactions_config_error(account.config)
+        if config_error is not None:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"Discord pairing is unavailable: {config_error}",
+            )
+        config = dict(account.config) if isinstance(account.config, dict) else {}
+        interactions_configured = config.get("discord_interactions_configured") is True
+        commands_current = discord_reserved_commands_are_current(account)
+        install_config_current = discord_install_config_is_current(account)
+        if not interactions_configured or not install_config_current:
+            await configure_discord_application(account)
+            await rearm_discord_command_reconciliation(db, account=account)
+            config = dict(account.config) if isinstance(account.config, dict) else {}
+        if not interactions_configured or not install_config_current or not commands_current:
+            # Reserved control-plane commands are true account-global
+            # commands so they remain available before any Guild or DM is
+            # paired. Agent runtime commands are virtualized per Link.
+            await sync_channel_commands(
+                account=account,
+                use_configured_discord_guild=False,
+            )
+            legacy_guild_id = config.get("guild_id")
+            if (
+                interactions_configured
+                and not commands_current
+                and isinstance(legacy_guild_id, str)
+                and legacy_guild_id.strip()
+            ):
+                # Older accounts could have installed the reserved commands in
+                # their configured guild scope. Reconcile that known scope too
+                # so the legacy bot_* commands cannot remain visible beside the
+                # new global commands.
+                await sync_channel_commands(
+                    account=account,
+                    guild_id=legacy_guild_id.strip(),
+                )
+            config["discord_interactions_configured"] = True
+            account.config = config
+            mark_discord_reserved_commands_current(account)
+    link, agent_token = await _resolve_pair_code_link(db, auth=auth, account=account, body=body)
+    material_changed = await _ensure_whatsapp_runtime_material(db, account=account, link=link)
+    created = await create_pair_code(
+        db,
+        account=account,
+        link=link,
+        ttl_seconds=body.ttl_seconds,
+        agent_token=agent_token,
+    )
+    if agent_token is not None or material_changed:
+        await _queue_agent_link_runtime_changed(db, account=account, link=created.link)
+    record_control_plane_audit(
+        db,
+        actor_type="user",
+        actor_user_id=auth.user_id,
+        target_user_id=auth.user_id,
+        action="channel.pair_code.create",
+        resource_type="channel_pair_code",
+        resource_id=str(created.pair_code.id),
+        channel_account_id=account.id,
+        channel_agent_link_id=created.link.id,
+        source="api.channels",
+        details={
+            "provider": account.provider,
+            "agent_id": str(created.link.agent_id),
+            "ttl_seconds": body.ttl_seconds,
+        },
+    )
+    await db.commit()
+    await db.refresh(created.pair_code)
+    pairing_command = f"{PAIR_COMMAND} {created.code}"
+    bot_username = _telegram_bot_username(account)
+    deep_link = (
+        f"https://t.me/{bot_username}?start={quote(created.code, safe='')}"
+        if bot_username is not None
+        else await _whatsapp_pair_deep_link(account, pairing_command=pairing_command)
+    )
+    return ChannelPairCodeResponse(
+        id=created.pair_code.id,
+        agent_link_id=created.link.id,
+        agent_id=created.link.agent_id,
+        agent_token=created.agent_token,
+        code=created.code,
+        expires_at=created.pair_code.expires_at,
+        pairing_command=pairing_command,
+        bot_username=bot_username,
+        deep_link=deep_link,
+        qr_payload=deep_link,
+        discord_install_url=discord_bot_install_url(account),
+        discord_user_install_url=discord_user_install_url(account),
+    )
+
+
+@router.get("/{account_id}/agent-links")
+async def list_channel_agent_links(
+    account_id: UUID,
+    auth: AuthContext = Depends(require_user_auth),
+    db: AsyncSession = Depends(get_session),
+) -> list[ChannelAgentLinkResponse]:
+    account = await get_accessible_channel_account(db, account_id=account_id, user_id=auth.user_id)
+    result = await db.execute(
+        select(ChannelBotAgentLink)
+        .where(
+            ChannelBotAgentLink.account_id == account.id,
+            ChannelBotAgentLink.user_id == auth.user_id,
+            ChannelBotAgentLink.status == BOT_AGENT_LINK_STATUS_ACTIVE,
+            ChannelBotAgentLink.archived_at.is_(None),
+        )
+        .order_by(ChannelBotAgentLink.created_at)
+    )
+    links = list(result.scalars().all())
+    runtime_evidence = await load_runtime_observed_evidence(
+        db,
+        environment_ids=[link.agent_id for link in links],
+        owner_user_id=auth.user_id,
+    )
+    return [
+        _agent_link_response(
+            link,
+            runtime_status=_agent_link_runtime_status(runtime_evidence.get(link.agent_id)),
+        )
+        for link in links
+    ]
+
+
+@router.post("/{account_id}/agent-links", status_code=status.HTTP_201_CREATED)
+async def create_channel_agent_link(
+    account_id: UUID,
+    body: ChannelAgentLinkCreate,
+    auth: AuthContext = Depends(require_user_auth),
+    db: AsyncSession = Depends(get_session),
+) -> ChannelAgentLinkResponse:
+    account = await get_usable_channel_account(db, account_id=account_id, user_id=auth.user_id)
+    await require_whatsapp_custom_link_ready(
+        account,
+        registry=get_active_whatsapp_sidecar_clients(),
+    )
+    agent_id = await _resolve_agent_id_for_link(db, auth=auth, requested_agent_id=body.agent_id)
+    link, agent_token = await get_or_create_bot_agent_link(
+        db,
+        account=account,
+        agent_id=agent_id,
+        user_id=auth.user_id,
+        replace_existing_provider_link=body.replace_existing_provider_link,
+    )
+    material_changed = await _ensure_whatsapp_runtime_material(db, account=account, link=link)
+    if agent_token is not None or material_changed:
+        await _queue_agent_link_runtime_changed(db, account=account, link=link)
+    record_control_plane_audit(
+        db,
+        actor_type="user",
+        actor_user_id=auth.user_id,
+        target_user_id=auth.user_id,
+        action="channel.agent_link.create" if agent_token else "channel.agent_link.ensure",
+        resource_type="channel_agent_link",
+        resource_id=str(link.id),
+        channel_account_id=account.id,
+        channel_agent_link_id=link.id,
+        source="api.channels",
+        details={
+            "provider": account.provider,
+            "agent_id": str(agent_id),
+            "created": agent_token is not None,
+            "replace_existing_provider_link": body.replace_existing_provider_link,
+        },
+    )
+    await db.commit()
+    await db.refresh(link)
+    return _agent_link_response(link, agent_token=agent_token)
+
+
+@router.post("/{account_id}/agent-links/{link_id}/token")
+async def rotate_channel_agent_link_token(
+    account_id: UUID,
+    link_id: UUID,
+    auth: AuthContext = Depends(require_user_auth),
+    db: AsyncSession = Depends(get_session),
+) -> ChannelAgentLinkResponse:
+    account = await get_usable_channel_account(db, account_id=account_id, user_id=auth.user_id)
+    link = await get_owned_bot_agent_link(
+        db, account=account, link_id=link_id, user_id=auth.user_id
+    )
+    agent_token = await rotate_bot_agent_link_token(db, account=account, link=link)
+    await _queue_agent_link_runtime_changed(db, account=account, link=link)
+    record_control_plane_audit(
+        db,
+        actor_type="user",
+        actor_user_id=auth.user_id,
+        target_user_id=auth.user_id,
+        action="channel.agent_link.credential_rotate",
+        resource_type="channel_agent_link",
+        resource_id=str(link.id),
+        channel_account_id=account.id,
+        channel_agent_link_id=link.id,
+        source="api.channels",
+        details={"provider": account.provider, "agent_id": str(link.agent_id)},
+    )
+    await db.commit()
+    await db.refresh(link)
+    return _agent_link_response(link, agent_token=agent_token)
+
+
+@router.delete("/{account_id}/agent-links/{link_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_channel_agent_link(
+    account_id: UUID,
+    link_id: UUID,
+    background_tasks: BackgroundTasks,
+    auth: AuthContext = Depends(require_user_auth),
+    db: AsyncSession = Depends(get_session),
+) -> None:
+    account = await get_usable_channel_account(db, account_id=account_id, user_id=auth.user_id)
+    link_result = await db.execute(
+        select(ChannelBotAgentLink)
+        .where(
+            ChannelBotAgentLink.id == link_id,
+            ChannelBotAgentLink.account_id == account.id,
+            ChannelBotAgentLink.user_id == auth.user_id,
+        )
+        .execution_options(populate_existing=True)
+        .with_for_update()
+    )
+    link = link_result.scalar_one_or_none()
+    if link is None or link.status != BOT_AGENT_LINK_STATUS_ACTIVE or link.archived_at is not None:
+        return
+
+    bindings = list(
+        (
+            await db.execute(
+                select(ChannelBinding).where(
+                    ChannelBinding.bot_agent_link_id == link.id,
+                    ChannelBinding.status == BINDING_STATUS_ACTIVE,
+                )
+            )
+        ).scalars()
+    )
+    discord_guild_ids = (
+        {
+            guild_id
+            for binding in bindings
+            if (guild_id := discord_binding_guild_id(binding)) is not None
+        }
+        if account.provider == CHANNEL_PROVIDER_DISCORD
+        else set[str]()
+    )
+    for binding in sorted(bindings, key=lambda item: item.external_chat_id):
+        await lock_channel_binding_identity(
+            db,
+            account_id=account.id,
+            external_chat_id=binding.external_chat_id,
+        )
+    await archive_bot_agent_link(db, link=link, account=account)
+    await _queue_agent_link_runtime_changed(db, account=account, link=link)
+    record_control_plane_audit(
+        db,
+        actor_type="user",
+        actor_user_id=auth.user_id,
+        target_user_id=auth.user_id,
+        action="channel.agent_link.archive",
+        resource_type="channel_agent_link",
+        resource_id=str(link.id),
+        channel_account_id=account.id,
+        channel_agent_link_id=link.id,
+        source="api.channels",
+        details={"provider": account.provider, "agent_id": str(link.agent_id)},
+    )
+    await db.commit()
+    if discord_guild_ids:
+        background_tasks.add_task(
+            cleanup_discord_guild_commands_after_authority_revoked,
+            account_id=account.id,
+            bot_agent_link_id=link.id,
+            guild_ids=discord_guild_ids,
+        )
+    elif account.provider == CHANNEL_PROVIDER_TELEGRAM and bindings:
+        cleaned = await reconcile_telegram_link_unlink(
+            db=db,
+            account=account,
+            link=link,
+            bindings=bindings,
+        )
+        if not cleaned:
+            record_control_plane_audit(
+                db,
+                actor_type="system",
+                target_user_id=auth.user_id,
+                action="channel.agent_link.telegram_cleanup_failed",
+                resource_type="channel_agent_link",
+                resource_id=str(link.id),
+                channel_account_id=account.id,
+                channel_agent_link_id=link.id,
+                source="api.channels",
+                details={"provider": account.provider},
+            )
+        await db.commit()
+
+
+@router.get("/{account_id}/bindings")
+async def list_channel_bindings(
+    account_id: UUID,
+    auth: AuthContext = Depends(require_user_auth),
+    db: AsyncSession = Depends(get_session),
+) -> list[ChannelBindingResponse]:
+    account = await get_accessible_channel_account(db, account_id=account_id, user_id=auth.user_id)
+    binding_activity = (
+        select(
+            ChannelMessage.binding_id.label("binding_id"),
+            func.max(ChannelMessage.created_at).label("last_message_at"),
+        )
+        .where(
+            ChannelMessage.account_id == account.id,
+            ChannelMessage.user_id == auth.user_id,
+            ChannelMessage.binding_id.is_not(None),
+        )
+        .group_by(ChannelMessage.binding_id)
+        .subquery()
+    )
+    result = await db.execute(
+        select(ChannelBinding, binding_activity.c.last_message_at)
+        .outerjoin(binding_activity, binding_activity.c.binding_id == ChannelBinding.id)
+        .where(
+            ChannelBinding.account_id == account.id,
+            ChannelBinding.user_id == auth.user_id,
+            ChannelBinding.status == BINDING_STATUS_ACTIVE,
+        )
+        .order_by(ChannelBinding.created_at.desc())
+    )
+    return [
+        binding_response(binding, last_message_at=last_message_at)
+        for binding, last_message_at in result.all()
+    ]
+
+
+@router.delete("/{account_id}/bindings/{binding_id}")
+async def delete_channel_binding(
+    account_id: UUID,
+    binding_id: UUID,
+    auth: AuthContext = Depends(require_user_auth),
+    db: AsyncSession = Depends(get_session),
+) -> ChannelBindingDeleteResponse:
+    account = await get_usable_channel_account(db, account_id=account_id, user_id=auth.user_id)
+    row = (
+        await db.execute(
+            select(ChannelBinding, ChannelBotAgentLink)
+            .join(
+                ChannelBotAgentLink,
+                and_(
+                    ChannelBotAgentLink.id == ChannelBinding.bot_agent_link_id,
+                    ChannelBotAgentLink.account_id == ChannelBinding.account_id,
+                    ChannelBotAgentLink.user_id == ChannelBinding.user_id,
+                ),
+            )
+            .where(
+                ChannelBinding.id == binding_id,
+                ChannelBinding.account_id == account.id,
+                ChannelBinding.user_id == auth.user_id,
+                ChannelBotAgentLink.user_id == auth.user_id,
+                ChannelBotAgentLink.status == BOT_AGENT_LINK_STATUS_ACTIVE,
+                ChannelBotAgentLink.archived_at.is_(None),
+            )
+        )
+    ).one_or_none()
+    if row is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="binding not found")
+    binding, _link = row
+    await lock_channel_binding_identity(
+        db,
+        account_id=account.id,
+        external_chat_id=binding.external_chat_id,
+    )
+    row = (
+        await db.execute(
+            select(ChannelBinding, ChannelBotAgentLink)
+            .join(
+                ChannelBotAgentLink,
+                and_(
+                    ChannelBotAgentLink.id == ChannelBinding.bot_agent_link_id,
+                    ChannelBotAgentLink.account_id == ChannelBinding.account_id,
+                    ChannelBotAgentLink.user_id == ChannelBinding.user_id,
+                ),
+            )
+            .where(
+                ChannelBinding.id == binding_id,
+                ChannelBinding.account_id == account.id,
+                ChannelBinding.user_id == auth.user_id,
+                ChannelBotAgentLink.user_id == auth.user_id,
+                ChannelBotAgentLink.status == BOT_AGENT_LINK_STATUS_ACTIVE,
+                ChannelBotAgentLink.archived_at.is_(None),
+            )
+            .execution_options(populate_existing=True)
+            .with_for_update(of=ChannelBinding)
+        )
+    ).one_or_none()
+    if row is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="binding not found")
+    binding, link = row
+    await get_owned_agent_or_404(db, user_id=auth.user_id, agent_id=link.agent_id)
+    discord_guild_id = (
+        discord_binding_guild_id(binding) if account.provider == CHANNEL_PROVIDER_DISCORD else None
+    )
+
+    if binding.status != BINDING_STATUS_ACTIVE:
+        return ChannelBindingDeleteResponse(
+            binding_id=binding.id,
+            unpaired=False,
+            notification_status="not_applicable",
+            provider_cleanup_status="not_applicable",
+        )
+
+    binding.status = BINDING_STATUS_ARCHIVED
+    await consume_pending_inbound_messages_for_bindings(db, bindings=[binding])
+    record_control_plane_audit(
+        db,
+        actor_type="user",
+        actor_user_id=auth.user_id,
+        target_user_id=auth.user_id,
+        action="channel.binding.archive",
+        resource_type="channel_binding",
+        resource_id=str(binding.id),
+        environment_id=link.agent_id,
+        channel_account_id=account.id,
+        channel_agent_link_id=link.id,
+        source="api.channels",
+        details={
+            "provider": account.provider,
+            "external_chat_id": binding.external_chat_id,
+        },
+    )
+    # Authority commits before any provider I/O. Notification or provider cleanup
+    # failure can never roll back a completed unpair.
+    await db.commit()
+
+    notification_status = "not_applicable"
+    provider_cleanup_status = "not_applicable"
+    warning: str | None = None
+    if account.provider == CHANNEL_PROVIDER_TELEGRAM:
+        outcome = await reconcile_telegram_binding_unpair_from_ui(
+            db=db,
+            account=account,
+            link=link,
+            binding=binding,
+        )
+        notification_status = "sent" if outcome.notification_sent else "failed"
+        provider_cleanup_status = (
+            "succeeded" if outcome.commands_cleared and outcome.menu_reset else "failed"
+        )
+        if notification_status == "failed" or provider_cleanup_status == "failed":
+            warning = (
+                "Chat was unpaired, but Telegram notification or per-chat cleanup did not complete."
+            )
+        record_control_plane_audit(
+            db,
+            actor_type="user",
+            actor_user_id=auth.user_id,
+            target_user_id=auth.user_id,
+            action="channel.binding.telegram_cleanup",
+            resource_type="channel_binding",
+            resource_id=str(binding.id),
+            environment_id=link.agent_id,
+            channel_account_id=account.id,
+            channel_agent_link_id=link.id,
+            source="api.channels",
+            details={
+                "notification_status": notification_status,
+                "provider_cleanup_status": provider_cleanup_status,
+            },
+        )
+        await db.commit()
+    elif account.provider == CHANNEL_PROVIDER_DISCORD and discord_guild_id is not None:
+        cleanup_succeeded = await cleanup_discord_guild_commands_after_authority_revoked(
+            account_id=account.id,
+            bot_agent_link_id=link.id,
+            guild_ids={discord_guild_id},
+        )
+        provider_cleanup_status = "succeeded" if cleanup_succeeded else "failed"
+        if not cleanup_succeeded:
+            warning = "Chat was unpaired, but Discord server command cleanup did not complete."
+        record_control_plane_audit(
+            db,
+            actor_type="user",
+            actor_user_id=auth.user_id,
+            target_user_id=auth.user_id,
+            action="channel.binding.discord_cleanup",
+            resource_type="channel_binding",
+            resource_id=str(binding.id),
+            environment_id=link.agent_id,
+            channel_account_id=account.id,
+            channel_agent_link_id=link.id,
+            source="api.channels",
+            details={
+                "guild_id": discord_guild_id,
+                "provider_cleanup_status": provider_cleanup_status,
+            },
+        )
+        await db.commit()
+
+    return ChannelBindingDeleteResponse(
+        binding_id=binding.id,
+        unpaired=True,
+        notification_status=notification_status,
+        provider_cleanup_status=provider_cleanup_status,
+        warning=warning,
+    )
+
+
+@router.post("/{account_id}/commands/sync")
+async def sync_channel_commands_route(
+    account_id: UUID,
+    body: ChannelCommandSyncRequest,
+    auth: AuthContext = Depends(require_user_auth),
+    db: AsyncSession = Depends(get_session),
+) -> ChannelCommandSyncResponse:
+    account = await get_owned_private_channel_account(
+        db,
+        account_id=account_id,
+        user_id=auth.user_id,
+    )
+    commands = (
+        [command.model_dump(exclude_none=True) for command in body.commands]
+        if body.commands is not None
+        else None
+    )
+    synced = await sync_channel_commands(
+        account=account,
+        commands=commands,
+        guild_id=body.guild_id,
+    )
+    if account.provider == CHANNEL_PROVIDER_DISCORD and commands is None and body.guild_id is None:
+        mark_discord_reserved_commands_current(account)
+        await db.commit()
+    if account.provider == CHANNEL_PROVIDER_TELEGRAM:
+        mark_telegram_reserved_commands_current(account)
+        await db.commit()
+    return ChannelCommandSyncResponse(provider=account.provider, commands=synced)
+
+
+@router.post("/{account_id}/messages", status_code=status.HTTP_201_CREATED)
+async def send_channel_message(
+    account_id: UUID,
+    body: ChannelSendMessageRequest,
+    auth: AuthContext = Depends(require_user_auth),
+    db: AsyncSession = Depends(get_session),
+) -> ChannelMessageResponse:
+    account = await get_usable_channel_account(db, account_id=account_id, user_id=auth.user_id)
+    external_chat_id = body.external_chat_id
+    bot_agent_link_id: UUID | None = None
+    if body.binding_id is not None:
+        result = await db.execute(
+            select(ChannelBinding).where(
+                ChannelBinding.id == body.binding_id,
+                ChannelBinding.account_id == account.id,
+                ChannelBinding.user_id == auth.user_id,
+                ChannelBinding.status == BINDING_STATUS_ACTIVE,
+            )
+        )
+        binding = result.scalar_one_or_none()
+        if binding is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="binding not found")
+        external_chat_id = binding.external_chat_id
+        bot_agent_link_id = binding.bot_agent_link_id
+    elif account.visibility == CHANNEL_VISIBILITY_PUBLIC and external_chat_id is not None:
+        result = await db.execute(
+            select(ChannelBinding)
+            .where(
+                ChannelBinding.account_id == account.id,
+                ChannelBinding.user_id == auth.user_id,
+                ChannelBinding.external_chat_id == external_chat_id,
+                ChannelBinding.status == BINDING_STATUS_ACTIVE,
+            )
+            .order_by(ChannelBinding.created_at.desc())
+            .limit(1)
+        )
+        binding = result.scalar_one_or_none()
+        if binding is None:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="chat is not paired with this user",
+            )
+        bot_agent_link_id = binding.bot_agent_link_id
+    if external_chat_id is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="binding_id or external_chat_id is required",
+        )
+    message, delivery = await enqueue_channel_outbound_message(
+        db,
+        account=account,
+        external_chat_id=external_chat_id,
+        text=body.text,
+        bot_agent_link_id=bot_agent_link_id,
+    )
+    await db.commit()
+    await db.refresh(message)
+    await db.refresh(delivery)
+    return message_response(message, delivery=delivery)
+
+
+async def _resolve_agent_id_for_link(
+    db: AsyncSession,
+    *,
+    auth: AuthContext,
+    requested_agent_id: UUID | None,
+) -> UUID:
+    if requested_agent_id is not None:
+        await get_owned_agent_or_404(db, user_id=auth.user_id, agent_id=requested_agent_id)
+        await get_strict_v2_hosted_channel_agent_or_409(
+            db,
+            user_id=auth.user_id,
+            agent_id=requested_agent_id,
+        )
+        return requested_agent_id
+    if auth.is_cli and auth.api_key is not None and auth.api_key.environment_id is not None:
+        await get_owned_agent_or_404(
+            db,
+            user_id=auth.user_id,
+            agent_id=auth.api_key.environment_id,
+        )
+        await get_strict_v2_hosted_channel_agent_or_409(
+            db,
+            user_id=auth.user_id,
+            agent_id=auth.api_key.environment_id,
+        )
+        return auth.api_key.environment_id
+    raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="agent_id is required")
+
+
+async def _resolve_initial_agent_id(
+    db: AsyncSession,
+    *,
+    auth: AuthContext,
+    requested_agent_id: UUID | None,
+    provider: str,
+) -> UUID | None:
+    if requested_agent_id is not None:
+        await get_owned_agent_or_404(db, user_id=auth.user_id, agent_id=requested_agent_id)
+        await get_strict_v2_hosted_channel_agent_or_409(
+            db,
+            user_id=auth.user_id,
+            agent_id=requested_agent_id,
+        )
+        return requested_agent_id
+    if auth.is_cli and auth.api_key is not None and auth.api_key.environment_id is not None:
+        await get_owned_agent_or_404(
+            db,
+            user_id=auth.user_id,
+            agent_id=auth.api_key.environment_id,
+        )
+        await get_strict_v2_hosted_channel_agent_or_409(
+            db,
+            user_id=auth.user_id,
+            agent_id=auth.api_key.environment_id,
+        )
+        return auth.api_key.environment_id
+    agent_ids = await list_strict_v2_hosted_channel_agent_ids(
+        db,
+        user_id=auth.user_id,
+        provider=provider,
+    )
+    if len(agent_ids) == 1:
+        return agent_ids[0]
+    return None
+
+
+async def _resolve_pair_code_link(
+    db: AsyncSession,
+    *,
+    auth: AuthContext,
+    account: ChannelAccount,
+    body: ChannelPairCodeCreate,
+) -> tuple[ChannelBotAgentLink, str | None]:
+    if body.agent_link_id is not None:
+        link = await get_owned_bot_agent_link(
+            db,
+            account=account,
+            link_id=body.agent_link_id,
+            user_id=auth.user_id,
+        )
+        await get_strict_v2_hosted_channel_agent_or_409(
+            db,
+            user_id=auth.user_id,
+            agent_id=link.agent_id,
+            lock_runtime_fence=True,
+        )
+        if not await bot_agent_link_has_strict_v2_authority(db, link=link):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="This Agent Link has no managed runtime authority.",
+            )
+        await ensure_bot_agent_link_provider_cardinality_or_409(
+            db,
+            account=account,
+            link=link,
+        )
+        return link, None
+    if body.agent_id is not None:
+        await get_owned_agent_or_404(db, user_id=auth.user_id, agent_id=body.agent_id)
+        link, agent_token = await get_or_create_bot_agent_link(
+            db,
+            account=account,
+            agent_id=body.agent_id,
+            user_id=auth.user_id,
+        )
+        await get_strict_v2_hosted_channel_agent_or_409(
+            db,
+            user_id=auth.user_id,
+            agent_id=link.agent_id,
+            lock_runtime_fence=True,
+        )
+        if not await bot_agent_link_has_strict_v2_authority(db, link=link):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="This Agent Link has no managed runtime authority.",
+            )
+        await ensure_bot_agent_link_provider_cardinality_or_409(
+            db,
+            account=account,
+            link=link,
+        )
+        return link, agent_token
+    links = await list_owned_active_bot_agent_links(db, account=account, user_id=auth.user_id)
+    if len(links) == 1:
+        await get_strict_v2_hosted_channel_agent_or_409(
+            db,
+            user_id=auth.user_id,
+            agent_id=links[0].agent_id,
+            lock_runtime_fence=True,
+        )
+        if not await bot_agent_link_has_strict_v2_authority(db, link=links[0]):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="This Agent Link has no managed runtime authority.",
+            )
+        await ensure_bot_agent_link_provider_cardinality_or_409(
+            db,
+            account=account,
+            link=links[0],
+        )
+        return links[0], None
+    detail = "agent_id or agent_link_id is required"
+    if len(links) > 1:
+        detail = "agent_id or agent_link_id is required for channels with multiple agents"
+    raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=detail)
+
+
+async def _health_accounts(
+    db: AsyncSession,
+    *,
+    user_id: UUID,
+) -> list[ChannelAccount]:
+    result = await db.execute(
+        select(ChannelAccount)
+        .outerjoin(
+            ChannelBotAgentLink,
+            and_(
+                ChannelBotAgentLink.account_id == ChannelAccount.id,
+                ChannelBotAgentLink.user_id == user_id,
+                ChannelBotAgentLink.status == BOT_AGENT_LINK_STATUS_ACTIVE,
+                ChannelBotAgentLink.archived_at.is_(None),
+            ),
+        )
+        .outerjoin(
+            ChannelBinding,
+            and_(
+                ChannelBinding.account_id == ChannelAccount.id,
+                ChannelBinding.user_id == user_id,
+                ChannelBinding.status == BINDING_STATUS_ACTIVE,
+            ),
+        )
+        .where(
+            ChannelAccount.archived_at.is_(None),
+            or_(
+                and_(
+                    ChannelAccount.user_id == user_id,
+                    ChannelAccount.visibility == CHANNEL_VISIBILITY_PRIVATE,
+                ),
+                and_(
+                    ChannelAccount.visibility == CHANNEL_VISIBILITY_PUBLIC,
+                    ChannelAccount.user_id.is_(None),
+                    ChannelAccount.status == CHANNEL_STATUS_ACTIVE,
+                    or_(
+                        ChannelBotAgentLink.id.is_not(None),
+                        ChannelBinding.id.is_not(None),
+                    ),
+                ),
+            ),
+        )
+        .order_by(ChannelAccount.provider, ChannelAccount.visibility, ChannelAccount.name)
+    )
+    accounts: list[ChannelAccount] = []
+    seen: set[UUID] = set()
+    for account in result.scalars().all():
+        if account.id in seen:
+            continue
+        seen.add(account.id)
+        accounts.append(account)
+    return accounts
+
+
+async def _channel_health_items(
+    db: AsyncSession,
+    *,
+    accounts: list[ChannelAccount],
+    user_id: UUID,
+) -> list[ChannelHealthItemResponse]:
+    if not accounts:
+        return []
+    account_ids = [account.id for account in accounts]
+    recent_error_cutoff = datetime.now(UTC) - _CHANNEL_HEALTH_ERROR_WINDOW
+
+    runtime_link_rows = (
+        await db.execute(
+            select(
+                ChannelBotAgentLink.account_id,
+                ChannelBotAgentLink.agent_id,
+            ).where(
+                ChannelBotAgentLink.account_id.in_(account_ids),
+                ChannelBotAgentLink.user_id == user_id,
+                ChannelBotAgentLink.status == BOT_AGENT_LINK_STATUS_ACTIVE,
+                ChannelBotAgentLink.archived_at.is_(None),
+            )
+        )
+    ).all()
+    runtime_evidence_by_agent = await load_runtime_observed_evidence(
+        db,
+        environment_ids=[agent_id for _account_id, agent_id in runtime_link_rows],
+        owner_user_id=user_id,
+    )
+    runtime_evidence_by_account: dict[UUID, list[RuntimeObservedEvidence]] = {}
+    for account_id, agent_id in runtime_link_rows:
+        runtime_evidence_by_account.setdefault(account_id, []).append(
+            runtime_evidence_by_agent.get(
+                agent_id,
+                RuntimeObservedEvidence(status="missing", observed_at=None, converged=False),
+            )
+        )
+
+    pending_inbox_rows = await db.execute(
+        select(
+            ChannelMessage.account_id,
+            func.count(ChannelMessage.id),
+            func.min(ChannelMessage.created_at),
+        )
+        .join(
+            ChannelBinding,
+            and_(
+                ChannelBinding.id == ChannelMessage.binding_id,
+                ChannelBinding.account_id == ChannelMessage.account_id,
+                ChannelBinding.bot_agent_link_id == ChannelMessage.bot_agent_link_id,
+                ChannelBinding.user_id == ChannelMessage.user_id,
+            ),
+        )
+        .join(
+            ChannelBotAgentLink,
+            and_(
+                ChannelBotAgentLink.id == ChannelMessage.bot_agent_link_id,
+                ChannelBotAgentLink.account_id == ChannelMessage.account_id,
+            ),
+        )
+        .join(ChannelAccount, ChannelAccount.id == ChannelMessage.account_id)
+        .where(
+            ChannelMessage.account_id.in_(account_ids),
+            ChannelMessage.user_id == user_id,
+            ChannelMessage.direction == "inbound",
+            ChannelMessage.binding_id.is_not(None),
+            ChannelMessage.delivered_at.is_(None),
+            ChannelBinding.status == BINDING_STATUS_ACTIVE,
+            ChannelBotAgentLink.status == BOT_AGENT_LINK_STATUS_ACTIVE,
+            ChannelBotAgentLink.archived_at.is_(None),
+            ChannelAccount.status == CHANNEL_STATUS_ACTIVE,
+            ChannelAccount.archived_at.is_(None),
+        )
+        .group_by(ChannelMessage.account_id)
+    )
+    pending_inbox_by_account = {
+        account_id: (int(count), oldest_pending_at)
+        for account_id, count, oldest_pending_at in pending_inbox_rows.all()
+    }
+
+    successful_events = union_all(
+        select(
+            ChannelDebugEvent.account_id.label("account_id"),
+            ChannelDebugEvent.created_at.label("succeeded_at"),
+        ).where(
+            ChannelDebugEvent.account_id.in_(account_ids),
+            ChannelDebugEvent.user_id == user_id,
+            ChannelDebugEvent.outcome == "success",
+        ),
+        select(
+            ChannelDelivery.account_id.label("account_id"),
+            ChannelDelivery.updated_at.label("succeeded_at"),
+        ).where(
+            ChannelDelivery.account_id.in_(account_ids),
+            ChannelDelivery.user_id == user_id,
+            ChannelDelivery.status == DELIVERY_STATUS_SUCCEEDED,
+        ),
+    ).subquery()
+    latest_success = (
+        select(
+            successful_events.c.account_id,
+            func.max(successful_events.c.succeeded_at).label("succeeded_at"),
+        )
+        .group_by(successful_events.c.account_id)
+        .subquery()
+    )
+    last_success_rows = await db.execute(
+        select(latest_success.c.account_id, latest_success.c.succeeded_at)
+    )
+    last_success_by_account: dict[UUID, datetime] = dict(last_success_rows.tuples().all())
+
+    delivery_rows = await db.execute(
+        select(
+            ChannelDelivery.account_id,
+            func.count(ChannelDelivery.id)
+            .filter(ChannelDelivery.status == DELIVERY_STATUS_PENDING)
+            .label("pending_count"),
+            func.count(ChannelDelivery.id)
+            .filter(ChannelDelivery.status == DELIVERY_STATUS_IN_PROGRESS)
+            .label("in_progress_count"),
+            func.count(ChannelDelivery.id)
+            .filter(
+                ChannelDelivery.status == DELIVERY_STATUS_FAILED,
+                ChannelDelivery.updated_at >= recent_error_cutoff,
+                or_(
+                    latest_success.c.succeeded_at.is_(None),
+                    ChannelDelivery.updated_at > latest_success.c.succeeded_at,
+                ),
+            )
+            .label("failed_count"),
+        )
+        .outerjoin(
+            latest_success,
+            latest_success.c.account_id == ChannelDelivery.account_id,
+        )
+        .where(
+            ChannelDelivery.account_id.in_(account_ids),
+            ChannelDelivery.user_id == user_id,
+        )
+        .group_by(ChannelDelivery.account_id)
+    )
+    delivery_counts_by_account = {
+        account_id: (int(pending), int(in_progress), int(failed))
+        for account_id, pending, in_progress, failed in delivery_rows.all()
+    }
+
+    message_rows = await db.execute(
+        select(ChannelMessage.account_id, func.max(ChannelMessage.created_at))
+        .where(
+            ChannelMessage.account_id.in_(account_ids),
+            ChannelMessage.user_id == user_id,
+        )
+        .group_by(ChannelMessage.account_id)
+    )
+    last_message_by_account: dict[UUID, datetime] = {
+        account_id: timestamp for account_id, timestamp in message_rows.tuples().all()
+    }
+
+    event_rows = await db.execute(
+        select(ChannelDebugEvent.account_id, func.max(ChannelDebugEvent.created_at))
+        .where(
+            ChannelDebugEvent.account_id.in_(account_ids),
+            ChannelDebugEvent.user_id == user_id,
+        )
+        .group_by(ChannelDebugEvent.account_id)
+    )
+    last_event_by_account: dict[UUID, datetime] = {
+        account_id: timestamp
+        for account_id, timestamp in event_rows.tuples().all()
+        if account_id is not None
+    }
+
+    debug_signal_ranked = (
+        select(
+            ChannelDebugEvent.account_id,
+            ChannelDebugEvent.created_at,
+            ChannelDebugEvent.stage,
+            ChannelDebugEvent.outcome,
+            ChannelDebugEvent.error,
+            func.row_number()
+            .over(
+                partition_by=ChannelDebugEvent.account_id,
+                order_by=(ChannelDebugEvent.created_at.desc(), ChannelDebugEvent.id.desc()),
+            )
+            .label("row_number"),
+        )
+        .where(
+            ChannelDebugEvent.account_id.in_(account_ids),
+            ChannelDebugEvent.user_id == user_id,
+            or_(
+                ChannelDebugEvent.outcome == "success",
+                ChannelDebugEvent.outcome == "failure",
+                ChannelDebugEvent.error.is_not(None),
+            ),
+        )
+        .subquery()
+    )
+    debug_signal_rows = await db.execute(
+        select(
+            debug_signal_ranked.c.account_id,
+            debug_signal_ranked.c.created_at,
+            debug_signal_ranked.c.stage,
+            debug_signal_ranked.c.outcome,
+            debug_signal_ranked.c.error,
+        ).where(debug_signal_ranked.c.row_number == 1)
+    )
+    debug_signal_by_account = {
+        account_id: (created_at, stage, outcome, error)
+        for account_id, created_at, stage, outcome, error in debug_signal_rows.all()
+    }
+
+    delivery_signal_ranked = (
+        select(
+            ChannelDelivery.account_id,
+            ChannelDelivery.updated_at,
+            ChannelDelivery.status,
+            ChannelDelivery.last_error,
+            func.row_number()
+            .over(
+                partition_by=ChannelDelivery.account_id,
+                order_by=(ChannelDelivery.updated_at.desc(), ChannelDelivery.id.desc()),
+            )
+            .label("row_number"),
+        )
+        .where(
+            ChannelDelivery.account_id.in_(account_ids),
+            ChannelDelivery.user_id == user_id,
+            or_(
+                ChannelDelivery.status == DELIVERY_STATUS_SUCCEEDED,
+                ChannelDelivery.last_error.is_not(None),
+            ),
+        )
+        .subquery()
+    )
+    delivery_signal_rows = await db.execute(
+        select(
+            delivery_signal_ranked.c.account_id,
+            delivery_signal_ranked.c.updated_at,
+            delivery_signal_ranked.c.status,
+            delivery_signal_ranked.c.last_error,
+        ).where(delivery_signal_ranked.c.row_number == 1)
+    )
+    delivery_signal_by_account = {
+        account_id: (updated_at, delivery_status, last_error)
+        for account_id, updated_at, delivery_status, last_error in delivery_signal_rows.all()
+    }
+
+    # All rows/aggregates are loaded. Release the read/auth transaction before provider I/O.
+    if any(account.provider == CHANNEL_PROVIDER_WHATSAPP for account in accounts):
+        await db.close()
+    from app.services.whatsapp_provider_bridge import whatsapp_account_transport_statuses
+
+    transport_statuses = await whatsapp_account_transport_statuses(accounts)
+    return [
+        _channel_health_item(
+            account=account,
+            native_transport=(
+                transport_statuses[account.id].as_dict()
+                if account.id in transport_statuses
+                else None
+            ),
+            pending_inbox_stats=pending_inbox_by_account.get(account.id, (0, None)),
+            delivery_counts=delivery_counts_by_account.get(account.id, (0, 0, 0)),
+            last_message_at=last_message_by_account.get(account.id),
+            last_event_at=last_event_by_account.get(account.id),
+            debug_signal=debug_signal_by_account.get(account.id),
+            delivery_signal=delivery_signal_by_account.get(account.id),
+            last_success_at=last_success_by_account.get(account.id),
+            runtime_evidence=runtime_evidence_by_account.get(account.id, []),
+            recent_error_cutoff=recent_error_cutoff,
+        )
+        for account in accounts
+    ]
+
+
+def _channel_health_item(
+    *,
+    account: ChannelAccount,
+    native_transport: dict[str, Any] | None,
+    pending_inbox_stats: tuple[int, datetime | None],
+    delivery_counts: tuple[int, int, int],
+    last_message_at: datetime | None,
+    last_event_at: datetime | None,
+    debug_signal: tuple[datetime, str, str, str | None] | None,
+    delivery_signal: tuple[datetime, str, str | None] | None,
+    last_success_at: datetime | None,
+    runtime_evidence: list[RuntimeObservedEvidence],
+    recent_error_cutoff: datetime,
+) -> ChannelHealthItemResponse:
+    pending_inbox, oldest_pending_inbox_at = pending_inbox_stats
+    pending_deliveries, in_progress_deliveries, failed_deliveries = delivery_counts
+    last_error_at = None
+    last_error = None
+    last_error_stage = None
+    last_error_outcome = None
+    if debug_signal is not None and (debug_signal[2] == "failure" or debug_signal[3] is not None):
+        last_error_at, last_error_stage, last_error_outcome, raw_error = debug_signal
+        last_error = public_channel_operation_error(raw_error)
+    if (
+        delivery_signal is not None
+        and delivery_signal[1] != DELIVERY_STATUS_SUCCEEDED
+        and delivery_signal[2] is not None
+        and (last_error_at is None or delivery_signal[0] > last_error_at)
+    ):
+        last_error_at = delivery_signal[0]
+        last_error = public_channel_delivery_error(delivery_signal[2])
+        last_error_stage = "delivery"
+        last_error_outcome = "failure"
+    if (
+        last_error_at is not None
+        and last_success_at is not None
+        and last_success_at >= last_error_at
+    ):
+        last_error_at = None
+        last_error = None
+        last_error_stage = None
+        last_error_outcome = None
+
+    whatsapp_transport_connected = (
+        account.provider == CHANNEL_PROVIDER_WHATSAPP
+        and native_transport is not None
+        and native_transport.get("available") is True
+    )
+    whatsapp_transport_reconnecting = (
+        account.provider == CHANNEL_PROVIDER_WHATSAPP
+        and native_transport is not None
+        and native_transport.get("reconnecting") is True
+    )
+    reasons: list[str] = []
+    if account.status != CHANNEL_STATUS_ACTIVE:
+        reasons.append("channel_disabled")
+    if failed_deliveries > 0:
+        reasons.append("failed_deliveries")
+    if (
+        last_error is not None
+        and last_error_at is not None
+        and last_error_at >= recent_error_cutoff
+    ):
+        reasons.append("recent_error")
+    if (
+        native_transport is not None
+        and native_transport.get("reason") == "provider-transport-not-probed"
+    ):
+        reasons.append("native_transport_not_probed")
+    elif account.provider == CHANNEL_PROVIDER_WHATSAPP and not whatsapp_transport_connected:
+        reasons.append(
+            "native_transport_reconnecting"
+            if whatsapp_transport_reconnecting
+            else "native_transport_unavailable"
+        )
+    if runtime_evidence:
+        statuses = {item.status for item in runtime_evidence}
+        if "error" in statuses:
+            reasons.append("runtime_observation_error")
+        elif "missing" in statuses:
+            reasons.append("runtime_observation_missing")
+        elif "stale" in statuses:
+            reasons.append("runtime_observation_stale")
+        elif "unknown" in statuses:
+            reasons.append("runtime_observation_unknown")
+        if not all(item.converged for item in runtime_evidence):
+            reasons.append("runtime_not_converged")
+    elif account.provider != CHANNEL_PROVIDER_WHATSAPP:
+        reasons.append("agent_not_linked")
+    if in_progress_deliveries > 0:
+        reasons.append("deliveries_in_progress")
+    if pending_deliveries > 0:
+        reasons.append("pending_deliveries")
+    if pending_inbox > 0:
+        reasons.append("pending_inbox")
+    health_status = "ok"
+    if any(
+        reason in reasons
+        for reason in (
+            "channel_disabled",
+            "failed_deliveries",
+            "recent_error",
+            "native_transport_unavailable",
+            "runtime_observation_error",
+        )
+    ):
+        health_status = "error"
+    elif reasons:
+        health_status = "warning"
+
+    return ChannelHealthItemResponse(
+        account_id=account.id,
+        provider=account.provider,
+        name=account.name,
+        visibility=channel_visibility(account),
+        channel_status=account.status,
+        health_status=health_status,
+        reasons=reasons,
+        pending_inbox=pending_inbox,
+        oldest_pending_inbox_at=oldest_pending_inbox_at,
+        pending_deliveries=pending_deliveries,
+        in_progress_deliveries=in_progress_deliveries,
+        failed_deliveries=failed_deliveries,
+        last_message_at=last_message_at,
+        last_event_at=last_event_at,
+        last_error_at=last_error_at,
+        last_error=last_error,
+        last_error_stage=last_error_stage,
+        last_error_outcome=last_error_outcome,
+        native_transport=native_transport,
+    )
+
+
+def _telegram_bot_username(account: ChannelAccount) -> str | None:
+    if account.provider != CHANNEL_PROVIDER_TELEGRAM or not isinstance(account.config, dict):
+        return None
+    value = account.config.get("bot_username")
+    if not isinstance(value, str):
+        return None
+    return normalize_telegram_bot_username(value)

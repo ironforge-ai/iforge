@@ -1,0 +1,481 @@
+"""SSE event channel for `clawdi daemon` processes.
+
+Daemon opens a long-lived `GET /v1/sync/events` connection authed
+with the same Bearer token it uses for any other API call. The server pushes
+skill revision events and signal-only
+`{"type":"runtime_manifest_changed","environment_id":"…"}` events. Skill
+events wake a local inventory scan; they never download, write, or remove Agent
+filesystem content. Periodic revision-fenced complete Agent-Project listings
+catch up missed events and only reconcile Cloud projections.
+
+Outbound-only: daemon doesn't open an inbound HTTP server. Auth
+is the Bearer token at handshake; `401` mid-stream (key revoked)
+closes the connection from the server side.
+
+Heartbeat: server emits `: ping` comment line every 25s. Daemon
+considers the connection stale if no message arrives for 60s and
+reconnects with exponential backoff (1→60s, ±20% jitter).
+
+Connection cap: per-user max concurrent SSE connections (v1
+default 10) — excess gets 429 with `Retry-After`. Stops a
+misbehaving daemon from opening hundreds of streams.
+
+Server-side project filter: each subscriber registers with the set
+of `project_ids` it's allowed to see (`project_ids_visible_to`). The
+broker filters per-event so a bound api_key for env A never
+receives `skill_changed` for skills in env B's project — not even
+as metadata. The daemon keeps a client-side filter as
+defense-in-depth.
+
+Cross-process delivery uses PostgreSQL LISTEN/NOTIFY through
+`app.services.sync_events`, so streams remain active across multiple uvicorn
+workers or API replicas.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+from collections.abc import AsyncGenerator, Awaitable, Callable
+from contextlib import aclosing
+from datetime import UTC, datetime, timedelta
+from uuid import UUID
+
+from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
+from fastapi.responses import StreamingResponse
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+from starlette.types import Send
+
+from app.core.auth import AuthContext, require_scope_short_session
+from app.core.database import async_session_factory, finish_cleanup
+from app.core.project import project_ids_visible_to
+from app.core.skill_sync_protocol import (
+    SKILL_SYNC_PROTOCOL_HEADER,
+    resolve_skill_sync_protocol,
+)
+from app.models.api_key import ApiKey
+from app.services import sync_events
+from app.services.distributed_state import (
+    acquire_sync_subscription_lease,
+    refresh_sync_subscription_lease,
+    release_sync_subscription_lease,
+)
+
+router = APIRouter(prefix="/sync", tags=["sync"])
+log = logging.getLogger(__name__)
+
+
+# Per-user open-connection cap. Bound deploy keys may each hold
+# three streams (daemon skill sync, runtime-watch invalidation,
+# and one debug/diagnostic stream), but the aggregate user cap
+# remains authoritative: five keys with their two routine streams
+# consume all 10 slots, so an additional diagnostic stream gets
+# 429 until another stream closes. This bounds account-level
+# memory and connection use.
+PER_USER_CONNECTION_CAP = 10
+PER_BOUND_KEY_CONNECTION_CAP = 3
+
+# Heartbeat cadence. SSE comments (`: ping\n\n`) are ignored by
+# clients but keep intermediary proxies (k8s ingress, Cloudflare)
+# from idle-closing the connection. 25s sits comfortably under the
+# typical 60s default. Daemon treats 60s of silence as "stale,
+# reconnect."
+HEARTBEAT_INTERVAL_S = 25.0
+SUBSCRIPTION_LEASE_TTL = timedelta(seconds=90)
+OAUTH_ACCESS_EXPIRY_SKEW = timedelta(seconds=1)
+
+
+class SyncStreamingResponse(StreamingResponse):
+    def __init__(
+        self,
+        content: AsyncGenerator[bytes, None],
+        *,
+        cleanup: Callable[[], Awaitable[None]],
+        headers: dict[str, str],
+    ) -> None:
+        super().__init__(content, media_type="text/event-stream", headers=headers)
+        self._content = content
+        self._cleanup = cleanup
+
+    async def stream_response(self, send: Send) -> None:
+        # Starlette does not close an iterator suspended at yield when send
+        # fails or is cancelled by disconnect/backpressure.
+        try:
+            async with aclosing(self._content):
+                await super().stream_response(send)
+        finally:
+            # Header send can fail before iteration: closing an unstarted
+            # generator does not run its finally block.
+            await self._cleanup()
+
+
+def _oauth_cli_access_expired(
+    auth: AuthContext,
+    *,
+    now: datetime | None = None,
+) -> bool:
+    if not auth.oauth_cli:
+        return False
+    expires_at = auth.oauth_access_expires_at
+    if expires_at is None:
+        return True
+    current = now or datetime.now(UTC)
+    return current >= expires_at - OAUTH_ACCESS_EXPIRY_SKEW
+
+
+async def _close_on_oauth_access_expiry(
+    auth: AuthContext,
+    close_stream: asyncio.Event,
+    *,
+    now: Callable[[], datetime] = lambda: datetime.now(UTC),
+    sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+) -> None:
+    """Close only OAuth CLI streams when their verified access JWT expires."""
+    if not auth.oauth_cli:
+        return
+    expires_at = auth.oauth_access_expires_at
+    if expires_at is None:
+        close_stream.set()
+        return
+    while not close_stream.is_set():
+        remaining = (expires_at - OAUTH_ACCESS_EXPIRY_SKEW - now()).total_seconds()
+        if remaining <= 0:
+            close_stream.set()
+            return
+        await sleep(min(remaining, HEARTBEAT_INTERVAL_S))
+
+
+async def cancel_and_wait(*tasks: asyncio.Task[object]) -> None:
+    """Cancel and collect every child before surfacing the first failure."""
+    for task in tasks:
+        if not task.done():
+            task.cancel()
+
+    async def collect() -> None:
+        await asyncio.gather(*tasks, return_exceptions=True)
+        for task in tasks:
+            if task.cancelled():
+                continue
+            failure = task.exception()
+            if failure is not None:
+                raise failure
+
+    # The stream owns these tasks. Repeated cancellation of the stream must
+    # not cancel their in-progress database termination a second time.
+    await finish_cleanup(collect)
+
+
+async def refresh_subscription_lease(lease_id: UUID, close_stream: asyncio.Event) -> None:
+    """Renew the shared SSE slot and fail closed if its authority is lost."""
+    while not close_stream.is_set():
+        try:
+            await asyncio.wait_for(close_stream.wait(), timeout=HEARTBEAT_INTERVAL_S)
+            return
+        except TimeoutError:
+            pass
+        try:
+            refreshed = await refresh_sync_subscription_lease(
+                lease_id,
+                ttl=SUBSCRIPTION_LEASE_TTL,
+            )
+        except Exception as error:  # noqa: BLE001 - a stale uncounted stream is unsafe
+            log.warning("sync events: subscription lease refresh failed: %s", error)
+            close_stream.set()
+            return
+        if not refreshed:
+            log.warning("sync events: subscription lease expired")
+            close_stream.set()
+            return
+
+
+async def release_subscription_lease_safely(lease_id: UUID) -> None:
+    async def release() -> None:
+        try:
+            await release_sync_subscription_lease(lease_id)
+        except Exception as error:  # noqa: BLE001 - expiry is the crash-safe fallback
+            log.warning("sync events: subscription lease release failed: %s", error)
+
+    await finish_cleanup(release)
+
+
+async def _stream(
+    queue: sync_events.SyncEventQueue,
+    request: Request,
+    revoked: asyncio.Event,
+) -> AsyncGenerator[bytes, None]:
+    """SSE event source. Drains `queue` (events from
+    `bump_skills_revision`, already broker-filtered to the
+    subscriber's visible projects) and emits heartbeats so proxies
+    don't nuke the connection during quiet periods. Returns when
+    the client disconnects, when `revoked` fires (api_key
+    revocation noticed by the subscription refresher), or whichever
+    happens first."""
+    yield b": connected\n\n"
+    revoked_task = asyncio.create_task(revoked.wait())
+    event_task = None
+    try:
+        while True:
+            if await request.is_disconnected() or revoked.is_set():
+                return
+            event_task = asyncio.create_task(queue.get())
+            done, _pending = await asyncio.wait(
+                (event_task, revoked_task),
+                timeout=HEARTBEAT_INTERVAL_S,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            # Revocation wins even when an event completes in the same turn.
+            if revoked_task in done or revoked.is_set():
+                return
+            if event_task not in done:
+                await cancel_and_wait(event_task)
+                yield b": ping\n\n"
+                continue
+            # The event task has finished; only pending or exiting work needs
+            # shielded collection. Keep the revocation waiter across records.
+            event_payload = event_task.result()
+            payload = json.dumps(event_payload)
+            yield f"event: {event_payload['type']}\ndata: {payload}\n\n".encode()
+    finally:
+        # Own both waiters through disconnect, cancellation, and generator close.
+        child_tasks = (revoked_task,) if event_task is None else (event_task, revoked_task)
+        await cancel_and_wait(*child_tasks)
+
+
+# Notifications drive normal refreshes. This slow poll only catches a lost
+# PostgreSQL notification or a listener outage.
+SUBSCRIPTION_REFRESH_FALLBACK_INTERVAL_S = 5 * 60.0
+
+
+async def _api_key_inactive_reason(db: AsyncSession, api_key_id: UUID) -> str | None:
+    result = await db.execute(select(ApiKey.id, ApiKey.revoked_at).where(ApiKey.id == api_key_id))
+    row = result.first()
+    if row is None:
+        return "deleted"
+    if row.revoked_at is not None:
+        return "revoked"
+    return None
+
+
+@router.get("/events")
+async def events(
+    request: Request,
+    # `require_scope_short_session` opens/closes its own DB session
+    # for auth lookup instead of holding a request-scoped one for the
+    # life of the stream. FastAPI's yield-dependency contract
+    # finalises `get_session` only when the StreamingResponse ends —
+    # for SSE that means hours, and a few hundred daemons would
+    # exhaust the connection pool. The refresh loop below opens
+    # short-lived sessions on its own cadence.
+    auth: AuthContext = Depends(require_scope_short_session("skills:read")),
+    skill_sync_protocol: str | None = Header(default=None, alias=SKILL_SYNC_PROTOCOL_HEADER),
+):
+    """SSE event channel. Daemons subscribe here and treat Skill events as
+    invalidations that trigger an Agent-filesystem rescan and Cloud projection.
+    Server-side project filtering is applied at broker level: subscribers only
+    receive events for projects they have read access to.
+
+    No request-scoped DB session: SSE streams live for hours,
+    and `Depends(get_session)` would pin one connection from
+    the pool for the whole duration. Each query inside this
+    handler opens a short-lived session via
+    `async_session_factory()` and closes it as soon as the
+    query returns. With many connected daemons this keeps the
+    pool free for normal request traffic.
+    """
+    resolve_skill_sync_protocol(skill_sync_protocol)
+    user_id = auth.user_id
+    if _oauth_cli_access_expired(auth):
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "OAuth access token has expired")
+
+    refresh_key = str(user_id)
+    refresh_requested = sync_events.sync_subscriptions_changed.subscribe(refresh_key)
+    lease_id: UUID | None = None
+    try:
+        # Subscribe to mutation wakeups before the initial reads. A commit that
+        # crosses the handshake either appears in these reads or leaves the
+        # waiter set for an immediate recheck.
+        async with async_session_factory() as initial_db:
+            if auth.api_key is not None:
+                inactive_reason = await _api_key_inactive_reason(initial_db, auth.api_key.id)
+                if inactive_reason is not None:
+                    raise HTTPException(status.HTTP_401_UNAUTHORIZED, "API key is revoked")
+            initial_visible = frozenset(await project_ids_visible_to(initial_db, auth))
+        bound_api_key_id = (
+            auth.api_key.id
+            if auth.api_key is not None and auth.api_key.environment_id is not None
+            else None
+        )
+        lease_id = await acquire_sync_subscription_lease(
+            user_id=user_id,
+            bound_api_key_id=bound_api_key_id,
+            max_per_user=PER_USER_CONNECTION_CAP,
+            max_per_key=PER_BOUND_KEY_CONNECTION_CAP,
+            ttl=SUBSCRIPTION_LEASE_TTL,
+        )
+        if lease_id is None:
+            raise HTTPException(
+                status.HTTP_429_TOO_MANY_REQUESTS,
+                detail="too many concurrent sync subscriptions for this user",
+                headers={"Retry-After": "30"},
+            )
+        subscription = await sync_events.try_subscribe(
+            user_id,
+            initial_visible,
+            max_per_user=PER_USER_CONNECTION_CAP,
+            api_key_id=auth.api_key.id if auth.api_key is not None else None,
+            # Per-key cap only applies to Agent API keys. Unbound
+            # CLI keys are user-level (one key shared across N daemons
+            # via `clawdi daemon install --all`), so any small per-key
+            # cap would silently 429 later local agents on a multi-agent
+            # machine. Bound keys use `try_subscribe`'s single default
+            # authority of 3: skill sync + runtime watch + one diagnostic.
+            is_env_bound=(auth.api_key is not None and auth.api_key.environment_id is not None),
+            environment_id=(auth.api_key.environment_id if auth.api_key is not None else None),
+            max_per_key=PER_BOUND_KEY_CONNECTION_CAP,
+        )
+        if subscription is None:
+            raise HTTPException(
+                status.HTTP_429_TOO_MANY_REQUESTS,
+                detail="too many concurrent sync subscriptions for this user",
+                headers={"Retry-After": "30"},
+            )
+    except BaseException:
+        if lease_id is not None:
+            await release_subscription_lease_safely(lease_id)
+        sync_events.sync_subscriptions_changed.unsubscribe(refresh_key, refresh_requested)
+        raise
+    queue, subscriber = subscription
+    assert lease_id is not None
+
+    log.info(
+        "sync events: subscribed user=%s visible_projects=%d connection_count=%s",
+        user_id,
+        len(initial_visible),
+        sync_events.connection_count(user_id),
+    )
+
+    # Set when the event-driven refresher notices the caller's api_key
+    # was revoked. Closes the auth-after-handshake window where a
+    # subscriber kept receiving `skill_changed` / `skill_deleted`
+    # invalidations, which wake an Agent-authoritative local rescan and Cloud
+    # projection, for as long as the TCP stream happened to stay alive.
+    revoked = asyncio.Event()
+
+    async def refresh_visibility() -> None:
+        """Refresh after a committed mutation or the slow fallback timeout.
+
+        Re-checks both project visibility and api_key revocation, closing the
+        cross-project leak window when an env's default_project_id changes
+        mid-stream AND the post-revocation auth window.
+
+        Opens its own short-lived `async_session_factory()` per
+        refresh so a connection isn't held between cycles.
+        Without this, every connected daemon held one open DB
+        session for the lifetime of its stream — a few hundred
+        daemons would exhaust the pool.
+        """
+        while True:
+            try:
+                await asyncio.wait_for(
+                    refresh_requested.wait(),
+                    timeout=SUBSCRIPTION_REFRESH_FALLBACK_INTERVAL_S,
+                )
+            except TimeoutError:
+                pass
+            # Clear before querying. A mutation committed during the reads sets
+            # the waiter again and forces another pass.
+            refresh_requested.clear()
+            try:
+                async with async_session_factory() as refresh_db:
+                    # Revocation check first — if the key is dead, the
+                    # project set is moot. The handshake-time AuthContext
+                    # is stale; re-read the row to see `revoked_at` AND
+                    # whether the row still exists. Env delete cascades
+                    # `api_keys.environment_id` so a deleted env can
+                    # take its deploy key with it; we treat row-gone
+                    # the same as revoked. Without this, `scalar_one_
+                    # or_none()` returning None would be silently
+                    # interpreted as "still valid".
+                    if auth.api_key is not None:
+                        inactive_reason = await _api_key_inactive_reason(
+                            refresh_db,
+                            auth.api_key.id,
+                        )
+                        if inactive_reason is not None:
+                            log.info(
+                                "sync events: api_key %s mid-stream user=%s key=%s",
+                                inactive_reason,
+                                user_id,
+                                auth.api_key.id,
+                            )
+                            revoked.set()
+                            return
+                    fresh = frozenset(await project_ids_visible_to(refresh_db, auth))
+            except Exception as e:  # noqa: BLE001 — keep stream alive
+                log.warning("sync events: project refresh failed user=%s: %s", user_id, e)
+                continue
+            if fresh != subscriber.visible_project_ids:
+                old_visible_count = (
+                    0
+                    if subscriber.visible_project_ids is None
+                    else len(subscriber.visible_project_ids)
+                )
+                log.info(
+                    "sync events: project filter updated user=%s old=%d new=%d",
+                    user_id,
+                    old_visible_count,
+                    len(fresh),
+                )
+                subscriber.visible_project_ids = fresh
+
+    cleaned_up = False
+
+    async def cleanup() -> None:
+        nonlocal cleaned_up
+        # The generator closes first; response cleanup also covers a stream
+        # that never started. A started body_iterator also owns direct aclose().
+        if cleaned_up:
+            return
+        cleaned_up = True
+        try:
+            sync_events.sync_subscriptions_changed.unsubscribe(refresh_key, refresh_requested)
+        finally:
+            try:
+                sync_events.unsubscribe(user_id, queue)
+                log.info(
+                    "sync events: unsubscribed user=%s remaining=%s",
+                    user_id,
+                    sync_events.connection_count(user_id),
+                )
+            finally:
+                await release_subscription_lease_safely(lease_id)
+
+    async def gen() -> AsyncGenerator[bytes, None]:
+        refresh_task = asyncio.create_task(refresh_visibility())
+        expiry_task = asyncio.create_task(_close_on_oauth_access_expiry(auth, revoked))
+        lease_task = asyncio.create_task(refresh_subscription_lease(lease_id, revoked))
+        try:
+            async with aclosing(_stream(queue, request, revoked)) as stream:
+                async for chunk in stream:
+                    yield chunk
+        finally:
+            try:
+                await cancel_and_wait(refresh_task, expiry_task, lease_task)
+            finally:
+                await cleanup()
+
+    # `text/event-stream` is the SSE content type. `X-Accel-Buffering:
+    # no` disables nginx response buffering on the off chance an
+    # operator runs us behind one — without it the bytes pile up in
+    # nginx's buffer and the daemon never sees the heartbeat.
+    return SyncStreamingResponse(
+        gen(),
+        cleanup=cleanup,
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
+        },
+    )

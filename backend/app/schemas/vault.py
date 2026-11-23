@@ -1,0 +1,263 @@
+import re
+from datetime import datetime
+from typing import Annotated, Literal
+from uuid import UUID
+
+from pydantic import BaseModel, Field, RootModel, field_validator
+
+VAULT_SLUG_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,198}[a-z0-9])?$")
+VAULT_ITEM_SEGMENT_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
+
+
+def clean_vault_segment(value: str, *, field_name: str, allow_empty: bool = False) -> str:
+    cleaned = value.strip()
+    if not cleaned:
+        if allow_empty:
+            return ""
+        raise ValueError(f"{field_name} cannot be empty")
+    if len(cleaned) > 200:
+        raise ValueError(f"{field_name} must be at most 200 characters")
+    if not VAULT_ITEM_SEGMENT_RE.fullmatch(cleaned):
+        raise ValueError(
+            f"{field_name} may contain only letters, numbers, dots, underscores, and hyphens"
+        )
+    return cleaned
+
+
+class VaultCreate(BaseModel):
+    slug: str = Field(min_length=1, max_length=200)
+    name: str = Field(min_length=1, max_length=200)
+
+    @field_validator("slug", mode="after")
+    @classmethod
+    def validate_slug(cls, value: str) -> str:
+        slug = value.strip()
+        if not VAULT_SLUG_RE.fullmatch(slug):
+            raise ValueError(
+                "slug must use lowercase letters, numbers, and hyphens, "
+                "without leading or trailing hyphens"
+            )
+        return slug
+
+    @field_validator("name", mode="after")
+    @classmethod
+    def validate_name(cls, value: str) -> str:
+        name = value.strip()
+        if not name:
+            raise ValueError("name cannot be empty")
+        return name
+
+
+class VaultItemUpsert(BaseModel):
+    section: str = Field(default="", max_length=200)
+    fields: dict[str, str] = Field(min_length=1, max_length=200)
+
+    @field_validator("section", mode="after")
+    @classmethod
+    def validate_section(cls, value: str) -> str:
+        return clean_vault_segment(value, field_name="section", allow_empty=True)
+
+    @field_validator("fields", mode="after")
+    @classmethod
+    def validate_field_names(cls, value: dict[str, str]) -> dict[str, str]:
+        return {
+            clean_vault_segment(field_name, field_name="field name"): field_value
+            for field_name, field_value in value.items()
+        }
+
+
+class VaultItemDelete(BaseModel):
+    # Field names here are NOT charset-validated: legacy vaults hold
+    # names the upsert validator would reject today (e.g. slash-
+    # namespaced `app/DATABASE_URL` imports). Deleting is an exact match
+    # against existing rows, so refusing those names would make them
+    # permanently undeletable. Only writes of *new* names stay strict.
+    section: str = Field(default="", max_length=200)
+    fields: list[str] = Field(min_length=1, max_length=200)
+
+    @field_validator("section", mode="after")
+    @classmethod
+    def validate_section(cls, value: str) -> str:
+        return clean_vault_segment(value, field_name="section", allow_empty=True)
+
+    @field_validator("fields", mode="after")
+    @classmethod
+    def validate_field_names(cls, value: list[str]) -> list[str]:
+        cleaned: list[str] = []
+        for field_name in value:
+            stripped = field_name.strip()
+            if not stripped:
+                raise ValueError("field name cannot be empty")
+            if len(stripped) > 200:
+                raise ValueError("field name must be at most 200 characters")
+            cleaned.append(stripped)
+        return cleaned
+
+
+class VaultResponse(BaseModel):
+    id: str
+    slug: str
+    name: str
+    # Legacy single-Project field kept for older CLI versions and
+    # scripts. New clients should read `project_ids`.
+    project_id: str | None = None
+    # Projects this vault is attached to and visible through for the
+    # current caller. Key rows belong to the vault, not to Projects.
+    project_ids: list[str]
+    is_owner: bool = True
+    # Number of key rows (names only — never values). Lets the dashboard
+    # rank vaults busiest-first and label cards without N+1 item fetches.
+    item_count: int = 0
+    created_at: datetime
+
+
+class VaultCreatedResponse(BaseModel):
+    id: str
+    slug: str
+
+
+class VaultDeleteResponse(BaseModel):
+    status: Literal["deleted"]
+
+
+class VaultSectionsResponse(RootModel[dict[str, list[str]]]):
+    pass
+
+
+class VaultItemsCopy(BaseModel):
+    """Server-side duplication of items into another owned vault.
+
+    Plaintext never reaches the caller — the server decrypts and
+    re-encrypts per item, preserving the CLI-only resolve boundary.
+    """
+
+    target_slug: str = Field(min_length=1, max_length=200)
+    section: str = Field(default="", max_length=200)
+    fields: list[str] = Field(min_length=1, max_length=200)
+    # Optional rename-on-copy: strip this prefix from each item name at
+    # the destination (`clawdi-backend/DATABASE_URL` → `DATABASE_URL`).
+    # Powers the "split a grab-bag vault into per-app vaults" flow —
+    # names get clean, values still never leave the server.
+    strip_prefix: str | None = Field(default=None, max_length=200)
+
+    @field_validator("target_slug", mode="after")
+    @classmethod
+    def validate_target_slug(cls, value: str) -> str:
+        slug = value.strip()
+        if not VAULT_SLUG_RE.fullmatch(slug):
+            raise ValueError(
+                "target_slug must use lowercase letters, numbers, and hyphens, "
+                "without leading or trailing hyphens"
+            )
+        return slug
+
+    @field_validator("section", mode="after")
+    @classmethod
+    def validate_section(cls, value: str) -> str:
+        return clean_vault_segment(value, field_name="section", allow_empty=True)
+
+
+class VaultItemsCopyResponse(BaseModel):
+    status: Literal["ok"]
+    copied: int
+
+
+class VaultItemsUpsertResponse(BaseModel):
+    status: Literal["ok"]
+    fields: int
+
+
+class VaultItemsDeleteResponse(BaseModel):
+    status: Literal["deleted"]
+
+
+class VaultResolveResponse(RootModel[dict[str, object]]):
+    pass
+
+
+class VaultReferenceResolveInput(BaseModel):
+    reference: str = Field(min_length=1, max_length=1000)
+    vault_slug: str = Field(min_length=1, max_length=200)
+    section: str = Field(default="", max_length=200)
+    field: str = Field(min_length=1, max_length=200)
+    project_id: UUID | None = None
+
+
+class VaultBulkResolveRequest(BaseModel):
+    references: list[VaultReferenceResolveInput] = Field(min_length=1, max_length=200)
+    project_id: UUID | None = None
+    agent_id: UUID | None = None
+    allow_conflicts: bool = False
+    debug: bool = False
+    preview: bool = False
+
+
+class VaultBulkResolveResponse(BaseModel):
+    results: dict[str, dict[str, object]]
+
+
+class VaultCredentialProfileUpsert(BaseModel):
+    tool: str = Field(min_length=1, max_length=80, pattern=r"^[A-Za-z0-9_.-]+$")
+    profile: str = Field(
+        default="default",
+        min_length=1,
+        max_length=120,
+        pattern=r"^[A-Za-z0-9_.-]+$",
+    )
+    payload: str = Field(min_length=1)
+
+
+class VaultCredentialProfileResolveRequest(BaseModel):
+    tool: str = Field(min_length=1, max_length=80, pattern=r"^[A-Za-z0-9_.-]+$")
+    profile: str = Field(
+        default="default",
+        min_length=1,
+        max_length=120,
+        pattern=r"^[A-Za-z0-9_.-]+$",
+    )
+    project_id: UUID | None = None
+
+
+class VaultCredentialProfileResponse(BaseModel):
+    id: str
+    project_id: str
+    tool: str
+    profile: str
+    updated_at: datetime
+
+
+class VaultCredentialProfileResolveResponse(VaultCredentialProfileResponse):
+    payload: str
+
+
+class RuntimeVaultField(BaseModel):
+    id: UUID
+    section: str
+    name: str
+    references: list[str]
+    value: str
+
+
+class RuntimeVault(BaseModel):
+    id: UUID
+    name: str
+    slug: str
+    project_ids: list[UUID]
+    revision: str
+    content_version: int = Field(ge=0)
+    fields: list[RuntimeVaultField] | None = None
+
+
+class RuntimeVaultSnapshot(BaseModel):
+    schema_version: Literal[1] = 1
+    complete: Literal[True] = True
+    agent_id: UUID
+    user_id: UUID
+    vaults: list[RuntimeVault]
+
+
+class RuntimeVaultMaterialInput(BaseModel):
+    etag: str = Field(max_length=100)
+    revisions: dict[UUID, Annotated[str, Field(pattern=r"^[a-f0-9]{64}$")]] = Field(
+        default_factory=dict, max_length=10000
+    )

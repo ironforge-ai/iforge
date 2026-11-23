@@ -1,0 +1,692 @@
+# AI Providers
+
+AI Provider is iforge's portable model-provider metadata and Hosted runtime
+projection layer. Provider Catalogs may contain many providers. A configured
+Core Hosted runtime binds zero or one provider through its manifest; local
+catalog storage and the public provider API remain multi-record surfaces.
+
+iforge does not proxy BYOK model traffic. Hermes and OpenClaw call OpenAI,
+Anthropic, OpenRouter, Gemini, Mistral, or a compatible endpoint directly.
+iforge stores metadata and auth references, and the Hosted controller delivers
+the selected provider through the stable runtime bootstrap bundle.
+
+## Supported Provider Data
+
+The product has three provider kinds:
+
+| Kind | User input | Model ownership |
+| --- | --- | --- |
+| iforge Managed | Choose a model when creating or editing an agent | iforge configures the connection and selected model |
+| Custom provider | Name, Endpoint, API format, API key | The agent owns models and selection |
+| Native provider | Choose a supported provider, Name, key/token or supported sign-in | The agent owns models and selection |
+
+The provider chooser groups brands; a second step selects native region, plan,
+or product variants before credential setup.
+ChatGPT sign-in remains a native credential option. Every Name is only an iforge
+`label`; renaming does not change stable IDs, credential identity, or runtime intent.
+Provider credential forms have no model catalog editor or inference test.
+iforge Managed retains its model picker on agent creation and settings pages. Credential environment names
+are internal, unique at creation, and immutable on existing custom connections.
+
+New Custom records use `configuration_mode: "custom"`. Create through the normal
+atomic `/v1/ai-providers/accept` API with an API-key credential. No model metadata
+is accepted or emitted. They support first binding, switching agents, and rebind
+without an iforge-selected model. The provider remains the same saved connection;
+native model choices remain local to each agent.
+
+CLI initialization creates only a missing custom provider with routing and its env
+credential reference. OpenClaw requires an empty `models` array for a new provider;
+Hermes needs no model directory. This is not a guarantee that an arbitrary endpoint
+supports discovery or that a model is already selected. Users choose models inside
+the native agent. Subsequent convergence never seeds or replaces model fields.
+A durable keyless pending-creation flag allows a retry after journal persistence
+but before the first config write, and is cleared after successful authority commit.
+After success, a user-deleted provider row is an error, not permission to restore it.
+
+Custom edits use PATCH; an optional `credential: {type: "api_key", value: "..."}`
+replaces the key atomically with label/routing changes. Models and auth/environment
+identity cannot be replaced through PATCH or accept. Unbind removes only owned env
+references and keeps routing, models and selection. Rebind restores its owned auth.
+Hermes global model selection persists endpoint/protocol mirrors: matching mirrors
+follow an explicit routing edit, while foreign routing/credentials fail preflight.
+OpenClaw authentication-header overrides and personal Hermes pools cannot silently
+replace the delivered key. No user credential is deleted to resolve a conflict.
+
+The released `catalog` and migration-only `connection` modes remain internal
+compatibility paths. They are not new provider choices. Existing records can use
+"Manage models in agent", a mode-only PATCH to `custom`, preserving stored model
+metadata and encrypted credentials. Bound consumers must first prove fresh current
+source/apply identity on a qualified CLI. Unbound records may upgrade after the
+feature release is enabled and initialize when subsequently bound. A bound runtime
+with conflicting or missing native state still refuses unsafe handoff.
+
+`supported_custom_provider_cli_versions` is an exact stable-release allowlist in
+Core and the first-party control plane. It defaults closed. First-party admission
+and provisioning require the server-selected exact CLI; Core also rejects runtime
+state that would send Custom to an unsupported target reader. Binding admission
+checks the exact desired CLI version for the owner's active Custom providers;
+it does not require an old healthy observation. This applies to first binding,
+online reconfiguration, offline edits, restart and recovery. Bootstrap must accept
+configuration before the CLI can start and produce evidence. The qualified CLI
+switches versions before convergence and enforces native credential ownership in
+its durable configuration transaction. Admission neither proves readiness nor
+changes observations. Mode-only ownership migration and credential restoration
+still require their separate runtime evidence. Enable only after
+publishing and qualifying the supporting CLI. This is capability admission, not a
+second desired-version selector. `supported_connection_cli_versions` continues to
+protect the earlier migration-only contract. No allowlist is enabled by code.
+Redacted include ownership remains excluded rather than guessed.
+
+`native_provider` identifies the connection and `native_variant` optionally
+identifies its region or plan. The shared
+[`native-ai-providers.json`](../packages/shared/src/native-ai-providers.json) contains only
+auth/routing metadata. Core validates the identity and hydrates endpoint,
+protocol, and runtime credential delivery; Hosted consumes Core readiness.
+The encrypted key or reference and the Agent binding remain separately owned.
+
+Native connections include NVIDIA NIM, Fireworks AI, Hugging Face (access
+token), DeepInfra, OpenCode Zen and Go, Xiaomi MiMo, and Tencent TokenHub and
+TokenPlan, alongside the existing providers. OpenCode's per-model protocols,
+provider request headers, and model catalogs remain native. TokenPlan uses
+OpenAI chat in OpenClaw and Anthropic Messages in Hermes; runtime routing
+overrides do not change the portable saved connection. Xiaomi Token Plan is
+not included because the audited Hermes version has no separate native profile.
+
+Omitted `configuration_mode` means the existing `catalog` contract. Existing
+catalog connections keep their explicit model intent until the user converts
+them. Custom endpoints retain URL/protocol and optional model metadata for
+runtimes that require a fallback. Managed AI keeps frozen catalogs and an
+explicit primary model.
+
+Supported provider types:
+
+- `openai`
+- `anthropic`
+- `openrouter`
+- `gemini`
+- `mistral`
+- `custom_openai_compatible`
+
+Supported auth references:
+
+- `env:<NAME>`
+- `iforge://...`
+- `none` for loopback or private local endpoints
+- Codex OAuth stored as an encrypted `agent_profile`
+- imported Codex profiles through `ai-provider import-auth`
+
+The catalog supports provider identity, `base_url`, `api_mode`,
+`default_model`, capabilities, auth indirection, an optional runtime env name,
+and optional model metadata. The canonical model limits are `context_window`,
+`max_input_tokens`, and `max_tokens`. Managed OpenAI-compatible discovery also
+accepts `context_length` and `max_output_tokens` as wire aliases; canonical
+fields win when both forms are present.
+
+Local catalog metadata lives in `~/.iforge/ai-providers/catalog.json`. API keys
+do not. A local catalog may contain several providers, and projection helpers
+may model several target entries. Those facts do not widen a Core Hosted
+runtime binding beyond one selected provider.
+
+## Local Catalog Commands
+
+Add and validate an env-backed provider:
+
+```bash
+iforge ai-provider add openai-main \
+  --type openai \
+  --base-url https://api.openai.com/v1 \
+  --default-model gpt-5.2 \
+  --api-mode openai_responses \
+  --auth env:OPENAI_API_KEY \
+  --set-default
+
+iforge ai-provider validate openai-main
+iforge ai-provider test openai-main
+```
+
+`test` checks configuration and auth availability without a provider request.
+Use `--live` only when a direct metadata probe is intended:
+
+```bash
+iforge ai-provider test openai-main --live
+```
+
+Other current catalog commands are:
+
+```bash
+iforge ai-provider list
+iforge ai-provider edit openai-main --default-model gpt-5.3
+iforge ai-provider remove openai-main
+```
+
+The local CLI does not activate or materialize provider configuration into a
+local Codex, Hermes, or OpenClaw installation. Provider activation for Core
+Hosted agents belongs to the Hosted manifest/controller path below.
+
+Done: `bun run packages/cli/src/index.ts ai-provider --help` exits 0 and lists
+`list`, `add`, `edit`, `remove`, `validate`, `test`, `connect`,
+`complete-oauth`, `import-auth`, `export`, and `import`.
+
+## Vault, No-Auth, And Anthropic
+
+Vault-backed providers store only a reference in the catalog:
+
+```bash
+iforge ai-provider add openai-vault \
+  --type openai \
+  --base-url https://api.openai.com/v1 \
+  --default-model gpt-5.2 \
+  --api-mode openai_responses \
+  --auth iforge://default/OPENAI_API_KEY \
+  --agent-env OPENAI_API_KEY
+```
+
+No-auth providers are accepted for loopback and private local endpoints:
+
+```bash
+iforge ai-provider add lmstudio-local \
+  --type custom_openai_compatible \
+  --base-url http://127.0.0.1:1234/v1 \
+  --api-mode openai_chat \
+  --default-model local-model \
+  --auth none
+```
+
+Public no-auth URLs are rejected by default. Hosted provider base URLs are
+validated as public HTTPS URLs before projection.
+
+Claude Code OAuth is not part of the current AI Provider surface. Use an
+Anthropic API key, env, or Vault reference:
+
+```bash
+iforge ai-provider add anthropic-main \
+  --type anthropic \
+  --base-url https://api.anthropic.com \
+  --default-model claude-opus-4-6 \
+  --api-mode anthropic_messages \
+  --auth env:ANTHROPIC_API_KEY
+```
+
+## Codex OAuth Connection
+
+Codex is the enabled OAuth source:
+
+```bash
+iforge ai-provider add openai-codex \
+  --type openai \
+  --base-url https://api.openai.com/v1 \
+  --default-model gpt-5.2 \
+  --api-mode openai_responses \
+  --auth env:OPENAI_API_KEY
+
+iforge ai-provider connect openai-codex --tool codex
+```
+
+The CLI listens on the supported loopback callbacks. For a headless flow:
+
+```bash
+iforge ai-provider connect openai-codex --tool codex --callback manual
+iforge ai-provider complete-oauth openai-codex --redirect-url '<browser callback url>'
+```
+
+Existing Codex auth may be imported and bound to a provider:
+
+```bash
+iforge ai-provider import-auth openai-codex --tool codex
+```
+
+OAuth tokens are stored as encrypted provider-auth payloads and are not stored
+in the Provider Catalog or printed by these commands.
+
+## Core Hosted Runtime Binding
+
+The Hosted controller is the activation authority:
+
+```text
+provider catalog / auth payload
+          |
+          v
+Hosted controller admission (provider_ids length 0..2)
+          |
+          v
+stable runtime bootstrap bundle + scoped secretValues
+          |
+          v
+CLI manifest validation before secret rendering/decryption
+          |
+          +--> Hermes config/auth convergence
+          `--> OpenClaw config/provider-auth convergence
+```
+
+The wire field remains `provider_ids: string[]`. Its Core Hosted semantics are:
+
+- configured mode contains one primary provider and may contain one additional
+  capability provider;
+- unmanaged mode contains an empty list;
+- an explicit `primary_model.provider_id` must belong to the configured provider IDs;
+- a native chat binding may omit `primary_model` or send null, including when
+  accompanied by a separate managed embedding provider;
+- the manifest `providers` projection must exactly match the selected IDs;
+- the capability provider does not participate in chat fallback or ordering.
+
+The public REST provider arrays and their existing limits are separate API
+debt and are not the Hosted binding contract. Provider Catalog CRUD likewise
+remains multi-record.
+
+The bootstrap response is the only Hosted wire used for convergence. Provider
+selection does not alter that stable contract.
+
+Done: `bun test packages/cli/src/runtime/manifest-reconciliation.test.ts`
+exits 0 and covers the optional capability provider plus duplicate and size
+limits.
+
+## Hosted Hermes And OpenClaw Delivery
+
+Native credential convergence never writes `model.provider`/`model.default`
+in Hermes or `agents.defaults.model.primary` in OpenClaw. This also applies to
+Codex OAuth; its existing ownership and token-rotation reconciliation remains
+in place. OpenClaw's current OAuth provider ID is `openai`, while Hermes uses
+`openai-codex`; the portable credential identity stays `openai-codex`.
+
+Native manifest entries are resolved directly to runtime connections. They do not
+pass through the legacy catalog projector or synthesize a primary model.
+
+OpenClaw enables the official provider plugin, installing it through the
+native CLI when absent. Native capability consent and install policy remain
+active. API keys use narrow `auth: "api-key"` and env SecretRef overrides so
+an existing auth profile cannot silently replace the selected key. Native
+provider objects contain no `models`; their catalog uses `models.mode: merge`.
+Other provider settings and stored user auth profiles are preserved. Removing
+a native binding removes its owned auth/endpoint fields, not the user profile.
+These narrow updates use `openclaw config patch --stdin`; keys are supplied only
+in the child process environment. Official CLI verification against npm
+`openclaw@2026.9.2` ([`3928bad9`](https://github.com/openclaw/openclaw/tree/3928bad9badfcb6c7d140530435e806fb8092190))
+confirmed merge and null deletion preserve unrelated fields. Its `--replace-path`
+replaces a small catalog but rejects a 300-to-1 model reduction under the native
+[size-drop guard](https://github.com/openclaw/openclaw/blob/3928bad9badfcb6c7d140530435e806fb8092190/src/config/io.write-safety.ts#L161).
+The CLI has no explicit size-drop option, so owned catalog replacement and legacy
+memory-layout repair retain the existing public SDK path, before native updates.
+
+Hermes uses a namespaced native credential-pool entry and `fill_first` for the
+bound API-key provider, preserving other pool entries and the selected model.
+Key rotation updates only that entry. Its keyless ownership journal preserves
+the prior credential strategy across retries and restores it when unbound.
+Native pool APIs retain concurrent changes and cooldown state for other keys.
+The standalone Python bridge calls public `read_credential_pool`,
+`write_credential_pool`, `PooledCredential`, and `has_named_custom_provider`;
+Bun embeds it in Node and native CLI builds. Secrets arrive through stdin.
+Hermes `auth add` uses random IDs and a masked prompt or key argv, so it cannot
+provide the required secure, owned, idempotent upsert. Its config CLI has no
+batch/CAS operation; structured changes retain `HermesConfigTransaction`.
+The installed Hermes auth resolver identifies aliases using the same provider
+key as its credential pool (`opencode-zen`, not the models.dev alias `opencode`).
+For the selected native provider, obsolete `model.base_url`, auth and protocol
+overrides are removed through the config transaction; `model.provider` and
+`model.default` are preserved. Connection overrides for other providers remain.
+
+These native contracts are audited against OpenClaw
+[`53ff0867`](https://github.com/openclaw/openclaw/tree/53ff0867149e1fd753cbfc9f67f79a28e6318f58/extensions)
+and Hermes
+[`96663732`](https://github.com/NousResearch/hermes-agent/blob/966637323e6f90864e069dbc12755934c2c86387/hermes_cli/runtime_provider.py).
+Provider identity/auth mappings do not freeze upstream model catalogs.
+
+Done: `scripts/test.sh cli src/runtime/native-provider-credentials.test.ts
+src/runtime/hermes-native-credentials.test.ts` exits 0.
+
+For Hermes, Hosted convergence uses `hermes config get --json` when it needs a
+resolved value, `unset` for deletion, and `set --force` for scalar writes. Raw
+structured state is read from, and mappings and arrays are atomically
+reconciled in, the YAML path reported by `hermes config path`, because `config
+set` does not provide a portable structured-value contract across supported
+installations. This preserves unrelated config and opaque map keys such as MCP
+names containing dots. The projection maps portable API modes to Hermes
+transport names and writes only environment-variable names for API-key
+providers. Codex OAuth uses
+Hermes' native `openai-codex` selector and a reserved iforge-owned
+credential-pool entry. Managed API-key provider
+objects set the upstream-supported `discover_models: false` and explicitly map
+the accepted-generation manifest's frozen `models`; each generation replaces
+all generated provider fields, so removed models do not survive. Generic and
+BYOK projection leaves Hermes' discovery default unchanged. Hermes has no
+OpenClaw-style global `models.mode` switch.
+
+This provider catalog behavior is verified against Hermes `0.19.1`, source commit
+[`cc4cab2f`](https://github.com/NousResearch/hermes-agent/tree/cc4cab2f592e60a197e796506de9168f74baf3ea):
+[`model_switch.py`](https://github.com/NousResearch/hermes-agent/blob/cc4cab2f592e60a197e796506de9168f74baf3ea/hermes_cli/model_switch.py#L2613-L2658)
+and its custom-provider path
+[`model_switch.py`](https://github.com/NousResearch/hermes-agent/blob/cc4cab2f592e60a197e796506de9168f74baf3ea/hermes_cli/model_switch.py#L2791-L2942)
+probe `/models` by default but honor `discover_models: false`;
+[`config.py`](https://github.com/NousResearch/hermes-agent/blob/cc4cab2f592e60a197e796506de9168f74baf3ea/hermes_cli/config.py#L1310-L1321)
+accepts that provider field.
+
+When the manifest selects an enabled Hermes runtime's iforge-managed Responses
+provider (`managed_by: clawdi`), the CLI defaults
+`HERMES_API_CALL_STALE_TIMEOUT=1200` in its generated gateway and dashboard
+service environments. Explicit `run.env` / service `env` or `secretEnv` values
+win. Hermes also gives explicit provider/model timeout config and the user's
+`.hermes/.env` precedence. Generated run files and service environments retract
+the default on a manifest switch to BYO, without editing user config or `.env`.
+Provider names, gateway hostnames and merely running on hosted compute do not
+identify iforge AI; no additional manifest policy field is needed.
+
+The 1200-second scalar is the maximum native Codex context stale floor, not
+dynamic equivalence. Hermes
+[`9e6c4100` watchdogs](https://github.com/NousResearch/hermes-agent/blob/9e6c4100cbf5222fb473ecc2b51fd17874f6ee75/agent/chat_completion_helpers.py)
+use 600/900/1200 seconds above 10k/50k/100k context tokens for native Codex.
+The 1500-second native hard ceiling is not a stale baseline. The CLI leaves the
+normal 1800-second request budget, Responses TTFB/event-idle settings, auth,
+reasoning, retries, model capabilities and UI streaming defaults unchanged.
+The user dotenv precedence is verified in
+[`env_loader.py`](https://github.com/NousResearch/hermes-agent/blob/9e6c4100cbf5222fb473ecc2b51fd17874f6ee75/hermes_cli/env_loader.py#L349).
+
+This default follows the manifest-selected deployment: a local/session-only
+switch to another provider before authoritative manifest convergence shares
+the service default for all models. Hermes collapses named custom profiles to
+runtime provider `custom`; writing timeout-only `providers.custom` entries is
+unsafe because its model-selection and provider metadata readers also consume
+that namespace. The service environment avoids adding a bogus provider.
+
+Done: `scripts/test.sh cli src/runtime/manifest-services.test.ts` verifies managed
+selection, repeat convergence, explicit values and BYO withdrawal.
+
+For explicit catalog connections, OpenClaw Hosted provider convergence uses the public
+`openclaw/plugin-sdk/config-mutation` export. The mutation starts from authored
+source config, sets `models.mode` to `replace`, exactly replaces each selected
+provider object, and leaves unrelated provider and user settings intact. In the
+verified OpenClaw target, replace mode skips implicit provider discovery, so
+the active managed catalog comes only from the manifest projection; replacing
+the provider object also removes stale API modes and key references. The
+mutation enables OpenClaw's targeted `allowConfigSizeDrop` write option because
+removing stale managed models is an intentional size reduction; schema,
+SecretRef preflight, config-path ownership, locking, and compare-and-swap guards
+remain active. Gateway and channel patches continue to use `openclaw config
+patch --stdin`.
+
+The repository regression-audits these public SDK and projection mechanics with
+`openclaw@2026.7.1-2`, official source commit
+[`0790d9f`](https://github.com/openclaw/openclaw/commit/0790d9f593ad30c940ed93b5872a8cf6d6f3cf8c).
+That artifact remains an API audit sample, not a Hosted install pin. Hosted v2
+uses OpenClaw's official installer without a version argument; convergence
+capability-gates the APIs it uses.
+The discovery skip is implemented in
+[`models-config.plan.ts`](https://github.com/openclaw/openclaw/blob/0790d9f593ad30c940ed93b5872a8cf6d6f3cf8c/src/agents/models-config.plan.ts#L115-L120).
+API-key providers use env-backed `apiKey` references and explicitly set
+`auth: "api-key"`. This makes the provider entry win execution-time credential
+selection, but it does not govern doctor migration. The precedence contract is
+verified in OpenClaw's
+[`model-auth-provider-config.ts`](https://github.com/openclaw/openclaw/blob/8f382a202ff1e15833394b481615dcdda99b04d7/src/agents/model-auth-provider-config.ts#L216-L226)
+and
+[`model-auth-provider.ts`](https://github.com/openclaw/openclaw/blob/8f382a202ff1e15833394b481615dcdda99b04d7/src/agents/model-auth-provider.ts#L310-L337).
+
+`clawdi` is the reserved provider for the Hosted v2 managed projection, and its
+environment SecretRef is the sole API-key authority. OpenClaw model generation
+serializes the SecretRef id as the literal `CLAWDI_AI_API_KEY` marker in
+`models.json`. The supported `2026.7.1-2` and `2026.8.1` packages are exercised
+with this native env-backed projection, including an explicit Doctor repair and
+post-repair auth-store inspection. No provider metadata plugin participates in
+the current contract. A historical beta workaround installed
+`clawdi-managed-provider` only to register the env name as metadata; convergence
+now removes a verified iforge-owned legacy installation with OpenClaw's official
+uninstall command. An unrelated plugin with the same id is never removed.
+Explicit `auth: "api-key"` remains necessary for execution precedence, and the
+historical `clawdi` auth-profile cleanup remains in place for deployments that
+were previously affected. `2026.7.1-2` may report the generated env marker as a
+non-blocking `secrets audit` finding; Doctor and runtime authentication remain
+functional.
+
+When the accepted Hosted v2 manifest proves that exact managed projection,
+root-owned convergence uses OpenClaw's public config-mutation and provider-auth
+SDKs to remove every normalized `clawdi` auth registration and stored profile.
+The read-only preflight skips clean config/store writes. Transactional discovery
+covers the default/main store, the active
+`OPENCLAW_AGENT_DIR`, discovered state-tree agents, and explicitly configured
+agent directories; related order, `lastGood`, and usage references are removed
+by the owning APIs. Other providers, native Codex OAuth profiles, and unmanaged
+mode are preserved. Codex OAuth continues to use the native subscription route
+and a namespaced iforge-owned profile.
+
+Existing Hosted v2 deployments receive this repair through the root-owned
+runtime manifest converge path. After publishing the exact CLI package, Hosted
+selects it and accepts a controlled rollout for each existing deployment. The
+root-owned shim installs and verifies the package, atomically activates it, and
+self-reexecs before manifest convergence; no runtime-image rebuild is required.
+Changing the global package setting alone does not advance existing deployment
+generations. Cleanup runs before gateway activation and does not depend on a
+successful model response, a chat request, or OpenClaw doctor. A cleanup error
+prevents applied-authority commit, so the deployment remains incomplete and
+the next reconcile retries it.
+
+OAuth reconcile is durable and target-native:
+
+- the credential revision is seed authority, not overwrite authority;
+- refresh-token rotation performed by Hermes or OpenClaw is preserved;
+- logout/revoke is recorded and is not silently replayed;
+- write-ahead intent, compensation, ownership ledger, and compare-and-swap
+  evidence guard every native mutation;
+- one OAuth credential family cannot be owned by multiple Agent runtimes.
+
+The last rule is a cross-runtime ownership fence. It is not a multi-provider
+pool rule and remains required even though each runtime binds at most one
+provider.
+
+## Import And Export
+
+Import existing metadata without activating a local runtime:
+
+```bash
+iforge ai-provider import --from-hermes ~/.hermes/config.yaml
+iforge ai-provider import --from-openclaw ./openclaw-provider-config.json
+iforge ai-provider validate
+```
+
+Imports merge by default. Use `--replace` only when incoming IDs should replace
+matching local records.
+
+Default export contains metadata and secret references only:
+
+```bash
+iforge ai-provider export --out ai-providers.json
+iforge ai-provider import ai-providers.json
+```
+
+Including env-backed secrets requires passphrase encryption:
+
+```bash
+export IFORGE_SECRET_EXPORT_PASSPHRASE='choose-a-strong-passphrase'
+iforge ai-provider export \
+  --out ai-providers-with-secrets.json \
+  --include-secrets \
+  --secret-passphrase
+```
+
+Do not commit decrypted or imported env files.
+
+## Current Non-Goals
+
+- iforge-proxied BYOK model requests.
+- Local runtime activation/materialization from `iforge ai-provider`.
+- Claude Code OAuth through AI Provider.
+- OAuth for Anthropic, Gemini, OpenRouter, Mistral, or arbitrary custom
+  providers.
+- Changing the public REST provider-array contract as part of Core Hosted
+  binding admission.
+
+
+## Recovering an already-applied custom provider
+
+A failed desired provider change must not prevent restoring a custom provider
+whose ownership was already transferred by a qualified CLI. Same-instance
+runtime-state writes may recover only newly requested custom IDs found in the
+unique authenticated active boot for the persisted apply generation. The current
+head or retained accepted inbox evidence from its exact receipt, manifest ETag,
+boot nonce and session must prove those IDs were applied. Older evidence must not
+exceed the head sequence or capture time; purged payloads cannot authorize recovery.
+The active environment owner, deployment binding, instance, CLI selection,
+receipt/boot identity and source/ETag pair must match. Only active heads in the
+persisted apply generation participate in historical ambiguity; unrelated older
+generations remain stored and cannot block recovery. Multiple active boots within
+that generation (even expired ones), missing observations, retired bindings and
+changed incarnations fail closed. The ordinary runtime-state generation and
+owner locks still apply.
+
+Historical error/expired observations establish previous ownership, never health
+or current convergence. A newer valid desired source does not revoke a completed
+provider transfer: authenticated rollback may restore the previously applied
+connection while that source differs. When rendering fails, the persisted failure
+must belong to the current renderer contract. A historical claim cannot admit an
+unrelated custom provider; new handoffs retain the fresh, healthy, exact-source
+CLI requirement.
+
+The CLI still creates a missing provider only on initialization when it has no
+previous ownership record or a pending creation. A completed ownership record
+never authorizes recreating a missing provider. Recovery preserves native models
+and user configuration; it does not explain who removed a provider.
+
+Done: `bash scripts/test.sh backend tests/test_ai_provider_connection_ownership.py`
+passes against the runner's isolated PostgreSQL. Admission needs no CLI or
+wire-schema change. The Hermes mirror fix requires a new CLI release.
+
+Connection credential environment names remain immutable through PATCH, full
+upsert and archived-provider acceptance. Native ownership journals survive
+unbinding and archiving. Hermes may retain a `model.key_env` mirror equal to the
+selected connection environment; different environments and inline model
+credentials remain conflicts. This follows the native [provider configuration
+contract](https://github.com/Clawdi-AI/hermes-agent/blob/7a9634568cdeb8f5363bc99042a24ebff9df0e1c/hermes_cli/config.py).
+
+The native [runtime provider resolver](https://github.com/Clawdi-AI/hermes-agent/blob/7a9634568cdeb8f5363bc99042a24ebff9df0e1c/hermes_cli/runtime_provider.py)
+retains the named custom provider `key_env` and resolves that environment when
+selecting credentials. Equal environment references do not introduce a second
+credential identity. Native fallback credential sources may still exist, so
+manifest credential injection alone is not proof that a model call succeeds or
+fails. No implicit credential-identity migration is authorized by this fix.
+
+
+## Restoring a corrupted credential environment
+
+Ordinary edits still cannot change a completed connection's credential environment.
+A narrow platform restoration API accepts only `platform:provider-environment:repair`
+workload tokens. The trusted hosting verifier reads native ownership itself; user
+assertions, legacy admin credentials and general runtime-state scopes do not grant
+restoration authority. No provider or secret is created or replaced.
+
+The owning operator boundary verifies all retained V2 incarnations, fixed-path
+protected journals, local apply receipts and pinned substrate identity. It rejects
+inconsistent owners, unfinished creation and stale expectations. For an unbound
+consumer, its local push checkpoint must be current or its runtime must be stopped;
+content revision alone is not a causal absence proof.
+
+Cloud serializes provider/credential and runtime-fence validation, records an audit
+and durable idempotent receipt, then invalidates the usual manifests. Receipt reads
+allow recovery from a lost response without requiring a second native mutation.
+`already_current` is an audited no-op, not a readiness or model-call assertion.
+
+The new workload scope is not granted by migration. An authenticated admin may
+inspect and CAS grant/revoke only this capability on an existing active runtime
+projection client. This changes neither its keys nor its other scopes, and does not
+invalidate unrelated tokens. Configure only the reviewed hosting verifier; a worker
+that accepts caller-supplied native proof must never hold this scope.
+
+`POST /v1/admin/platform/workload-clients` registers a public assertion JWK with
+only `platform:runtime-state:write`. It requires admin authentication,
+`Idempotency-Key`, and a body containing `client_id`, `assertion_kid`,
+`assertion_algorithm`, `public_jwk`, and a nonblank `reason`. RS256 requires an
+RSA key of at least 2048 bits; ES256 requires P-256. Private key fields, mismatched
+key identity, and signing-only usage are rejected. Registration and its audit and
+replay receipt commit together. An existing client cannot be replaced or revived
+through this endpoint, even with the same public key. Retry with the original
+idempotency key; inspect current verifier access before its separate CAS grant.
+
+`POST /v1/admin/platform/signing-keys` registers the separate Cloud signing
+identity. Its body contains only `kid`, `algorithm`, public `public_jwk`, aware
+`not_before`/`expires_at`, and `reason`. Configure
+`PLATFORM_WORKLOAD_SIGNING_KEY_REFS` to map the public-material SHA-256 reference
+(`sha256:<digest>`) to an approved `file://` or `env://` secret reference. The
+resolver fails closed when absent, changed, non-regular, oversized, or mismatched.
+Registration verifies a real signature against the submitted public key, records
+an audit and durable replay receipt, and cannot replace an existing kid/reference.
+Client and signing identities cannot reuse the same public key. Private key
+material is never registered, stored in these tables, logged, or echoed in errors.
+
+Upstream's Kamal release workflow uses two dedicated GitHub secrets for the optional
+Cloud signer (the fork's kept `iforge-image-release.yml` and `config/deploy.yml` do not
+wire it yet; an operator enabling it supplies both values): `PLATFORM_WORKLOAD_SIGNING_KEY_REFS` contains
+`{"sha256:<64-lowercase-hex-digest>":"env://IFORGE_CLOUD_WORKLOAD_SIGNING_PRIVATE_KEY"}`;
+`IFORGE_CLOUD_WORKLOAD_SIGNING_PRIVATE_KEY` contains the separate private PEM
+with LF line endings; the mapping must be compact single-line JSON.
+Both unset preserves the existing deployment (the map defaults to `{}`). Partial
+configuration, malformed fingerprints, or a different environment reference stop
+the deploy preflight. The resolver and public registration verify key material;
+the deployment preflight checks configuration completeness, not cryptographic identity.
+Kamal receives literal environment references, never serialized PEM in its dotenv
+file. Operator deployments must provide the same environment and secret aliases
+(or `{}` and an empty signing value when disabled). Do not reuse a client assertion
+key as the Cloud signer. This workflow installs one signer reference; rotation with
+multiple simultaneous signing authorities requires a separately reviewed deployment.
+
+Archived custom/connection rows retain their credential environment. Reactivation
+keeps the provider UUID and creates a new Cloud incarnation. A per-provider
+`identity_enabled` marker is backfilled false for existing rows and defaults true
+for newly created rows; reactivation or explicit handoff enables it permanently.
+Healthy legacy bindings retain their old projection even with a newer reader:
+upgrading software alone never infers or writes a Cloud tuple by provider name.
+Identified new providers and explicitly handed-off providers bind
+`(providerUuid, incarnationId)` into their transfer entries. Reactivated providers
+cannot inherit an old or missing tuple merely because their name matches.
+The `provider-identity-v1` capability gates the additive manifest fields. Existing
+legacy readers remain available for unchanged legacy projections; they cannot
+process a pending handoff or native credential authority.
+
+## Explicit native identity handoff
+
+The workload-scoped `/v1/platform/ai-providers/{provider_id}/identity-handoff`
+POST prepares a specifically authorized native handoff. It validates the complete
+owner inventory, provider UUID/incarnation, opaque revision, native config/env and
+root journal hashes, routing agreement and fresh verifier evidence. Native owners
+must have current running checkpoints. The trusted hosting operator surface
+constructs these proofs itself; ordinary users and legacy admin auth cannot submit
+native attestations.
+
+A prepared receipt fences provider edits/rotation/archive and appears in every
+participating runtime manifest, including unbound consumers. Normal convergence
+stops before native changes. An explicitly invoked root CLI command fetches this
+current authorization and CAS-writes only the journal under the existing converge
+lock. It never imports or overwrites the native key, config or applied receipt.
+Reads walk every parent through no-follow directory descriptors under the runtime
+filesystem identity. Journal and env files require mode 0600; native config allows
+0600 or 0644, all with the expected uid/gid. File and directory device/inode,
+permissions, link count and content are checked again before the fd-relative atomic
+rename. Symlink ancestors, FIFOs and same-byte file replacements cannot pass CAS.
+A missing protected journal cannot establish ownership; an existing empty journal
+can admit a verified native provider through this explicit authorization.
+
+`POST .../identity-handoff/complete` rereads all consumer evidence before committing
+Cloud metadata. Its receipt and the latest provider-row handoff state are durable.
+Lost responses replay; partially acknowledged consumers continue the same intent.
+Fresh inspection plus `supersedes_handoff_id` permits the same operator to replace
+a stale pending intent explicitly, with a new idempotency key and CAS. A known
+foreign provider UUID/incarnation is always rejected. No journal is deleted and
+no old success receipt is fabricated.
+
+Completion marks native credential ownership. The provider response exposes
+`credential_authority: "native"`; runtime projection suppresses Cloud key injection,
+Cloud key rotation/saved-key testing rejects this authority, and Unset preserves
+the native credential reference. Ordinary metadata edits remain supported.
+Completion is not proof of runtime health or a successful model call: normal
+convergence and inference checks still follow. Image/lifecycle/funding operations
+remain with the existing owning control plane.
+
+One nullable JSONB column holds the latest prepared/completed receipt; historical
+responses and audit use the existing platform idempotency machinery. The separate
+per-provider activation bit preserves legacy compatibility without a global flag. The migration
+refuses downgrade while handoff state exists. Do not downgrade readers after a
+journal has adopted the new identity fields.
+
+Done: isolated PostgreSQL repair/grant tests verify stale CAS, replay, unchanged
+credential bytes, other-consumer conflicts and rejection of untrusted credentials.
+
+```bash
+scripts/test.sh backend tests/test_workload_client_bootstrap.py tests/test_ai_provider_connection_ownership.py tests/test_provider_environment_repair.py tests/test_provider_identity_handoff.py
+```
+
+Done: registration, separate grant, authority-preserving reactivation, and repair
+boundary tests pass without live credentials or infrastructure.

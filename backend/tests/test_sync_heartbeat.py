@@ -1,0 +1,1824 @@
+"""sync-heartbeat endpoint + EnvironmentResponse sync fields.
+
+Daemons hit this every ~30s. The dashboard reads
+EnvironmentResponse to paint its "online / errored / offline"
+badges. Both sides must round-trip: what the daemon writes is
+what the dashboard sees.
+
+Plus: an api_key bound to environment A must NOT be allowed to
+heartbeat environment B. Without this, a leaked deploy-key from
+one pod could overwrite another pod's observability fields and
+disguise a broken sync as healthy.
+"""
+
+from __future__ import annotations
+
+import uuid
+from collections.abc import AsyncIterator
+from datetime import UTC, datetime, timedelta
+from urllib.parse import urlparse
+
+import httpx
+import pytest
+import pytest_asyncio
+from httpx import ASGITransport
+from sqlalchemy import event
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio.engine import AsyncEngine
+
+from app.core.auth import AuthContext, get_auth
+from app.core.database import get_session
+from app.main import app
+from app.models.api_key import ApiKey
+from app.models.hosted_runtime import HostedRuntimeConfigObservation
+from app.models.session import AgentEnvironment
+from app.models.user import User
+from app.routes import sessions as session_routes
+from app.schemas.session import RuntimeObservedResponse
+from app.services.runtime_source import expected_runtime_bundle_v2_etag
+from app.services.runtime_source_revision import (
+    refresh_runtime_source_revisions,
+    runtime_source_contract_revision,
+)
+from tests.conftest import create_env_with_project
+from tests.hosted_runtime_fixtures import (
+    CANONICAL_CODEX_TOOLS,
+    canonical_hosted_runtime_state,
+    ensure_canonical_codex_tool_provider,
+)
+
+pytestmark = pytest.mark.committed_db
+
+_TEST_LOCALE = {"language": "en", "timezone": "UTC"}
+_TEST_CLI_PACKAGE_SPEC = "clawdi@1.2.3-test"
+_TEST_HOSTED_INTEGRATIONS_CLI_PACKAGE_SPEC = "clawdi@1.2.5-test"
+_TEST_SYSTEM = {}
+
+
+@pytest_asyncio.fixture(autouse=True)
+async def _canonical_codex_tool_graph(
+    db_session: AsyncSession,
+    seed_user,
+) -> None:
+    await ensure_canonical_codex_tool_provider(db_session, seed_user)
+
+
+def _test_runtimes(provider_id: str = "clawdi-managed") -> dict:
+    return {
+        "openclaw": {
+            "enabled": True,
+            "providerMode": "configured",
+            "provider_ids": [provider_id],
+            "primary_model": {"provider_id": provider_id, "model": "gpt-5.5"},
+            "install": {"source": "official"},
+        }
+    }
+
+
+def _runtime_observed(
+    *,
+    source_revision: str = "a" * 64,
+    reported_at: str | None = None,
+    status: str = "ok",
+    active_cli_version: str | None = "1.2.3-test",
+    applied: bool = True,
+    manifest_etag: str | None = None,
+    applied_generation: int = 4,
+    applied_instance_id: str = "iid-observed",
+    applied_provider_ids: list[str] | None = None,
+    providers: dict | None = None,
+    supervisor: dict | None = None,
+) -> dict:
+    payload = {
+        "schemaVersion": "clawdi.hostedRuntimeObserved.v2",
+        "reportedAt": reported_at or datetime.now(UTC).isoformat(),
+        "runtimeMode": "hosted",
+        "status": status,
+        "activeCliVersion": active_cli_version,
+        "applied": (
+            {
+                "etag": manifest_etag or expected_runtime_bundle_v2_etag(source_revision),
+                "sourceRevision": source_revision,
+                "generation": applied_generation,
+                "instanceId": applied_instance_id,
+                "appliedProviderIds": applied_provider_ids
+                if applied_provider_ids is not None
+                else ["clawdi-managed"],
+            }
+            if applied
+            else None
+        ),
+        "boot": None,
+        "cli": None,
+        "providers": providers
+        if providers is not None
+        else {
+            "clawdi-managed": {
+                "status": "ok",
+                "configured": True,
+                "secretAvailable": True,
+            }
+        },
+    }
+    if supervisor is not None:
+        payload["supervisor"] = supervisor
+    return payload
+
+
+async def _create_env(client: httpx.AsyncClient) -> str:
+    """Register an env via the public route — fixture-style helper.
+    Returns the new env_id. Uses a random machine_id so concurrent
+    test runs don't collide in the shared test DB."""
+    body = {
+        "machine_id": uuid.uuid4().hex,
+        "machine_name": "test-laptop",
+        "agent_type": "claude_code",
+        "os": "darwin",
+    }
+    r = await client.post("/v1/environments", json=body)
+    assert r.status_code == 200, r.text
+    return r.json()["id"]
+
+
+async def _persist_runtime_source_revision(
+    db_session: AsyncSession,
+    environment_id: str,
+) -> str:
+    parsed_id = uuid.UUID(environment_id)
+    revisions = await refresh_runtime_source_revisions(db_session, [parsed_id])
+    await db_session.commit()
+    revision = revisions[parsed_id]
+    assert revision is not None
+    return revision
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_writes_observability_fields(
+    client: httpx.AsyncClient,
+):
+    env_id = await _create_env(client)
+
+    payload = {
+        "last_revision_seen": 7,
+        "last_sync_error": None,
+        "queue_depth": 3,
+        "dropped_count_delta": 0,
+    }
+    r = await client.post(f"/v1/agents/{env_id}/sync-heartbeat", json=payload)
+    assert r.status_code == 204, r.text
+
+    # Round-trip through the public env GET — what the daemon
+    # wrote must be what the dashboard reads.
+    detail = (await client.get(f"/v1/environments/{env_id}")).json()
+    assert detail["last_revision_seen"] == 7
+    assert detail["queue_depth_high_water"] == 3
+    assert detail["last_sync_error"] is None
+    assert detail["last_sync_at"] is not None  # was None pre-heartbeat
+
+
+@pytest.mark.asyncio
+async def test_environment_identity_update_round_trips(client: httpx.AsyncClient):
+    env_id = await _create_env(client)
+
+    updated = await client.patch(
+        f"/v1/environments/{env_id}",
+        json={"display_name": "Build runner"},
+    )
+    assert updated.status_code == 200, updated.text
+    assert updated.json()["display_name"] == "Build runner"
+    assert updated.json()["avatar_url"] is None
+
+    detail = await client.get(f"/v1/environments/{env_id}")
+    assert detail.status_code == 200, detail.text
+    assert detail.json()["display_name"] == "Build runner"
+
+    cleared = await client.patch(
+        f"/v1/environments/{env_id}",
+        json={"display_name": ""},
+    )
+    assert cleared.status_code == 200, cleared.text
+    assert cleared.json()["display_name"] is None
+
+
+@pytest.mark.asyncio
+async def test_environment_update_rejects_avatar_url_field(client: httpx.AsyncClient):
+    env_id = await _create_env(client)
+
+    response = await client.patch(
+        f"/v1/environments/{env_id}",
+        json={"avatar_url": "https://example.com/agent.png"},
+    )
+    assert response.status_code == 422, response.text
+
+
+@pytest.mark.asyncio
+async def test_environment_update_rejects_avatar_preset_field(client: httpx.AsyncClient):
+    env_id = await _create_env(client)
+
+    response = await client.patch(
+        f"/v1/environments/{env_id}",
+        json={"avatar_preset": "aurora"},
+    )
+    assert response.status_code == 422, response.text
+
+
+@pytest.mark.asyncio
+async def test_environment_avatar_upload_stores_public_asset(client: httpx.AsyncClient):
+    env_id = await _create_env(client)
+    png = b"\x89PNG\r\n\x1a\n" + b"\x00" * 16
+
+    response = await client.post(
+        f"/v1/environments/{env_id}/avatar",
+        files={"file": ("agent.png", png, "image/png")},
+    )
+    assert response.status_code == 200, response.text
+    avatar_url = response.json()["avatar_url"]
+    assert "/v1/assets/agent-avatars/" in avatar_url
+    assert avatar_url.endswith(".png")
+
+    path = urlparse(avatar_url).path
+    asset = await client.get(path)
+    assert asset.status_code == 200, asset.text
+    assert asset.content == png
+    assert asset.headers["content-type"].startswith("image/png")
+
+    cleared = await client.delete(f"/v1/environments/{env_id}/avatar")
+    assert cleared.status_code == 200, cleared.text
+    assert cleared.json()["avatar_url"] is None
+
+
+@pytest.mark.asyncio
+async def test_environment_avatar_reupload_uses_new_asset_url(client: httpx.AsyncClient):
+    env_id = await _create_env(client)
+    first_png = b"\x89PNG\r\n\x1a\n" + b"\x00" * 16
+    second_png = b"\x89PNG\r\n\x1a\n" + b"\x01" * 16
+
+    first = await client.post(
+        f"/v1/environments/{env_id}/avatar",
+        files={"file": ("agent.png", first_png, "image/png")},
+    )
+    assert first.status_code == 200, first.text
+    first_path = urlparse(first.json()["avatar_url"]).path
+
+    second = await client.post(
+        f"/v1/environments/{env_id}/avatar",
+        files={"file": ("agent.png", second_png, "image/png")},
+    )
+    assert second.status_code == 200, second.text
+    second_path = urlparse(second.json()["avatar_url"]).path
+
+    assert second_path != first_path
+    old_asset = await client.get(first_path)
+    assert old_asset.status_code == 404
+    new_asset = await client.get(second_path)
+    assert new_asset.status_code == 200
+    assert new_asset.content == second_png
+
+
+@pytest.mark.asyncio
+async def test_environment_avatar_failed_reupload_keeps_existing_asset(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from app.routes import sessions as sessions_routes
+
+    env_id = await _create_env(client)
+    first_png = b"\x89PNG\r\n\x1a\n" + b"\x00" * 16
+    second_png = b"\x89PNG\r\n\x1a\n" + b"\x01" * 16
+
+    first = await client.post(
+        f"/v1/environments/{env_id}/avatar",
+        files={"file": ("agent.png", first_png, "image/png")},
+    )
+    assert first.status_code == 200, first.text
+    first_path = urlparse(first.json()["avatar_url"]).path
+
+    class FailingPutStore:
+        def __init__(self, delegate):
+            self.delegate = delegate
+
+        async def put(self, key: str, data: bytes, content_type: str | None = None) -> None:
+            del key, data, content_type
+            raise RuntimeError("object store unavailable")
+
+        async def get(self, key: str) -> bytes:
+            return await self.delegate.get(key)
+
+        async def delete(self, key: str) -> None:
+            await self.delegate.delete(key)
+
+        async def exists(self, key: str) -> bool:
+            return await self.delegate.exists(key)
+
+    monkeypatch.setattr(
+        sessions_routes,
+        "file_store",
+        FailingPutStore(sessions_routes.file_store),
+    )
+
+    with pytest.raises(RuntimeError, match="object store unavailable"):
+        await client.post(
+            f"/v1/environments/{env_id}/avatar",
+            files={"file": ("agent.png", second_png, "image/png")},
+        )
+
+    detail = await client.get(f"/v1/environments/{env_id}")
+    assert detail.status_code == 200, detail.text
+    assert urlparse(detail.json()["avatar_url"]).path == first_path
+
+    old_asset = await client.get(first_path)
+    assert old_asset.status_code == 200
+    assert old_asset.content == first_png
+
+
+@pytest.mark.asyncio
+async def test_environment_avatar_upload_rejects_non_image(client: httpx.AsyncClient):
+    env_id = await _create_env(client)
+
+    response = await client.post(
+        f"/v1/environments/{env_id}/avatar",
+        files={"file": ("agent.txt", b"not an image", "text/plain")},
+    )
+    assert response.status_code == 415, response.text
+
+
+@pytest.mark.asyncio
+async def test_environment_reorder_persists_list_order(client: httpx.AsyncClient):
+    first_id = await _create_env(client)
+    second_id = await _create_env(client)
+    third_id = await _create_env(client)
+
+    response = await client.patch(
+        "/v1/environments/order",
+        json={"environment_ids": [third_id, first_id, second_id]},
+    )
+    assert response.status_code == 200, response.text
+    assert [item["id"] for item in response.json()][:3] == [third_id, first_id, second_id]
+    assert [item["sort_order"] for item in response.json()][:3] == [0, 1, 2]
+
+    listed = await client.get("/v1/environments")
+    assert listed.status_code == 200, listed.text
+    assert [item["id"] for item in listed.json()][:3] == [third_id, first_id, second_id]
+
+
+@pytest.mark.asyncio
+async def test_environment_reorder_rejects_duplicate_ids(client: httpx.AsyncClient):
+    env_id = await _create_env(client)
+
+    response = await client.patch(
+        "/v1/environments/order",
+        json={"environment_ids": [env_id, env_id]},
+    )
+    assert response.status_code == 400, response.text
+
+
+@pytest.mark.asyncio
+async def test_environment_reorder_rejects_unknown_ids(client: httpx.AsyncClient):
+    env_id = await _create_env(client)
+
+    response = await client.patch(
+        "/v1/environments/order",
+        json={"environment_ids": [env_id, str(uuid.uuid4())]},
+    )
+    assert response.status_code == 404, response.text
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_high_water_only_grows(client: httpx.AsyncClient):
+    """`queue_depth_high_water` is monotonic — a heartbeat with a
+    smaller queue_depth must NOT lower the recorded peak.
+    Otherwise the dashboard underreports a daemon that briefly
+    blew up the queue then drained it."""
+    env_id = await _create_env(client)
+
+    await client.post(
+        f"/v1/agents/{env_id}/sync-heartbeat",
+        json={"queue_depth": 50},
+    )
+    await client.post(
+        f"/v1/agents/{env_id}/sync-heartbeat",
+        json={"queue_depth": 5},
+    )
+    detail = (await client.get(f"/v1/environments/{env_id}")).json()
+    assert detail["queue_depth_high_water"] == 50
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_dropped_count_accumulates(client: httpx.AsyncClient):
+    """The daemon sends a delta (since last heartbeat); server
+    keeps a running counter. A buggy daemon that always sends 0
+    won't move the needle, but a daemon dropping events will."""
+    env_id = await _create_env(client)
+
+    await client.post(
+        f"/v1/agents/{env_id}/sync-heartbeat",
+        json={"dropped_count_delta": 3},
+    )
+    await client.post(
+        f"/v1/agents/{env_id}/sync-heartbeat",
+        json={"dropped_count_delta": 2},
+    )
+    detail = (await client.get(f"/v1/environments/{env_id}")).json()
+    assert detail["dropped_count"] == 5
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_unknown_env_is_404(client: httpx.AsyncClient):
+    fake_id = uuid.uuid4()
+    r = await client.post(f"/v1/agents/{fake_id}/sync-heartbeat", json={"queue_depth": 0})
+    assert r.status_code == 404
+
+
+@pytest_asyncio.fixture
+async def env_bound_cli_client(
+    db_session: AsyncSession, seed_user
+) -> AsyncIterator[tuple[httpx.AsyncClient, str, str]]:
+    """A CLI-style client whose api_key is bound to a specific
+    environment_id. Yields (client, bound_env_id, other_env_id) so
+    tests can assert the bound key works on its own env and 403s
+    on another env owned by the same user."""
+    from tests.conftest import create_env_with_project
+
+    bound_env = await create_env_with_project(
+        db_session,
+        user_id=seed_user.id,
+        machine_id="bound",
+        machine_name="bound",
+    )
+    other_env = await create_env_with_project(
+        db_session,
+        user_id=seed_user.id,
+        machine_id="other",
+        machine_name="other",
+    )
+
+    bound_id = str(bound_env.id)
+    other_id = str(other_env.id)
+
+    # Build an api_key bound to bound_env. We don't insert it —
+    # the auth override returns it directly, which is enough for
+    # the 403 path because the route only inspects api_key fields.
+    placeholder_key = ApiKey(
+        user_id=seed_user.id,
+        key_hash="x" * 64,
+        key_prefix="x" * 16,
+        label="bound-test",
+        scopes=["sessions:write", "skills:read", "skills:write"],
+        environment_id=bound_env.id,
+    )
+
+    async def _override_session() -> AsyncIterator[AsyncSession]:
+        yield db_session
+
+    async def _override_auth() -> AuthContext:
+        return AuthContext(user=seed_user, api_key=placeholder_key)
+
+    app.dependency_overrides[get_session] = _override_session
+    app.dependency_overrides[get_auth] = _override_auth
+    try:
+        transport = ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+            yield ac, bound_id, other_id
+    finally:
+        app.dependency_overrides.clear()
+        # Best-effort cleanup so we don't leave envs littered.
+        await db_session.delete(bound_env)
+        await db_session.delete(other_env)
+        await db_session.commit()
+
+
+@pytest.mark.asyncio
+async def test_bound_key_can_heartbeat_its_own_env(env_bound_cli_client):
+    client, bound_id, _other_id = env_bound_cli_client
+    r = await client.post(f"/v1/agents/{bound_id}/sync-heartbeat", json={"queue_depth": 1})
+    assert r.status_code == 204, r.text
+
+
+@pytest.mark.asyncio
+async def test_bound_key_heartbeat_updates_hosted_runtime_config_observation(
+    env_bound_cli_client, db_session: AsyncSession
+):
+    client, bound_id, _other_id = env_bound_cli_client
+    state = canonical_hosted_runtime_state(
+        environment_id=uuid.UUID(bound_id),
+        deployment_id="dep-observed",
+        instance_id="iid-observed",
+        generation=1,
+        cli_package_spec=_TEST_CLI_PACKAGE_SPEC,
+        locale=_TEST_LOCALE,
+        system=_TEST_SYSTEM,
+        live_sync={"enabled": False, "agents": []},
+        recovery={"cacheManifest": True, "allowOfflineBoot": True},
+        runtimes=_test_runtimes(),
+    )
+    db_session.add(state)
+    await db_session.commit()
+    await db_session.refresh(state)
+    desired_updated_at = state.updated_at
+
+    observed = _runtime_observed()
+    received_at_lower_bound = datetime.now(UTC)
+    r = await client.post(
+        f"/v1/agents/{bound_id}/sync-heartbeat",
+        json={"queue_depth": 1, "runtime_observed": observed},
+    )
+    received_at_upper_bound = datetime.now(UTC)
+    assert r.status_code == 204, r.text
+
+    await db_session.refresh(state)
+    assert state.updated_at == desired_updated_at
+    observation = await db_session.get(HostedRuntimeConfigObservation, uuid.UUID(bound_id))
+    assert observation is not None
+    assert observation.observed_config_generation == 4
+    assert observation.observed_manifest_etag == expected_runtime_bundle_v2_etag("a" * 64)
+    assert observation.observed_source_revision == "a" * 64
+    assert observation.observed_at is not None
+    assert received_at_lower_bound <= observation.observed_at <= received_at_upper_bound
+    assert observation.diagnostics == {
+        **observed,
+        "reportedAt": datetime.fromisoformat(observed["reportedAt"])
+        .astimezone(UTC)
+        .isoformat()
+        .replace("+00:00", "Z"),
+    }
+
+
+@pytest.mark.asyncio
+async def test_runtime_observed_endpoint_returns_desired_observed_health(
+    client: httpx.AsyncClient,
+    db_session: AsyncSession,
+):
+    env_id = await _create_env(client)
+    state = canonical_hosted_runtime_state(
+        environment_id=uuid.UUID(env_id),
+        deployment_id="dep-observed-api",
+        instance_id="iid-observed-api",
+        generation=4,
+        cli_package_spec=_TEST_HOSTED_INTEGRATIONS_CLI_PACKAGE_SPEC,
+        locale=_TEST_LOCALE,
+        system=_TEST_SYSTEM,
+        live_sync={"enabled": False, "agents": []},
+        recovery={"cacheManifest": True, "allowOfflineBoot": True},
+        runtimes=_test_runtimes(),
+        mcp={"servers": {"clawdi": {"command": "clawdi", "args": ["mcp"]}}},
+        skills={
+            "entries": {
+                "clawdi": {"enabled": True, "version": 1},
+                "removed": {"enabled": False, "version": 2},
+                "review-pr": {
+                    "enabled": True,
+                    "source": {
+                        "type": "github",
+                        "url": "https://github.com/Clawdi-AI/store",
+                        "path": "skills/review-pr",
+                        "commit": "a" * 40,
+                    },
+                },
+            }
+        },
+        tools={**CANONICAL_CODEX_TOOLS, "catalog": "clawdi-default"},
+    )
+    db_session.add(state)
+    await db_session.commit()
+    await _persist_runtime_source_revision(db_session, env_id)
+
+    desired_source_revision = (
+        await client.get(f"/v1/environments/{env_id}/runtime-observed")
+    ).json()["desired"]["desired_source_revision"]
+    observed = _runtime_observed(
+        source_revision=desired_source_revision,
+        active_cli_version="1.2.5-test",
+        applied_generation=4,
+        applied_instance_id="iid-observed-api",
+    )
+    received_at_lower_bound = datetime.now(UTC)
+    heartbeat = await client.post(
+        f"/v1/agents/{env_id}/sync-heartbeat",
+        json={"queue_depth": 1, "runtime_observed": observed},
+    )
+    received_at_upper_bound = datetime.now(UTC)
+    assert heartbeat.status_code == 204, heartbeat.text
+
+    response = await client.get(f"/v1/environments/{env_id}/runtime-observed")
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert payload["desired"]["desired_source_revision"] == desired_source_revision
+    assert payload["environment"]["id"] == env_id
+    assert payload["desired"] == {
+        "deployment_id": "dep-observed-api",
+        "instance_id": "iid-observed-api",
+        "desired_config_generation": 4,
+        "desired_source_revision": payload["desired"]["desired_source_revision"],
+        "provider_id": "clawdi-managed",
+        "enabled_runtimes": ["openclaw"],
+        "has_mcp": True,
+        "has_tools": True,
+        "updated_at": payload["desired"]["updated_at"],
+    }
+    canonical = await client.get(f"/v1/agents/{env_id}/runtime-observed")
+    assert canonical.status_code == 200, canonical.text
+    assert canonical.json()["desired"]["managed_skills"] == [
+        {"id": "clawdi", "enabled": True, "version": 1},
+        {"id": "removed", "enabled": False, "version": 2},
+        {"id": "review-pr", "enabled": True, "version": 1},
+    ]
+    serialized = canonical.text.lower()
+    assert "secretref" not in serialized
+    assert '"headers"' not in serialized
+    assert '"url"' not in serialized
+    observed_at = datetime.fromisoformat(payload["observed"]["observed_at"].replace("Z", "+00:00"))
+    assert received_at_lower_bound <= observed_at <= received_at_upper_bound
+    assert datetime.fromisoformat(
+        payload["observed"]["diagnostics"]["reportedAt"].replace("Z", "+00:00")
+    ) == datetime.fromisoformat(observed["reportedAt"])
+    assert payload["observed"]["observed_config_generation"] == 4
+    assert payload["observed"]["observed_manifest_etag"] == expected_runtime_bundle_v2_etag(
+        desired_source_revision
+    )
+    assert payload["observed"]["observed_source_revision"] == desired_source_revision
+    assert payload["observed"]["diagnostics"]["schemaVersion"] == (
+        "clawdi.hostedRuntimeObserved.v2"
+    )
+    assert payload["observed"]["diagnostics"]["applied"]["generation"] == 4
+    assert payload["health"]["status"] == "ok"
+    assert payload["health"]["reasons"] == []
+    assert payload["health"]["observed_at"] is not None
+
+
+@pytest.mark.asyncio
+async def test_mcp_inventory_exposes_only_proven_user_declarations(
+    client: httpx.AsyncClient,
+    db_session: AsyncSession,
+):
+    env_id = await _create_env(client)
+
+    unavailable = await client.get(f"/v1/agents/{env_id}/mcp")
+    assert unavailable.status_code == 200, unavailable.text
+    assert unavailable.json() == {
+        "agent_id": env_id,
+        "deployment_id": None,
+        "availability": "unavailable",
+        "servers": [],
+    }
+    missing_agent_id = uuid.uuid4()
+    missing_agent = await client.get(f"/v1/agents/{missing_agent_id}/mcp")
+    assert missing_agent.status_code == 200, missing_agent.text
+    assert missing_agent.json() == {
+        "agent_id": str(missing_agent_id),
+        "deployment_id": None,
+        "availability": "unavailable",
+        "servers": [],
+    }
+
+    foreign_user = User(
+        clerk_id=f"foreign_mcp_{uuid.uuid4().hex[:8]}",
+        email=f"foreign-mcp-{uuid.uuid4().hex[:8]}@example.test",
+        name="Foreign MCP owner",
+    )
+    db_session.add(foreign_user)
+    await db_session.flush()
+    foreign_agent = await create_env_with_project(
+        db_session,
+        user_id=foreign_user.id,
+        machine_id=f"foreign-mcp-{uuid.uuid4().hex[:8]}",
+        machine_name="Foreign MCP Agent",
+    )
+    db_session.add(
+        canonical_hosted_runtime_state(
+            environment_id=foreign_agent.id,
+            deployment_id="dep-foreign-mcp",
+            instance_id="iid-foreign-mcp",
+            generation=1,
+            cli_package_spec=_TEST_CLI_PACKAGE_SPEC,
+            locale=_TEST_LOCALE,
+            system=_TEST_SYSTEM,
+            live_sync={"enabled": False, "agents": []},
+            recovery={"cacheManifest": True, "allowOfflineBoot": True},
+            runtimes=_test_runtimes(),
+            mcp={"servers": {"private": {"command": "private", "args": []}}},
+        )
+    )
+    await db_session.commit()
+    foreign = await client.get(f"/v1/agents/{foreign_agent.id}/mcp")
+    assert foreign.status_code == 200, foreign.text
+    assert foreign.json() == {
+        "agent_id": str(foreign_agent.id),
+        "deployment_id": None,
+        "availability": "unavailable",
+        "servers": [],
+    }
+
+    state = canonical_hosted_runtime_state(
+        environment_id=uuid.UUID(env_id),
+        deployment_id="dep-mcp-inventory",
+        instance_id="iid-mcp-inventory",
+        generation=1,
+        cli_package_spec=_TEST_CLI_PACKAGE_SPEC,
+        locale=_TEST_LOCALE,
+        system=_TEST_SYSTEM,
+        live_sync={"enabled": False, "agents": []},
+        recovery={"cacheManifest": True, "allowOfflineBoot": True},
+        runtimes=_test_runtimes(),
+        mcp=None,
+    )
+    db_session.add(state)
+    await db_session.commit()
+
+    missing_desired_projection = await client.get(f"/v1/agents/{env_id}/mcp")
+    assert missing_desired_projection.status_code == 200, missing_desired_projection.text
+    assert missing_desired_projection.json() == {
+        "agent_id": env_id,
+        "deployment_id": "dep-mcp-inventory",
+        "availability": "unavailable",
+        "servers": [],
+    }
+
+    state.mcp = {"servers": {}}
+    await db_session.commit()
+    configured_empty = await client.get(f"/v1/agents/{env_id}/mcp")
+    assert configured_empty.status_code == 200, configured_empty.text
+    assert configured_empty.json() == {
+        "agent_id": env_id,
+        "deployment_id": "dep-mcp-inventory",
+        "availability": "available",
+        "servers": [],
+    }
+
+    state.mcp = {"servers": {"clawdi": {"command": "clawdi", "args": ["mcp"]}}}
+    await db_session.commit()
+    platform_only = await client.get(f"/v1/agents/{env_id}/mcp")
+    assert platform_only.status_code == 200, platform_only.text
+    assert platform_only.json() == {
+        "agent_id": env_id,
+        "deployment_id": "dep-mcp-inventory",
+        "availability": "available",
+        "servers": [],
+    }
+
+    state.mcp = {
+        "servers": {
+            "local": {"command": "secret-command", "args": ["--secret-arg"]},
+            "remote": {
+                "url": "https://mcp.example.test/private",
+                "transport": "streamable-http",
+                "headers": {
+                    "Authorization": {
+                        "secretRef": "secret://mcp.remote.token",
+                        "prefix": "Bearer ",
+                    }
+                },
+            },
+        }
+    }
+    await db_session.commit()
+    inventory = await client.get(f"/v1/agents/{env_id}/mcp")
+    assert inventory.status_code == 200, inventory.text
+    assert inventory.json() == {
+        "agent_id": env_id,
+        "deployment_id": "dep-mcp-inventory",
+        "availability": "unavailable",
+        "servers": [],
+    }
+    serialized = inventory.text.lower()
+    for forbidden in (
+        "url",
+        "header",
+        "secretref",
+        "command",
+        "args",
+        "env",
+        "convergence",
+    ):
+        assert forbidden not in serialized
+
+    openapi = (await client.get("/openapi.json")).json()
+    response_schema = openapi["components"]["schemas"]["AgentMcpInventoryResponse"]
+    item_schema = openapi["components"]["schemas"]["AgentMcpServerInventoryItem"]
+    assert set(response_schema["properties"]) == {
+        "agent_id",
+        "deployment_id",
+        "availability",
+        "servers",
+    }
+    assert set(item_schema["properties"]) == {"id", "transport", "enabled", "source"}
+    assert item_schema["properties"]["source"]["const"] == "explicit_user_declaration"
+    assert "source" in item_schema["required"]
+
+    state.mcp = {
+        "servers": {
+            "clawdi": {"command": "clawdi", "args": ["mcp"]},
+            "unproven": {"command": "private", "args": []},
+        }
+    }
+    await db_session.commit()
+    mixed_platform_and_unproven = await client.get(f"/v1/agents/{env_id}/mcp")
+    assert mixed_platform_and_unproven.status_code == 200, mixed_platform_and_unproven.text
+    assert mixed_platform_and_unproven.json() == {
+        "agent_id": env_id,
+        "deployment_id": "dep-mcp-inventory",
+        "availability": "unavailable",
+        "servers": [],
+    }
+
+    state.mcp = {"servers": {"clawdi": {"command": "other", "args": ["mcp"]}}}
+    await db_session.commit()
+    unexpected_reserved_declaration = await client.get(f"/v1/agents/{env_id}/mcp")
+    assert unexpected_reserved_declaration.status_code == 200, unexpected_reserved_declaration.text
+    assert unexpected_reserved_declaration.json() == {
+        "agent_id": env_id,
+        "deployment_id": "dep-mcp-inventory",
+        "availability": "unavailable",
+        "servers": [],
+    }
+
+    state.mcp = {"servers": {"malformed": {"url": "https://mcp.example.test"}}}
+    await db_session.commit()
+    malformed = await client.get(f"/v1/agents/{env_id}/mcp")
+    assert malformed.status_code == 503, malformed.text
+    assert malformed.json() == {"detail": "Managed MCP inventory is temporarily unavailable."}
+
+
+@pytest.mark.asyncio
+async def test_runtime_observed_treats_unbackfilled_revision_as_pending(
+    client: httpx.AsyncClient,
+    db_session: AsyncSession,
+):
+    env_id = await _create_env(client)
+    state = canonical_hosted_runtime_state(
+        environment_id=uuid.UUID(env_id),
+        deployment_id="dep-revision-pending",
+        instance_id="iid-revision-pending",
+        generation=4,
+        cli_package_spec=_TEST_CLI_PACKAGE_SPEC,
+        locale=_TEST_LOCALE,
+        system=_TEST_SYSTEM,
+        live_sync={"enabled": False, "agents": []},
+        recovery={"cacheManifest": True, "allowOfflineBoot": True},
+        runtimes=_test_runtimes(),
+    )
+    db_session.add(state)
+    await db_session.commit()
+    heartbeat = await client.post(
+        f"/v1/agents/{env_id}/sync-heartbeat",
+        json={
+            "runtime_observed": _runtime_observed(
+                applied_generation=4,
+                applied_instance_id="iid-revision-pending",
+            )
+        },
+    )
+    assert heartbeat.status_code == 204, heartbeat.text
+
+    detail = (await client.get(f"/v1/agents/{env_id}/runtime-observed")).json()
+    summary = (await client.get("/v1/agents/runtime-observed")).json()
+    summary_item = next(item for item in summary["items"] if item["environment"]["id"] == env_id)
+    for payload in (detail, summary_item):
+        assert payload["desired"]["desired_source_revision"] is None
+        assert payload["health"]["status"] == "unknown"
+        assert "desired_source_revision_missing" in payload["health"]["reasons"]
+        assert "desired_source_invalid" not in payload["health"]["reasons"]
+        assert "desired_cli_version_invalid" not in payload["health"]["reasons"]
+
+    state.source_revision_contract = runtime_source_contract_revision()
+    await db_session.commit()
+    failed = (await client.get(f"/v1/agents/{env_id}/runtime-observed")).json()
+    assert "desired_source_invalid" in failed["health"]["reasons"]
+    assert "desired_source_revision_missing" not in failed["health"]["reasons"]
+
+
+@pytest.mark.asyncio
+async def test_runtime_health_fences_stale_instance_source_and_freshness(
+    client: httpx.AsyncClient,
+    db_session: AsyncSession,
+):
+    env_id = await _create_env(client)
+    state = canonical_hosted_runtime_state(
+        environment_id=uuid.UUID(env_id),
+        deployment_id="dep-health-fences",
+        instance_id="iid-current",
+        generation=4,
+        cli_package_spec=_TEST_CLI_PACKAGE_SPEC,
+        locale=_TEST_LOCALE,
+        system=_TEST_SYSTEM,
+        live_sync={"enabled": False, "agents": []},
+        recovery={"cacheManifest": True, "allowOfflineBoot": True},
+        runtimes=_test_runtimes(),
+    )
+    db_session.add(state)
+    await db_session.commit()
+    await _persist_runtime_source_revision(db_session, env_id)
+    desired_source_revision = (await client.get(f"/v1/agents/{env_id}/runtime-observed")).json()[
+        "desired"
+    ]["desired_source_revision"]
+    stale_source_revision = "b" * 64 if desired_source_revision != "b" * 64 else "c" * 64
+    heartbeat = await client.post(
+        f"/v1/agents/{env_id}/sync-heartbeat",
+        json={
+            "runtime_observed": _runtime_observed(
+                source_revision=stale_source_revision,
+                applied_generation=4,
+                applied_instance_id="iid-replaced",
+            )
+        },
+    )
+    assert heartbeat.status_code == 204, heartbeat.text
+
+    observation = await db_session.get(HostedRuntimeConfigObservation, uuid.UUID(env_id))
+    agent = await db_session.get(AgentEnvironment, uuid.UUID(env_id))
+    assert observation is not None
+    assert agent is not None
+
+    still_fresh_at = datetime.now(UTC) - timedelta(seconds=120)
+    observation.observed_at = still_fresh_at
+    agent.last_sync_at = still_fresh_at
+    await db_session.commit()
+
+    fresh_response = await client.get(f"/v1/agents/{env_id}/runtime-observed")
+    assert fresh_response.status_code == 200, fresh_response.text
+    fresh_health = fresh_response.json()["health"]
+    assert fresh_health["status"] == "unknown"
+    assert "daemon_stale" not in fresh_health["reasons"]
+    assert "runtime_observed_stale" not in fresh_health["reasons"]
+
+    stale_at = datetime.now(UTC) - timedelta(seconds=151)
+    observation.observed_at = stale_at
+    agent.last_sync_at = stale_at
+    await db_session.commit()
+
+    response = await client.get(f"/v1/agents/{env_id}/runtime-observed")
+    assert response.status_code == 200, response.text
+    health = response.json()["health"]
+    assert health["status"] == "stale"
+    assert {
+        "applied_instance_id_mismatch",
+        "source_revision_mismatch",
+        "observed_manifest_etag_mismatch",
+        "daemon_stale",
+        "runtime_observed_stale",
+    }.issubset(health["reasons"])
+
+
+@pytest.mark.asyncio
+async def test_agent_runtime_observed_schema_is_enriched_without_environment_v1_drift(
+    client: httpx.AsyncClient,
+):
+    openapi = (await client.get("/openapi.json")).json()
+    environment_schema = openapi["paths"]["/v1/environments/{environment_id}/runtime-observed"][
+        "get"
+    ]["responses"]["200"]["content"]["application/json"]["schema"]
+    agent_schema = openapi["paths"]["/v1/agents/{agent_id}/runtime-observed"]["get"]["responses"][
+        "200"
+    ]["content"]["application/json"]["schema"]
+    assert environment_schema["$ref"].endswith("/RuntimeObservedResponse")
+    assert agent_schema["$ref"].endswith("/AgentRuntimeObservedResponse")
+    desired = openapi["components"]["schemas"]["RuntimeObservedDesiredResponse"]
+    agent_desired = openapi["components"]["schemas"]["AgentRuntimeObservedDesiredResponse"]
+    assert "managed_skills" not in desired["properties"]
+    assert "managed_skills" in agent_desired["properties"]
+
+
+@pytest.mark.asyncio
+async def test_agent_runtime_observed_fails_closed_across_generation_race(
+    client: httpx.AsyncClient,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    env_id = await _create_env(client)
+    state = canonical_hosted_runtime_state(
+        environment_id=uuid.UUID(env_id),
+        deployment_id="dep-race",
+        instance_id="iid-race",
+        generation=2,
+        cli_package_spec=_TEST_HOSTED_INTEGRATIONS_CLI_PACKAGE_SPEC,
+        locale=_TEST_LOCALE,
+        system=_TEST_SYSTEM,
+        live_sync={"enabled": False, "agents": []},
+        recovery={"cacheManifest": True, "allowOfflineBoot": True},
+        runtimes=_test_runtimes(),
+        skills={"entries": {"clawdi": {"enabled": True, "version": 1}}},
+        tools={**CANONICAL_CODEX_TOOLS, "catalog": "clawdi-default"},
+    )
+    db_session.add(state)
+    await db_session.commit()
+    stale_payload = (await client.get(f"/v1/environments/{env_id}/runtime-observed")).json()
+    stale_payload["desired"]["desired_config_generation"] = 1
+
+    async def stale_environment_response(*_args, **_kwargs) -> RuntimeObservedResponse:
+        return RuntimeObservedResponse.model_validate(stale_payload)
+
+    monkeypatch.setattr(
+        session_routes, "get_environment_runtime_observed", stale_environment_response
+    )
+    response = await client.get(f"/v1/agents/{env_id}/runtime-observed")
+    assert response.status_code == 503
+    assert response.json() == {
+        "detail": "Runtime desired state changed while it was being read; retry the request."
+    }
+
+
+@pytest.mark.asyncio
+async def test_agent_managed_skill_inventory_fails_closed_on_invalid_persisted_state(
+    client: httpx.AsyncClient,
+    db_session: AsyncSession,
+):
+    env_id = await _create_env(client)
+    state = canonical_hosted_runtime_state(
+        environment_id=uuid.UUID(env_id),
+        deployment_id="dep-invalid-skills",
+        instance_id="iid-invalid-skills",
+        generation=1,
+        cli_package_spec=_TEST_HOSTED_INTEGRATIONS_CLI_PACKAGE_SPEC,
+        locale=_TEST_LOCALE,
+        system=_TEST_SYSTEM,
+        live_sync={"enabled": False, "agents": []},
+        recovery={"cacheManifest": True, "allowOfflineBoot": True},
+        runtimes=_test_runtimes(),
+        skills={"entries": {"clawdi": {"enabled": True, "version": 1}}},
+        tools={**CANONICAL_CODEX_TOOLS, "catalog": "clawdi-default"},
+    )
+    state.skills = {"entries": []}
+    db_session.add(state)
+    await db_session.commit()
+
+    environment = await client.get(f"/v1/environments/{env_id}/runtime-observed")
+    assert environment.status_code == 200
+    assert "managed_skills" not in environment.json()["desired"]
+    agent = await client.get(f"/v1/agents/{env_id}/runtime-observed")
+    assert agent.status_code == 503
+    assert agent.json() == {"detail": "Managed Skill inventory is temporarily unavailable."}
+
+
+@pytest.mark.asyncio
+async def test_v2_applied_authority_persists_and_drives_health(
+    client: httpx.AsyncClient,
+    db_session: AsyncSession,
+):
+    env_id = await _create_env(client)
+    db_session.add(
+        canonical_hosted_runtime_state(
+            environment_id=uuid.UUID(env_id),
+            deployment_id="dep-observed-v2",
+            instance_id="iid-observed-v2",
+            generation=4,
+            cli_package_spec="clawdi@0.13.68",
+            locale=_TEST_LOCALE,
+            system=_TEST_SYSTEM,
+            live_sync={"enabled": False, "agents": []},
+            recovery={"cacheManifest": True, "allowOfflineBoot": True},
+            runtimes=_test_runtimes(),
+        )
+    )
+    await db_session.commit()
+    await _persist_runtime_source_revision(db_session, env_id)
+    desired = (await client.get(f"/v1/environments/{env_id}/runtime-observed")).json()["desired"]
+    source_revision = desired["desired_source_revision"]
+
+    heartbeat = await client.post(
+        f"/v1/agents/{env_id}/sync-heartbeat",
+        json={
+            "runtime_observed": _runtime_observed(
+                source_revision=source_revision,
+                active_cli_version="0.13.68",
+                applied_instance_id="iid-observed-v2",
+            )
+        },
+    )
+    assert heartbeat.status_code == 204, heartbeat.text
+    observation = await db_session.get(HostedRuntimeConfigObservation, uuid.UUID(env_id))
+    assert observation is not None
+    assert observation.observed_config_generation == 4
+    assert observation.observed_manifest_etag == expected_runtime_bundle_v2_etag(source_revision)
+    assert observation.observed_source_revision == source_revision
+    assert observation.diagnostics["activeCliVersion"] == "0.13.68"
+    healthy = (await client.get(f"/v1/environments/{env_id}/runtime-observed")).json()
+    assert healthy["health"] == {
+        "status": "ok",
+        "reasons": [],
+        "observed_at": healthy["health"]["observed_at"],
+    }
+
+    mismatch = _runtime_observed(
+        source_revision=source_revision,
+        active_cli_version="0.13.67",
+        applied_instance_id="iid-observed-v2",
+        providers={},
+    )
+    response = await client.post(
+        f"/v1/agents/{env_id}/sync-heartbeat",
+        json={"runtime_observed": mismatch},
+    )
+    assert response.status_code == 204, response.text
+    await db_session.refresh(observation)
+    unhealthy = (await client.get(f"/v1/environments/{env_id}/runtime-observed")).json()
+    assert unhealthy["health"]["status"] == "unknown"
+    assert "active_cli_version_mismatch" in unhealthy["health"]["reasons"]
+    assert "provider_status_unknown" in unhealthy["health"]["reasons"]
+    provider_health = {
+        provider["provider_id"]: provider for provider in unhealthy["provider_health"]
+    }
+    assert provider_health["clawdi-managed"]["reasons"] == ["provider_observation_missing"]
+
+    missing = _runtime_observed(
+        source_revision=source_revision,
+        active_cli_version=None,
+        applied=False,
+    )
+    response = await client.post(
+        f"/v1/agents/{env_id}/sync-heartbeat",
+        json={"runtime_observed": missing},
+    )
+    assert response.status_code == 204, response.text
+    await db_session.refresh(observation)
+    unknown = (await client.get(f"/v1/environments/{env_id}/runtime-observed")).json()
+    assert unknown["health"]["status"] == "unknown"
+    assert "observed_source_revision_missing" in unknown["health"]["reasons"]
+    assert "observed_manifest_etag_missing" in unknown["health"]["reasons"]
+    assert "active_cli_version_missing" in unknown["health"]["reasons"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("manifest_etag", "applied_provider_ids", "expected_reason", "absent_reason"),
+    [
+        ('"wrong-bundle-etag"', ["clawdi-managed"], "observed_manifest_etag_mismatch", None),
+        (None, [], "applied_provider_ids_missing_desired", "applied_provider_ids_extra"),
+        (
+            None,
+            ["clawdi-managed", "stale-provider"],
+            "applied_provider_ids_extra",
+            "applied_provider_ids_missing_desired",
+        ),
+    ],
+)
+async def test_v2_health_requires_expected_etag_and_exact_source_provider_set(
+    client: httpx.AsyncClient,
+    db_session: AsyncSession,
+    manifest_etag: str | None,
+    applied_provider_ids: list[str],
+    expected_reason: str,
+    absent_reason: str | None,
+):
+    env_id = await _create_env(client)
+    db_session.add(
+        canonical_hosted_runtime_state(
+            environment_id=uuid.UUID(env_id),
+            deployment_id="dep-observed-v2-equality",
+            instance_id="iid-observed-v2-equality",
+            generation=4,
+            cli_package_spec=_TEST_CLI_PACKAGE_SPEC,
+            locale=_TEST_LOCALE,
+            system=_TEST_SYSTEM,
+            live_sync={"enabled": False, "agents": []},
+            recovery={"cacheManifest": True, "allowOfflineBoot": True},
+            runtimes=_test_runtimes(),
+        )
+    )
+    await db_session.commit()
+    await _persist_runtime_source_revision(db_session, env_id)
+    desired = (await client.get(f"/v1/environments/{env_id}/runtime-observed")).json()["desired"]
+    source_revision = desired["desired_source_revision"]
+
+    heartbeat = await client.post(
+        f"/v1/agents/{env_id}/sync-heartbeat",
+        json={
+            "runtime_observed": _runtime_observed(
+                source_revision=source_revision,
+                manifest_etag=manifest_etag,
+                applied_provider_ids=applied_provider_ids,
+            )
+        },
+    )
+
+    assert heartbeat.status_code == 204, heartbeat.text
+    health = (await client.get(f"/v1/environments/{env_id}/runtime-observed")).json()["health"]
+    assert expected_reason in health["reasons"]
+    if absent_reason is not None:
+        assert absent_reason not in health["reasons"]
+
+
+@pytest.mark.asyncio
+async def test_runtime_observed_health_uses_explicit_apply_generation(
+    client: httpx.AsyncClient,
+    db_session: AsyncSession,
+):
+    env_id = await _create_env(client)
+    db_session.add(
+        canonical_hosted_runtime_state(
+            environment_id=uuid.UUID(env_id),
+            deployment_id="dep-config-convergence",
+            instance_id="iid-config-convergence",
+            generation=2,
+            apply_generation=3,
+            cli_package_spec=_TEST_CLI_PACKAGE_SPEC,
+            locale=_TEST_LOCALE,
+            system=_TEST_SYSTEM,
+            live_sync={"enabled": False, "agents": []},
+            recovery={"cacheManifest": True, "allowOfflineBoot": True},
+            runtimes=_test_runtimes(),
+        )
+    )
+    await db_session.commit()
+
+    heartbeat = await client.post(
+        f"/v1/agents/{env_id}/sync-heartbeat",
+        json={"runtime_observed": _runtime_observed(applied_generation=3)},
+    )
+    assert heartbeat.status_code == 204, heartbeat.text
+
+    observation = await db_session.get(HostedRuntimeConfigObservation, uuid.UUID(env_id))
+    assert observation is not None
+    diagnostics = observation.diagnostics
+    assert isinstance(diagnostics, dict)
+    applied = diagnostics["applied"]
+    assert isinstance(applied, dict)
+    observation.diagnostics = {
+        **diagnostics,
+        "applied": {**applied, "generation": 2},
+    }
+    await db_session.commit()
+
+    response = await client.get(f"/v1/agents/{env_id}/runtime-observed")
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert payload["desired"]["desired_config_generation"] == 2
+    assert payload["observed"]["observed_config_generation"] == 3
+    assert "config_generation_mismatch" not in payload["health"]["reasons"]
+
+    deprecated = await client.get(f"/v1/environments/{env_id}/runtime-observed")
+    assert deprecated.status_code == 200, deprecated.text
+    deprecated_payload = deprecated.json()
+    assert deprecated_payload["desired"]["desired_config_generation"] == 2
+    assert deprecated_payload["observed"]["observed_config_generation"] == 3
+    assert "config_generation_mismatch" in deprecated_payload["health"]["reasons"]
+
+
+@pytest.mark.asyncio
+async def test_runtime_observed_health_falls_back_to_legacy_checkpoint_generation(
+    client: httpx.AsyncClient,
+    db_session: AsyncSession,
+):
+    env_id = await _create_env(client)
+    db_session.add(
+        canonical_hosted_runtime_state(
+            environment_id=uuid.UUID(env_id),
+            deployment_id="dep-legacy-config-convergence",
+            instance_id="iid-legacy-config-convergence",
+            generation=5,
+            cli_package_spec=_TEST_CLI_PACKAGE_SPEC,
+            locale=_TEST_LOCALE,
+            system=_TEST_SYSTEM,
+            live_sync={"enabled": False, "agents": []},
+            recovery={"cacheManifest": True, "allowOfflineBoot": True},
+            runtimes=_test_runtimes(),
+        )
+    )
+    await db_session.commit()
+
+    heartbeat = await client.post(
+        f"/v1/agents/{env_id}/sync-heartbeat",
+        json={"runtime_observed": _runtime_observed(applied_generation=4)},
+    )
+    assert heartbeat.status_code == 204, heartbeat.text
+
+    payload = (await client.get(f"/v1/agents/{env_id}/runtime-observed")).json()
+    assert payload["desired"]["desired_config_generation"] == 5
+    assert payload["observed"]["observed_config_generation"] == 4
+    assert "config_generation_mismatch" in payload["health"]["reasons"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "invalid_diagnostics",
+    ["invalid-scalar", ["invalid-list", {"preserved": True}]],
+    ids=["scalar", "list"],
+)
+async def test_sync_heartbeat_repairs_non_object_diagnostics(
+    client: httpx.AsyncClient,
+    db_session: AsyncSession,
+    invalid_diagnostics,
+):
+    env_id = await _create_env(client)
+    db_session.add(
+        canonical_hosted_runtime_state(
+            environment_id=uuid.UUID(env_id),
+            deployment_id="dep-legacy-json-value",
+            instance_id="iid-legacy-json-value",
+            generation=4,
+            cli_package_spec=_TEST_CLI_PACKAGE_SPEC,
+            locale=_TEST_LOCALE,
+            system=_TEST_SYSTEM,
+            live_sync={"enabled": False, "agents": []},
+            recovery={"cacheManifest": True, "allowOfflineBoot": True},
+            runtimes=_test_runtimes(),
+        )
+    )
+    await db_session.commit()
+    db_session.add(
+        HostedRuntimeConfigObservation(
+            environment_id=uuid.UUID(env_id),
+            observed_at=None,
+            observed_config_generation=None,
+            observed_manifest_etag=None,
+            diagnostics=invalid_diagnostics,
+        )
+    )
+    await db_session.commit()
+
+    heartbeat = await client.post(
+        f"/v1/agents/{env_id}/sync-heartbeat",
+        json={"runtime_observed": _runtime_observed(applied_generation=4)},
+    )
+
+    assert heartbeat.status_code == 204, heartbeat.text
+    observation = await db_session.get(HostedRuntimeConfigObservation, uuid.UUID(env_id))
+    assert observation is not None
+    await db_session.refresh(observation)
+    assert observation.observed_config_generation == 4
+    assert observation.observed_manifest_etag == expected_runtime_bundle_v2_etag("a" * 64)
+    assert observation.observed_source_revision == "a" * 64
+    assert isinstance(observation.diagnostics, dict)
+    assert observation.diagnostics["schemaVersion"] == "clawdi.hostedRuntimeObserved.v2"
+
+
+@pytest.mark.asyncio
+async def test_config_generation_and_manifest_etag_are_stored_independently(
+    client: httpx.AsyncClient,
+    db_session: AsyncSession,
+):
+    env_id = await _create_env(client)
+    state = canonical_hosted_runtime_state(
+        environment_id=uuid.UUID(env_id),
+        deployment_id="dep-config-etag-independent",
+        instance_id="iid-config-etag-independent",
+        generation=4,
+        cli_package_spec=_TEST_CLI_PACKAGE_SPEC,
+        locale=_TEST_LOCALE,
+        system=_TEST_SYSTEM,
+        live_sync={"enabled": False, "agents": []},
+        recovery={"cacheManifest": True, "allowOfflineBoot": True},
+        runtimes=_test_runtimes(),
+    )
+    db_session.add(state)
+    await db_session.commit()
+    await db_session.refresh(state)
+    desired_updated_at = state.updated_at
+
+    first = await client.post(
+        f"/v1/agents/{env_id}/sync-heartbeat",
+        json={
+            "runtime_observed": _runtime_observed(
+                applied_generation=4,
+                manifest_etag='"manifest-etag-a"',
+            )
+        },
+    )
+    assert first.status_code == 204, first.text
+    second = await client.post(
+        f"/v1/agents/{env_id}/sync-heartbeat",
+        json={
+            "runtime_observed": _runtime_observed(
+                applied_generation=4,
+                manifest_etag='"manifest-etag-b"',
+            )
+        },
+    )
+    assert second.status_code == 204, second.text
+
+    observation = await db_session.get(HostedRuntimeConfigObservation, uuid.UUID(env_id))
+    assert observation is not None
+    assert observation.observed_config_generation == 4
+    assert observation.observed_manifest_etag == '"manifest-etag-b"'
+    await db_session.refresh(state)
+    assert state.updated_at == desired_updated_at
+
+
+@pytest.mark.asyncio
+async def test_runtime_observed_endpoint_safely_degrades_invalid_stored_diagnostics(
+    client: httpx.AsyncClient,
+    db_session: AsyncSession,
+):
+    env_id = await _create_env(client)
+    db_session.add(
+        canonical_hosted_runtime_state(
+            environment_id=uuid.UUID(env_id),
+            deployment_id="dep-legacy-diagnostics",
+            instance_id="iid-legacy-diagnostics",
+            generation=4,
+            cli_package_spec=_TEST_CLI_PACKAGE_SPEC,
+            locale=_TEST_LOCALE,
+            system=_TEST_SYSTEM,
+            live_sync={"enabled": False, "agents": []},
+            recovery={"cacheManifest": True, "allowOfflineBoot": True},
+            runtimes=_test_runtimes(),
+        )
+    )
+    await db_session.commit()
+    heartbeat = await client.post(
+        f"/v1/agents/{env_id}/sync-heartbeat",
+        json={"queue_depth": 0},
+    )
+    assert heartbeat.status_code == 204, heartbeat.text
+    invalid_diagnostics = {
+        "schemaVersion": "unsupported.runtimeObserved",
+        "status": "ok",
+        "unknownField": {"preserved": True},
+    }
+    db_session.add(
+        HostedRuntimeConfigObservation(
+            environment_id=uuid.UUID(env_id),
+            observed_at=None,
+            observed_config_generation=None,
+            observed_manifest_etag=None,
+            diagnostics=invalid_diagnostics,
+        )
+    )
+    await db_session.commit()
+
+    response = await client.get(f"/v1/environments/{env_id}/runtime-observed")
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert payload["observed"] == {
+        "observed_at": None,
+        "observed_config_generation": None,
+        "observed_manifest_etag": None,
+        "observed_source_revision": None,
+        "diagnostics": None,
+    }
+    assert payload["health"]["status"] == "unknown"
+    assert {
+        "runtime_diagnostics_invalid",
+        "observed_config_generation_missing",
+        "observed_manifest_etag_missing",
+        "runtime_observed_at_missing",
+    }.issubset(payload["health"]["reasons"])
+    observation = await db_session.get(HostedRuntimeConfigObservation, uuid.UUID(env_id))
+    assert observation is not None
+    assert observation.diagnostics == invalid_diagnostics
+
+
+@pytest.mark.asyncio
+async def test_sync_heartbeat_refreshes_freshness_without_rewriting_diagnostics(
+    client: httpx.AsyncClient,
+    db_session: AsyncSession,
+):
+    env_id = await _create_env(client)
+    state = canonical_hosted_runtime_state(
+        environment_id=uuid.UUID(env_id),
+        deployment_id="dep-observed-dedupe",
+        instance_id="iid-observed-dedupe",
+        generation=4,
+        cli_package_spec=_TEST_CLI_PACKAGE_SPEC,
+        locale=_TEST_LOCALE,
+        system=_TEST_SYSTEM,
+        live_sync={"enabled": False, "agents": []},
+        recovery={"cacheManifest": True, "allowOfflineBoot": True},
+        runtimes=_test_runtimes(),
+    )
+    db_session.add(state)
+    await db_session.commit()
+
+    observed = _runtime_observed(reported_at="2026-06-11T00:00:00+00:00")
+    first = await client.post(
+        f"/v1/agents/{env_id}/sync-heartbeat",
+        json={"queue_depth": 1, "runtime_observed": observed},
+    )
+    assert first.status_code == 204, first.text
+    observation = await db_session.get(HostedRuntimeConfigObservation, uuid.UUID(env_id))
+    assert observation is not None
+    first_observed_at = observation.observed_at
+    first_diagnostics = observation.diagnostics
+
+    second = await client.post(
+        f"/v1/agents/{env_id}/sync-heartbeat",
+        json={
+            "runtime_observed": {
+                **observed,
+                "reportedAt": "2026-06-11T00:00:30+00:00",
+            }
+        },
+    )
+    assert second.status_code == 204, second.text
+    await db_session.refresh(observation)
+    assert observation.observed_at > first_observed_at
+    assert observation.diagnostics == first_diagnostics
+
+
+@pytest.mark.asyncio
+async def test_runtime_observed_endpoint_surfaces_supervisor_errors(
+    client: httpx.AsyncClient,
+    db_session: AsyncSession,
+):
+    env_id = await _create_env(client)
+    state = canonical_hosted_runtime_state(
+        environment_id=uuid.UUID(env_id),
+        deployment_id="dep-supervisor-error",
+        instance_id="iid-supervisor-error",
+        generation=5,
+        cli_package_spec=_TEST_CLI_PACKAGE_SPEC,
+        locale=_TEST_LOCALE,
+        system=_TEST_SYSTEM,
+        live_sync={"enabled": False, "agents": []},
+        recovery={"cacheManifest": True, "allowOfflineBoot": True},
+        runtimes=_test_runtimes(),
+    )
+    db_session.add(state)
+    await db_session.commit()
+
+    observed = _runtime_observed(
+        supervisor={
+            "status": "error",
+            "programs": [
+                {
+                    "name": "clawdi-openclaw",
+                    "state": "FATAL",
+                    "status": "error",
+                    "description": "Exited too quickly",
+                }
+            ],
+        }
+    )
+    heartbeat = await client.post(
+        f"/v1/agents/{env_id}/sync-heartbeat",
+        json={"queue_depth": 1, "runtime_observed": observed},
+    )
+    assert heartbeat.status_code == 204, heartbeat.text
+
+    response = await client.get(f"/v1/environments/{env_id}/runtime-observed")
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert payload["health"]["status"] == "error"
+    assert "supervisor_error" in payload["health"]["reasons"]
+    assert payload["observed"]["diagnostics"]["supervisor"]["programs"][0]["name"] == (
+        "clawdi-openclaw"
+    )
+
+
+@pytest.mark.asyncio
+async def test_runtime_observed_endpoint_surfaces_provider_errors(
+    client: httpx.AsyncClient,
+    db_session: AsyncSession,
+):
+    env_id = await _create_env(client)
+    state = canonical_hosted_runtime_state(
+        environment_id=uuid.UUID(env_id),
+        deployment_id="dep-provider-error",
+        instance_id="iid-provider-error",
+        generation=6,
+        cli_package_spec=_TEST_CLI_PACKAGE_SPEC,
+        locale=_TEST_LOCALE,
+        system=_TEST_SYSTEM,
+        live_sync={"enabled": False, "agents": []},
+        recovery={"cacheManifest": True, "allowOfflineBoot": True},
+        runtimes=_test_runtimes(),
+    )
+    db_session.add(state)
+    await db_session.commit()
+
+    observed = _runtime_observed(
+        providers={
+            "clawdi-managed": {
+                "status": "error",
+                "baseUrl": "https://sub2api.test/v1",
+                "model": "gpt-5.5",
+                "apiKeySecretRef": "secret://provider.clawdi-managed.apiKey",
+                "secretAvailable": False,
+                "reasons": ["secret_missing"],
+            }
+        }
+    )
+    heartbeat = await client.post(
+        f"/v1/agents/{env_id}/sync-heartbeat",
+        json={"queue_depth": 1, "runtime_observed": observed},
+    )
+    assert heartbeat.status_code == 204, heartbeat.text
+
+    response = await client.get(f"/v1/environments/{env_id}/runtime-observed")
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert payload["health"]["status"] == "error"
+    assert "provider_error" in payload["health"]["reasons"]
+    assert payload["provider_health"] == [
+        {
+            "provider_id": "clawdi-managed",
+            "status": "error",
+            "reasons": ["provider_secret_missing", "secret_missing"],
+            "desired": {
+                "selected": True,
+                "primary": True,
+            },
+            "observed": observed["providers"]["clawdi-managed"],
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_runtime_observed_endpoint_reports_not_configured(
+    client: httpx.AsyncClient,
+):
+    env_id = await _create_env(client)
+
+    response = await client.get(f"/v1/environments/{env_id}/runtime-observed")
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert payload["environment"]["id"] == env_id
+    assert payload["desired"] is None
+    assert payload["observed"] is None
+    assert payload["health"] == {
+        "status": "not_configured",
+        "reasons": ["hosted_runtime_state_missing"],
+        "observed_at": None,
+    }
+
+
+@pytest.mark.asyncio
+async def test_bound_key_runtime_observed_is_env_scoped(env_bound_cli_client):
+    client, bound_id, other_id = env_bound_cli_client
+
+    own = await client.get(f"/v1/environments/{bound_id}/runtime-observed")
+    assert own.status_code == 200, own.text
+    assert own.json()["environment"]["id"] == bound_id
+
+    other = await client.get(f"/v1/environments/{other_id}/runtime-observed")
+    assert other.status_code == 404, other.text
+
+
+@pytest.mark.asyncio
+async def test_runtime_observed_summary_has_bounded_queries_without_secret_decryption(
+    client: httpx.AsyncClient,
+    db_session: AsyncSession,
+    engine: AsyncEngine,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    ok_env_id = await _create_env(client)
+    error_env_id = await _create_env(client)
+    missing_state_env_id = await _create_env(client)
+    db_session.add_all(
+        [
+            canonical_hosted_runtime_state(
+                environment_id=uuid.UUID(ok_env_id),
+                deployment_id="dep-summary-ok",
+                instance_id="iid-summary-ok",
+                generation=1,
+                cli_package_spec=_TEST_CLI_PACKAGE_SPEC,
+                locale=_TEST_LOCALE,
+                system=_TEST_SYSTEM,
+                live_sync={"enabled": False, "agents": []},
+                recovery={"cacheManifest": True, "allowOfflineBoot": True},
+                runtimes=_test_runtimes(),
+            ),
+            canonical_hosted_runtime_state(
+                environment_id=uuid.UUID(error_env_id),
+                deployment_id="dep-summary-error",
+                instance_id="iid-summary-error",
+                generation=1,
+                cli_package_spec=_TEST_CLI_PACKAGE_SPEC,
+                locale=_TEST_LOCALE,
+                system=_TEST_SYSTEM,
+                live_sync={"enabled": False, "agents": []},
+                recovery={"cacheManifest": True, "allowOfflineBoot": True},
+                runtimes=_test_runtimes(),
+            ),
+        ]
+    )
+    await db_session.commit()
+    await refresh_runtime_source_revisions(
+        db_session,
+        [uuid.UUID(ok_env_id), uuid.UUID(error_env_id)],
+    )
+    await db_session.commit()
+    ok_observed = _runtime_observed(applied_generation=1)
+    error_observed = _runtime_observed(
+        applied_generation=1,
+        providers={
+            "default": {
+                "status": "error",
+                "apiKeySecretRef": "secret://provider.default.apiKey",
+                "secretAvailable": False,
+            }
+        },
+    )
+    ok_heartbeat = await client.post(
+        f"/v1/agents/{ok_env_id}/sync-heartbeat",
+        json={"queue_depth": 1, "runtime_observed": ok_observed},
+    )
+    assert ok_heartbeat.status_code == 204, ok_heartbeat.text
+    error_heartbeat = await client.post(
+        f"/v1/agents/{error_env_id}/sync-heartbeat",
+        json={"queue_depth": 1, "runtime_observed": error_observed},
+    )
+    assert error_heartbeat.status_code == 204, error_heartbeat.text
+
+    def reject_decrypt(*_args, **_kwargs):
+        raise AssertionError("runtime observed summary must not decrypt secrets")
+
+    monkeypatch.setattr("app.services.runtime_source.decrypt", reject_decrypt)
+    query_count = 0
+
+    def count_query(*_args, **_kwargs) -> None:
+        nonlocal query_count
+        query_count += 1
+
+    event.listen(engine.sync_engine, "before_cursor_execute", count_query)
+    try:
+        response = await client.get("/v1/environments/runtime-observed")
+    finally:
+        event.remove(engine.sync_engine, "before_cursor_execute", count_query)
+    assert response.status_code == 200, response.text
+    assert query_count <= 8
+    payload = response.json()
+    assert payload["counts"] == {
+        "ok": 0,
+        "error": 1,
+        "stale": 0,
+        "unknown": 1,
+        "not_configured": 1,
+    }
+    by_env = {item["environment"]["id"]: item for item in payload["items"]}
+    assert by_env[ok_env_id]["health"]["status"] == "unknown"
+    assert "source_revision_mismatch" in by_env[ok_env_id]["health"]["reasons"]
+    assert "observed_manifest_etag_mismatch" in by_env[ok_env_id]["health"]["reasons"]
+    assert by_env[ok_env_id]["observed"]["observed_config_generation"] == 1
+    assert any(
+        provider["status"] == "error" for provider in by_env[error_env_id]["provider_health"]
+    )
+    assert by_env[missing_state_env_id]["health"]["status"] == "not_configured"
+
+    canonical = await client.get("/v1/agents/runtime-observed")
+    assert canonical.status_code == 200, canonical.text
+    assert canonical.json() == payload
+
+
+@pytest.mark.asyncio
+async def test_sync_heartbeat_rejects_malformed_observed_scalar(
+    client: httpx.AsyncClient,
+    db_session: AsyncSession,
+):
+    env_id = await _create_env(client)
+    db_session.add(
+        canonical_hosted_runtime_state(
+            environment_id=uuid.UUID(env_id),
+            deployment_id="dep-observed-strict",
+            instance_id="iid-observed-strict",
+            generation=4,
+            cli_package_spec=_TEST_CLI_PACKAGE_SPEC,
+            locale=_TEST_LOCALE,
+            system=_TEST_SYSTEM,
+            live_sync={"enabled": False, "agents": []},
+            recovery={"cacheManifest": True, "allowOfflineBoot": True},
+            runtimes=_test_runtimes(),
+        )
+    )
+    await db_session.commit()
+    observed = _runtime_observed()
+    observed["applied"]["generation"] = "4"
+
+    response = await client.post(
+        f"/v1/agents/{env_id}/sync-heartbeat",
+        json={"runtime_observed": observed},
+    )
+
+    assert response.status_code == 422, response.text
+    assert await db_session.get(HostedRuntimeConfigObservation, uuid.UUID(env_id)) is None
+
+
+@pytest.mark.asyncio
+async def test_sync_heartbeat_bounds_oversized_observed_payload(
+    client: httpx.AsyncClient,
+    db_session: AsyncSession,
+):
+    env_id = await _create_env(client)
+    db_session.add(
+        canonical_hosted_runtime_state(
+            environment_id=uuid.UUID(env_id),
+            deployment_id="dep-observed-bounded",
+            instance_id="iid-observed-bounded",
+            generation=4,
+            cli_package_spec=_TEST_CLI_PACKAGE_SPEC,
+            locale=_TEST_LOCALE,
+            system=_TEST_SYSTEM,
+            live_sync={"enabled": False, "agents": []},
+            recovery={"cacheManifest": True, "allowOfflineBoot": True},
+            runtimes=_test_runtimes(),
+        )
+    )
+    await db_session.commit()
+    observed = _runtime_observed()
+    observed["error"] = "x" * (70 * 1024)
+
+    response = await client.post(
+        f"/v1/agents/{env_id}/sync-heartbeat",
+        json={"runtime_observed": observed},
+    )
+
+    assert response.status_code == 204, response.text
+    observation = await db_session.get(HostedRuntimeConfigObservation, uuid.UUID(env_id))
+    assert observation is not None
+    assert observation.diagnostics["truncated"] is True
+    assert observation.diagnostics["error"] == "runtime observed payload exceeded size limit"
+
+
+@pytest.mark.asyncio
+async def test_bound_key_cannot_heartbeat_another_env(env_bound_cli_client):
+    client, _bound_id, other_id = env_bound_cli_client
+    r = await client.post(f"/v1/agents/{other_id}/sync-heartbeat", json={"queue_depth": 1})
+    assert r.status_code == 403, r.text

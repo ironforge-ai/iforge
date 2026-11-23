@@ -1,0 +1,44 @@
+# Documents permitted to retain a legacy state-root reference -- phase 03.3, plan 20.
+#
+# This file is the single authority for which documents under docs/ may still name the
+# pre-migration CLI state root. Two consumers read it, and neither consults a SUMMARY:
+#
+#   * the gate command in plan 03.3-20 Task 1, which subtracts this path set from the paths
+#     `grep -rl` reports over docs/ and fails on anything left over;
+#   * backend/tests/test_docs_identity_contract.py, which PARSES it into
+#     DELIBERATE_LEGACY_REFERENCES rather than declaring a tuple of its own.
+#
+# One authority read by both. A tuple restated in the test would be a second copy that agrees
+# today and drifts silently.
+#
+# It lives in config/ rather than under .planning/ for the reason config/rebrand-allowlist.txt
+# already states: /gsd-cleanup archives .planning/phases/ when a milestone completes, and a
+# `bun run test` that breaks on planning maintenance is not a guard.
+#
+# GRAMMAR, one entry per line:
+#   empty line, or first non-space character is `#`  -> skipped
+#   anything else  -> one repository-relative path allowed to retain the reference
+#
+# Every path entry is immediately preceded by at least one `#` reason comment. A path with no
+# reason comment above it is a defect the contract suite fails on, naming the path: a fence
+# nobody justified is indistinguishable from a sweep somebody abandoned. An entry comes out
+# only together with the line underneath it, and a path listed here that no longer carries a
+# reference fails the suite too -- a fence over nothing decays into cover for a regression.
+#
+# REASONS CITE; THEY DO NOT QUOTE. Each reason names its site by line number and paraphrases
+# what that line is doing. This is structural rather than stylistic: `config` is a bare
+# pathspec in SCAN_PATHSPEC in scripts/check_rebrand_residual.py, whose only config-level
+# exclusion is config/rebrand-allowlist.txt. A reason that reproduced its site's text would
+# therefore make THIS file an unallowlisted residual hit. The scan exclusion the migration
+# runbook enjoys does not travel to a file that quotes it. Citing is also the more durable
+# grammar: a quoted line rots on the next rewording, while a line number plus a paraphrase
+# still names the site.
+#
+# A path appears here if and only if plan 03.3-20 Task 1 classified at least one of its sites
+# as a DELIBERATE reference to where a reader's PRE-MIGRATION state lives, as distinct from a
+# claim about where the CLI reads state now. The second kind was rewritten, not fenced.
+
+# 06.1-04 (user directive 2026-09-30, no old-brand name aliases): both survivors are gone. The
+# hosted identity migration runbook was deleted with the legacy readers it operated, and the env
+# migration runbook no longer names the pre-migration state tree or `iforge migrate`. No document
+# is allowed a legacy state-root reference, so this file carries only its header.

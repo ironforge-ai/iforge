@@ -1,0 +1,258 @@
+"use client";
+
+import { Link, type LinkProps } from "@tanstack/react-router";
+import {
+	type Column,
+	type ColumnDef,
+	type ColumnVisibilityState,
+	columnSizingFeature,
+	columnVisibilityFeature,
+	type OnChangeFn,
+	type ReactTable,
+	type RowData,
+	rowPaginationFeature,
+	rowSortingFeature,
+	type SortingState,
+	tableFeatures,
+	useTable,
+} from "@tanstack/react-table";
+import { useState } from "react";
+import { Skeleton } from "@/components/ui/skeleton";
+import {
+	Table,
+	TableBody,
+	TableCell,
+	TableHead,
+	TableHeader,
+	TableRow,
+} from "@/components/ui/table";
+import { cn } from "@/lib/utils";
+
+const SKELETON_ROWS = Array.from({ length: 5 }, (_, i) => `row-${i}`);
+
+const dataTableFeatures = tableFeatures({
+	columnSizingFeature,
+	columnVisibilityFeature,
+	rowPaginationFeature,
+	rowSortingFeature,
+});
+
+export type DataTableColumnDef<TData extends RowData, TValue = unknown> = ColumnDef<
+	typeof dataTableFeatures,
+	TData,
+	TValue
+>;
+
+export type DataTableColumn<TData extends RowData, TValue = unknown> = Column<
+	typeof dataTableFeatures,
+	TData,
+	TValue
+>;
+
+type DataTableInstance<TData extends RowData> = ReactTable<typeof dataTableFeatures, TData>;
+
+interface PaginationState {
+	pageIndex: number; // 0-based for tanstack; translated to 1-based for API
+	pageSize: number;
+}
+
+interface DataTableProps<TData extends RowData> {
+	columns: DataTableColumnDef<TData>[];
+	data: TData[];
+	isLoading?: boolean;
+	emptyMessage?: React.ReactNode;
+	/**
+	 * Make every row clickable and navigable. Preferred over `onRowClick`
+	 * for *navigation* — the row gets a stretched link overlay so middle-click
+	 * opens a new tab and keyboard tab-order works. Use `onRowClick` only for non-nav side
+	 * effects (selection, expand-in-place, etc).
+	 */
+	getRowLink?: (row: TData) => Pick<LinkProps, "to" | "params" | "search" | "hash">;
+	/** Used as the stretched link's aria-label so screen readers know
+	 * what activating the row does. Required when `getRowLink` is set. */
+	rowAriaLabel?: (row: TData) => string;
+	onRowClick?: (row: TData) => void;
+
+	// Server-mode state. All required together — DataTable no longer keeps
+	// its own pagination/sorting state, so the parent (page component) owns
+	// it and can reflect it into the React Query key for refetches.
+	sorting?: SortingState;
+	onSortingChange?: OnChangeFn<SortingState>;
+	pagination?: PaginationState;
+	onPaginationChange?: OnChangeFn<PaginationState>;
+	pageCount?: number;
+
+	toolbar?: React.ReactNode | ((table: DataTableInstance<TData>) => React.ReactNode);
+	footer?: React.ReactNode;
+	className?: string;
+	tableContainerClassName?: string;
+
+	/**
+	 * Optional row grouping. When provided, the table inserts a
+	 * full-width separator row above each group of consecutive rows
+	 * sharing the same `key` — used by /sessions for "Today /
+	 * Yesterday / Previous 7 days / …" buckets. The caller must
+	 * sort `data` so group keys form contiguous runs; this only
+	 * emits a separator on key transitions.
+	 */
+	getRowGroup?: (row: TData) => { key: string; label: string };
+}
+
+export function DataTable<TData extends RowData>({
+	columns,
+	data,
+	isLoading,
+	emptyMessage = "No results.",
+	getRowLink,
+	rowAriaLabel,
+	onRowClick,
+	sorting,
+	onSortingChange,
+	pagination,
+	onPaginationChange,
+	pageCount,
+	toolbar,
+	footer,
+	className,
+	tableContainerClassName,
+	getRowGroup,
+}: DataTableProps<TData>) {
+	const [columnVisibility, setColumnVisibility] = useState<ColumnVisibilityState>({});
+	const table = useTable({
+		features: dataTableFeatures,
+		data,
+		columns,
+		manualSorting: true,
+		manualPagination: true,
+		pageCount: pageCount ?? -1,
+		state: {
+			...(sorting !== undefined ? { sorting } : {}),
+			...(pagination !== undefined ? { pagination } : {}),
+			columnVisibility,
+		},
+		onSortingChange,
+		onPaginationChange,
+		onColumnVisibilityChange: setColumnVisibility,
+	});
+
+	return (
+		<div className={cn("space-y-3", className)}>
+			{typeof toolbar === "function" ? toolbar(table) : toolbar}
+
+			<div
+				className={cn(
+					"overflow-x-auto overflow-y-hidden rounded-lg border bg-card",
+					tableContainerClassName,
+				)}
+			>
+				<Table className="min-w-full table-fixed">
+					<TableHeader className="bg-muted/40">
+						{table.getHeaderGroups().map((headerGroup) => (
+							<TableRow key={headerGroup.id} className="hover:bg-transparent">
+								{headerGroup.headers.map((header) => (
+									<TableHead key={header.id} style={{ width: header.getSize() }}>
+										{header.isPlaceholder ? null : <table.FlexRender header={header} />}
+									</TableHead>
+								))}
+							</TableRow>
+						))}
+					</TableHeader>
+					<TableBody>
+						{isLoading ? (
+							SKELETON_ROWS.map((rowId) => (
+								<TableRow key={rowId} className="hover:bg-transparent">
+									{columns.map((col, j) => (
+										<TableCell key={col.id ?? `col-${j}`}>
+											<Skeleton className="h-4 w-full" />
+										</TableCell>
+									))}
+								</TableRow>
+							))
+						) : table.getRowModel().rows.length ? (
+							(() => {
+								// Emit a separator row when the group key
+								// transitions. Only fires when getRowGroup
+								// is supplied; ungrouped tables behave
+								// exactly as before. Caller is responsible
+								// for ensuring sorted data so keys form
+								// contiguous runs.
+								let prevKey: string | null = null;
+								const out: React.ReactNode[] = [];
+								for (const row of table.getRowModel().rows) {
+									if (getRowGroup) {
+										const g = getRowGroup(row.original);
+										if (g.key !== prevKey) {
+											out.push(
+												<TableRow
+													key={`group-${g.key}`}
+													className="hover:bg-transparent"
+													aria-hidden
+												>
+													<TableCell
+														colSpan={columns.length}
+														className="bg-muted/20 px-3 py-1.5 text-xs font-medium uppercase tracking-wide text-muted-foreground"
+													>
+														{g.label}
+													</TableCell>
+												</TableRow>,
+											);
+											prevKey = g.key;
+										}
+									}
+									const rowLink = getRowLink?.(row.original);
+									const interactive = !!rowLink || !!onRowClick;
+									out.push(
+										<TableRow
+											key={row.id}
+											onClick={onRowClick ? () => onRowClick(row.original) : undefined}
+											// `group` lets cells do group-hover tricks (e.g. a delete
+											// icon that reveals only on row hover).
+											// `relative` hosts the stretched <Link> overlay below.
+											className={cn(
+												"group",
+												interactive && "cursor-pointer",
+												rowLink && "relative",
+											)}
+										>
+											{row.getVisibleCells().map((cell, idx) => (
+												<TableCell key={cell.id}>
+													{idx === 0 && rowLink ? (
+														// Stretched-link pattern: an absolute anchor
+														// covers the whole row so middle-click opens a
+														// new tab while keeping the row target large.
+														// Sits behind cell content; cells are static-
+														// positioned so their text doesn't intercept the
+														// click. Interactive elements inside cells need
+														// `relative z-10` to escape the link's hit area.
+														<Link
+															{...rowLink}
+															aria-label={rowAriaLabel?.(row.original) ?? "Open"}
+															className="absolute inset-0"
+														/>
+													) : null}
+													<table.FlexRender cell={cell} />
+												</TableCell>
+											))}
+										</TableRow>,
+									);
+								}
+								return out;
+							})()
+						) : (
+							<TableRow className="hover:bg-transparent">
+								<TableCell
+									colSpan={columns.length}
+									className="h-24 text-center text-muted-foreground"
+								>
+									{emptyMessage}
+								</TableCell>
+							</TableRow>
+						)}
+					</TableBody>
+				</Table>
+			</div>
+
+			{footer}
+		</div>
+	);
+}

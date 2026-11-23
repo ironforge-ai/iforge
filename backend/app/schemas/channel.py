@@ -1,0 +1,337 @@
+from __future__ import annotations
+
+from datetime import datetime
+from typing import Any, Literal
+from uuid import UUID
+
+from pydantic import BaseModel, Field, SecretStr, field_validator, model_validator
+
+ChannelProvider = Literal["telegram", "discord", "whatsapp"]
+ChannelVisibility = Literal["private", "public"]
+ChannelBotPoolAccess = Literal["owner", "public"]
+ChannelHealthStatus = Literal["ok", "warning", "error"]
+ChannelRuntimeStatus = Literal["connecting", "connected"]
+WhatsAppOnboardingState = Literal[
+    "generating",
+    "ready",
+    "scanned",
+    "connected",
+    "expired",
+    "canceled",
+    "error",
+]
+WhatsAppOnboardingReadinessReason = Literal[
+    "not_configured",
+    "no_capacity",
+    "managed_sidecar_required",
+    "temporarily_unavailable",
+]
+
+
+class ChannelAccountCreate(BaseModel):
+    provider: ChannelProvider
+    name: str = Field(min_length=1, max_length=120)
+    agent_id: UUID | None = None
+    replace_existing_provider_link: bool = Field(
+        default_factory=bool,
+        description="Explicit opt-in to replace this Agent's active link for the same provider.",
+    )
+    provider_token: str | None = Field(default=None, min_length=1, max_length=2000)
+    config: dict[str, Any] | None = None
+    secrets: dict[str, str] | None = None
+
+    @field_validator("name")
+    @classmethod
+    def _strip_name(cls, value: str) -> str:
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError("name cannot be blank")
+        return stripped
+
+    @field_validator("secrets")
+    @classmethod
+    def _validate_secrets(cls, value: dict[str, str] | None) -> dict[str, str] | None:
+        if value is None:
+            return None
+        cleaned: dict[str, str] = {}
+        for key, secret in value.items():
+            name = key.strip()
+            if not name or len(name) > 80 or not name.replace("_", "").isalnum():
+                raise ValueError("secret names must be alphanumeric or underscore")
+            if not secret:
+                raise ValueError("secret values cannot be blank")
+            cleaned[name] = secret
+        return cleaned
+
+    @model_validator(mode="after")
+    def _validate_provider_link_replacement(self) -> ChannelAccountCreate:
+        if self.replace_existing_provider_link and self.agent_id is None:
+            raise ValueError("agent_id is required to replace an existing provider link")
+        return self
+
+
+class ChannelAccountResponse(BaseModel):
+    id: UUID
+    provider: str
+    name: str
+    status: str
+    visibility: ChannelVisibility = "private"
+    has_provider_token: bool
+    webhook_url: str
+    created_at: datetime
+
+
+class ChannelBotPoolCapabilities(BaseModel):
+    link_agent: bool
+    pair_chat: bool
+    send_message: bool
+    manage_account: bool
+    sync_commands: bool
+
+
+class ChannelBotPoolItem(ChannelAccountResponse):
+    access: ChannelBotPoolAccess
+    capabilities: ChannelBotPoolCapabilities
+    link_count: int = 0
+    max_links: int | None = None
+    available: bool = True
+
+
+class ChannelBotPoolResponse(BaseModel):
+    providers: dict[str, list[ChannelBotPoolItem]]
+
+
+class ChannelAccountCreatedResponse(ChannelAccountResponse):
+    webhook_secret: str
+    agent_link_id: UUID | None = None
+    agent_id: UUID | None = None
+    agent_token: str | None = None
+
+
+class ChannelWhatsAppOnboardingReadinessResponse(BaseModel):
+    available: bool
+    manual_pairing_code_supported: bool
+    reason: WhatsAppOnboardingReadinessReason | None = None
+
+
+class ChannelWhatsAppOnboardingCreate(BaseModel):
+    request_id: UUID
+    name: str = Field(min_length=1, max_length=120)
+
+    @field_validator("name")
+    @classmethod
+    def _strip_name(cls, value: str) -> str:
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError("name cannot be blank")
+        return stripped
+
+
+class ChannelWhatsAppOnboardingPairingCodeCreate(BaseModel):
+    phone_number: SecretStr
+
+
+class ChannelWhatsAppOnboardingSessionResponse(BaseModel):
+    id: UUID
+    channel_account_id: UUID | None = None
+    name: str
+    state: WhatsAppOnboardingState
+    method: Literal["qr", "code"]
+    qr: str | None = Field(default=None, repr=False)
+    qr_expires_at: datetime | None = None
+    pairing_code: str | None = Field(default=None, repr=False)
+    manual_pairing_code_supported: bool
+    started_at: datetime
+    expires_at: datetime
+    completed_at: datetime | None = None
+
+
+class ChannelAgentLinkCreate(BaseModel):
+    agent_id: UUID | None = None
+    replace_existing_provider_link: bool = Field(
+        default_factory=bool,
+        description="Explicit opt-in to replace this Agent's active link for the same provider.",
+    )
+
+    @model_validator(mode="after")
+    def _validate_provider_link_replacement(self) -> ChannelAgentLinkCreate:
+        if self.replace_existing_provider_link and self.agent_id is None:
+            raise ValueError("agent_id is required to replace an existing provider link")
+        return self
+
+
+class ChannelAgentLinkResponse(BaseModel):
+    id: UUID
+    account_id: UUID
+    agent_id: UUID
+    status: str
+    runtime_status: ChannelRuntimeStatus = "connecting"
+    created_at: datetime
+    agent_token: str | None = None
+
+
+class ChannelAgentLinkWithAccountResponse(ChannelAgentLinkResponse):
+    account: ChannelAccountResponse
+    binding_count: int = 0
+
+
+class ChannelPairCodeCreate(BaseModel):
+    agent_id: UUID | None = None
+    agent_link_id: UUID | None = None
+    ttl_seconds: int = Field(default=300, ge=60, le=86_400)
+
+
+class ChannelPairCodeResponse(BaseModel):
+    id: UUID
+    agent_link_id: UUID
+    agent_id: UUID
+    agent_token: str | None = None
+    code: str
+    expires_at: datetime
+    pairing_command: str
+    bot_username: str | None = None
+    deep_link: str | None = None
+    qr_payload: str | None = None
+    discord_install_url: str | None = None
+    discord_user_install_url: str | None = None
+
+
+class ChannelCommandSpec(BaseModel):
+    name: str = Field(min_length=1, max_length=32)
+    description: str = Field(min_length=1, max_length=100)
+    options: list[dict[str, Any]] | None = None
+
+    @field_validator("name")
+    @classmethod
+    def _clean_name(cls, value: str) -> str:
+        name = value.strip().lstrip("/").replace("-", "_")
+        if not name or not name.replace("_", "").isalnum():
+            raise ValueError("command names must be alphanumeric or underscore")
+        return name.lower()
+
+    @field_validator("description")
+    @classmethod
+    def _clean_description(cls, value: str) -> str:
+        description = value.strip()
+        if not description:
+            raise ValueError("description cannot be blank")
+        return description
+
+
+class ChannelCommandSyncRequest(BaseModel):
+    commands: list[ChannelCommandSpec] | None = None
+    guild_id: str | None = Field(default=None, min_length=1, max_length=64)
+
+    @field_validator("guild_id")
+    @classmethod
+    def _strip_guild_id(cls, value: str | None) -> str | None:
+        return value.strip() if isinstance(value, str) else value
+
+
+class ChannelCommandSyncResponse(BaseModel):
+    provider: str
+    commands: list[dict[str, Any]]
+
+
+class ChannelBindingResponse(BaseModel):
+    id: UUID
+    account_id: UUID
+    agent_link_id: UUID | None
+    external_chat_id: str
+    external_chat_type: str | None
+    external_chat_name: str | None
+    status: str
+    created_at: datetime
+    last_message_at: datetime | None = None
+
+
+class ChannelBindingDeleteResponse(BaseModel):
+    binding_id: UUID
+    unpaired: bool
+    notification_status: Literal["sent", "failed", "not_applicable"]
+    provider_cleanup_status: Literal["succeeded", "failed", "not_applicable"]
+    warning: str | None = None
+
+
+class ChannelSendMessageRequest(BaseModel):
+    binding_id: UUID | None = None
+    external_chat_id: str | None = Field(default=None, min_length=1, max_length=300)
+    text: str = Field(min_length=1, max_length=4096)
+
+    @field_validator("external_chat_id")
+    @classmethod
+    def _strip_chat_id(cls, value: str | None) -> str | None:
+        return value.strip() if isinstance(value, str) else value
+
+
+class ChannelMessageResponse(BaseModel):
+    id: UUID
+    direction: str
+    external_chat_id: str
+    provider_message_id: str | None
+    delivery_id: UUID | None = None
+    delivery_status: str | None = None
+    text: str | None
+    created_at: datetime
+
+
+class ChannelActivityItemResponse(BaseModel):
+    kind: Literal["message", "debug_event"]
+    id: UUID
+    account_id: UUID
+    provider: str
+    direction: str | None = None
+    external_chat_id: str | None = None
+    message_id: UUID | None = None
+    delivery_id: UUID | None = None
+    delivery_status: str | None = None
+    delivery_attempts: int | None = None
+    delivery_max_attempts: int | None = None
+    delivery_next_attempt_at: datetime | None = None
+    delivery_last_error: str | None = None
+    provider_message_id: str | None = None
+    text: str | None = None
+    stage: str | None = None
+    outcome: str | None = None
+    status_code: int | None = None
+    error: str | None = None
+    details: dict[str, Any] | None = None
+    created_at: datetime
+    updated_at: datetime
+
+
+class ChannelActivityListResponse(BaseModel):
+    items: list[ChannelActivityItemResponse]
+
+
+class ChannelHealthItemResponse(BaseModel):
+    account_id: UUID
+    provider: str
+    name: str
+    visibility: ChannelVisibility
+    channel_status: str
+    health_status: ChannelHealthStatus
+    reasons: list[str] = Field(default_factory=list)
+    pending_inbox: int = 0
+    oldest_pending_inbox_at: datetime | None = None
+    pending_deliveries: int = 0
+    in_progress_deliveries: int = 0
+    failed_deliveries: int = 0
+    last_message_at: datetime | None = None
+    last_event_at: datetime | None = None
+    last_error_at: datetime | None = None
+    last_error: str | None = None
+    last_error_stage: str | None = None
+    last_error_outcome: str | None = None
+    native_transport: dict[str, Any] | None = None
+
+
+class ChannelHealthListResponse(BaseModel):
+    items: list[ChannelHealthItemResponse]
+
+
+class TelegramWebhookResponse(BaseModel):
+    ok: bool = True
+    paired: bool = False
+    unpaired: bool = False
+    binding_id: UUID | None = None

@@ -1,0 +1,338 @@
+# The companion registry -- phase 04 (companion platform contract), plan 02.
+#
+# One authority for every companion kind the hosted runtime can deploy. A companion is a
+# server-owned program that runs beside the runtime under its own service identity; it is not a
+# user runtime and not an agent. `filebrowser` was the only kind until phase 06 added `postiz`
+# (plan 06-03, D-01) -- as a row, not a refactor, which is what this file exists for.
+#
+# GRAMMAR: `|`-separated columns with no surrounding spaces. Blank lines and lines whose first
+# character is `#` are skipped. A line whose column count does not match its row type is an ERROR,
+# never a skip -- a reader that skips a malformed row lets a parity assertion pass by comparing
+# nothing to nothing.
+#
+# ROW TYPES -- phase 05 added a second one, discriminated by the FIRST column:
+#
+#   KIND row  six columns, first column is the registry key. One per companion kind. Rows sorted
+#             by key. Unchanged by phase 05; the six columns below mean exactly what they meant.
+#
+#   VERB row  nine columns, first column is the literal marker `verb`. One per tool the façade
+#             exposes for a kind. Rows sorted by kind then verb. Placed after the kind rows.
+#
+# `verb` is therefore RESERVED and can never be a companion kind key. Both readers raise a
+# reserved-key error on a six-column line whose first column is `verb`, rather than reporting a
+# column miscount -- the two mistakes have different fixes and the message has to say which.
+#
+# COLUMNS, in order: key|artifactKind|minCliVersion|uid|port|egress
+#
+#   key            The registry key, and the `companions.<key>` key in the runtime manifest.
+#                  Bound: ^[a-z][a-z0-9-]{0,30}$. This value becomes a systemd unit name, a UID
+#                  lookup name, a `StateDirectory=` value and a path component, and it arrives
+#                  from the provisioning image -- outside this repository -- so it is untrusted
+#                  input. `sysusers.d(5)` caps user names at 31 characters and forbids a leading
+#                  digit or hyphen; the bound is that cap, enforced at the parse boundary rather
+#                  than downstream where a traversal would already have happened (T-4-01).
+#
+#   artifactKind   How this kind's digest pin is located. The vocabulary is CLOSED to exactly two
+#                  values, and any other value is a parse ERROR in both language readers:
+#                    `binary-sha256`  a native binary pinned by its SHA-256 (`filebrowser`).
+#                    `oci-digest`     the container image is located by an OCI content digest; the
+#                                     manifest entry carries repository plus digest, never a tag.
+#                  Phase 04's D-02 left this column as the seam for a container kind run as a
+#                  Quadlet/Podman systemd unit; phase 06 uses it for `postiz`. Per D-01 the
+#                  normative rule is FAIL CLOSED, NEVER FETCH A FLOATING REFERENCE -- which is why
+#                  there is no tag-shaped value here. The pin's field name is per-kind, not uniform:
+#                  `filebrowser` carries its digests at `assets.<arch>.sha256`, an unrecognised kind
+#                  carries one at `artifact.sha256`, and a container kind's per-image digests are
+#                  declared by its own manifest schema.
+#
+#   minCliVersion  The lowest CLI semver that can parse the kind. Consumed by the backend's
+#                  emit-time version gate (D-08/D-15), which fails closed on an absent observation.
+#
+#   uid            Either the literal `preallocated` or a decimal UID from the reserved block.
+#
+#   port           The single TCP port the kind listens on. Unique across rows; the parity suites
+#                  assert it. 9119 is taken by the Hermes dashboard, 9120 by `filebrowser` and 9130
+#                  by `postiz`.
+#
+#   egress         `redirect` or `bypass` -- whether the kind's UID participates in the transparent
+#                  egress redirect.
+#
+# VERB COLUMNS, in order: verb|kind|verb|class|method|pathTemplate|readProbe|capUnit|argsIn
+#
+#   verb           The literal row marker. Its only job is to discriminate the two row types, so
+#                  a reader can branch before it counts columns. See ROW TYPES above.
+#
+#   kind           The companion kind this verb belongs to. MUST already have a kind row; a verb
+#                  row naming a kind with no row is an ERROR, not a forward declaration. Read by
+#                  both language readers to assemble the tool name.
+#
+#   verb           The verb half of the tool name. Bound: ^[a-z][a-z0-9_]{0,60}$. The assembled
+#                  name is `kind__verb` (D-04, double underscore) -- e.g. `filebrowser__list_dir`.
+#                  The separator cannot appear in a kind key, which is bounded to
+#                  ^[a-z][a-z0-9-]{0,30}$, so the split is unambiguous in both directions. Dotted
+#                  names were rejected because some MCP clients restrict tool names to
+#                  [a-zA-Z0-9_-]. The assembled name MUST NOT collide with a key of
+#                  `_NATIVE_TOOL_REGISTRY` in `backend/app/routes/mcp_bridge.py`; a collision is a
+#                  parse ERROR naming it, never a silent shadow of a native tool.
+#
+#   class          One of `read`, `create`, `mutate`, `destroy` (D-05). This column is the
+#                  SERVER-SIDE gate's input. Scope mapping (phase 06, D-09): EVERY class requires
+#                  `companions:invoke` to call, and `tools/list` requires `companions:read`; the
+#                  class-specific protection is not a scope but what sits after the scope check --
+#                  the policy default for the class and, for `destroy`, the tenant's enablement
+#                  row as well (D-06). `derive_annotations` maps the class mechanically to the
+#                  MCP spec's advisory `readOnlyHint` / `destructiveHint` / `idempotentHint`
+#                  triple (D-07). The annotations are never the gate; this column is. A row whose
+#                  class is outside the vocabulary is an ERROR, so a verb cannot ship
+#                  unclassified.
+#
+#   method         The HTTP method the runtime-side executor issues against the companion.
+#                  Bound to the vocabulary GET|POST|PATCH|PUT|DELETE. It travels inside the signed
+#                  pre-authorized call, so the agent never supplies it.
+#
+#   pathTemplate   The companion-relative path the executor requests, e.g. `/api/resources`. MUST
+#                  begin with `/` and carry no scheme, host or port: host and port come from this
+#                  kind's `port` column and the loopback address, never from an argument. That is
+#                  what makes an SSRF parameter structurally absent rather than filtered (T-5-07).
+#
+#   readProbe      The verb of the SAME kind that previews this verb's effect, or `-` for none.
+#                  D-13: a `mutate` or `destroy` row declared without a probe is a MALFORMED row,
+#                  refused exactly as an unclassified one is -- which is what makes TOOL-05's
+#                  "any mutating tool has a preview path" structurally true rather than
+#                  aspirational. A probe naming a verb this kind does not declare is an ERROR too;
+#                  a dangling probe is a preview path that does not exist.
+#
+#   capUnit        The unit this verb's blast-radius cap is counted in: `calls`, `records` or
+#                  `bytes` (TOOL-04). Declared here rather than inferred from the class because
+#                  two verbs of one class can have wildly different blast radius -- reading a
+#                  directory listing is `calls`, reading a file is `bytes`.
+#
+#   argsIn         WHERE this verb's arguments travel. `query` puts each argument in the request's
+#                  query string; `body` sends them as one JSON object with the JSON content-type
+#                  header and an empty query string. The vocabulary is CLOSED to exactly those two
+#                  values, and an absent or unrecognised value is a parse ERROR in both language
+#                  readers rather than a default -- a default would reintroduce precisely the
+#                  invisible rule this column was added to remove.
+#
+#                  It was added (05-13, WR-06b) because placement used to be DERIVED FROM THE HTTP
+#                  METHOD inside `packages/cli/src/runtime/companion-executor.ts`: GET and DELETE
+#                  sent `?path=` while POST and PATCH sent a JSON body with no query string at all.
+#                  That rule lived in one branch of one function, so three verbs sent their target
+#                  path somewhere their sibling verbs did not and no reader could see the decision
+#                  in a diff. Declared here it is reviewable, and changing it is a one-column edit
+#                  with two readers and a doc-contract test behind it.
+#
+#                  `postiz__create_post` declares `body` (06-06): `POST /public/v1/posts` takes
+#                  one JSON object (the post DTO at the pinned tag), and the five Postiz reads
+#                  declare `query`. The paragraph below is about the filebrowser rows only.
+#
+#                  ALL SIX FILEBROWSER ROWS DECLARE `query`, AND THAT VALUE IS THE DECLARED DEFAULT
+#                  PENDING RESEARCH ASSUMPTIONS A2 AND A3 -- it is NOT a finding about how a live
+#                  filebrowser addresses `/api/resources`. What is observed, and all that is
+#                  observed, is this repository's own behaviour: `list_dir`, `read_file` and
+#                  `delete_path` already travel by query string today. The three write verbs
+#                  (`create_dir`, `write_file`, `move_path`) have never been dispatched by anything
+#                  in this repository, so their placement is a CHOICE, and the choice made here is
+#                  to declare the convention the observed three already use rather than to invent a
+#                  second one. What a live filebrowser accepts for POST and PATCH remains research
+#                  assumptions A2 and A3, unsettled until a provisioned host answers;
+#                  `scripts/probe-companion-assertion.ts` is what settles them (WINDOWS #133), and
+#                  these rows are the reviewable placeholder until it does.
+#
+# MEMBERSHIP RULE. A companion kind has a row here if and only if some half of this repository
+# must agree about it: the Zod envelope that parses it, the Pydantic envelope that emits it, or
+# the prose that documents it. A kind with no row is, by construction, an unrecognised kind -- it
+# is admitted by the envelope only on the minimal shape (kind identity plus digest-pinned
+# artifact) and skipped by reconciliation. Adding a row is what makes a kind first-class.
+#
+# The three implementations of this contract are asserted equal to this file by tests:
+#   packages/cli/src/runtime/companion-registry.ts  (companion-registry.test.ts, parity test)
+#   backend/app/core/companion_registry.py          (backend/tests/test_companion_registry.py)
+#   docs/managed-runtime.md                         (the D-09 bidirectional doc-contract reader)
+# The VERB table has two readers, pinned to each other by the same bidirectional source-read
+# mechanism the kind table uses:
+#   packages/cli/src/runtime/companion-registry.ts  `COMPANION_VERBS` / `deriveAnnotations`
+#   backend/app/core/companion_registry.py          `COMPANION_VERBS` / `derive_annotations`
+# The doc-contract reader covers BOTH tables: `### Companion Registry` and `### Companion Verb
+# Table` in `docs/managed-runtime.md` are each asserted equal to their rows here, bidirectionally.
+# Both code readers EMBED these values rather than reading this file at run time, for the reason
+# `backend/app/core/brand_env.py` records: the shipped artifact has no repository beside it.
+#
+# APPEND-ONLY / NEVER RECLAIM (D-13). A retired kind's row STAYS and its UID is permanently
+# burned. This is not tidiness. If a UID were reclaimed, leftover files on disk owned by the
+# retired companion would be silently inherited by whichever different companion landed on the
+# same number -- the exact class of bug `systemd.exec(5)` warns about for `DynamicUser=`, whose
+# UIDs "are recycled after a unit is terminated... a different unit might get the same UID/GID
+# assigned later on, and thus gain access to these files or directories". That warning is why
+# D-10 rejected `DynamicUser=` outright, and reclaiming here would reintroduce it by hand.
+#
+# RESERVED UID BLOCK: 10100-10199. Chosen because `HOSTED_RUNTIME_UID` is 10001 and this block is
+# adjacent to it without colliding. The FIRST NUMERIC ALLOCATION from it is `postiz` = 10101 (plan
+# 06-03). Phase 04 required the block to be confirmed against the provisioning image before that
+# allocation (research assumption A4, deferred obligation #2). At checkpoint CK-B on 2026-09-23 the
+# human owner explicitly DEFERRED that confirmation to host UAT rather than confirming it: nobody
+# has yet read the provisioning image's `/etc/passwd`, `/etc/subuid` or `/etc/subgid`. The number
+# is written anyway because the decision to write it was taken by a person, on the record, with the
+# gap stated -- and because `postiz` is not reconcilable until plan 06-08 ships the container kind,
+# so no host allocates 10101 before host UAT has had the chance to refuse it. 10100 is deliberately
+# left unallocated as the block's floor.
+#
+# SUBORDINATE UID RANGES (CK-B, option `rootful-static-map`, taken 2026-09-23). A container kind
+# runs as a ROOTFUL Quadlet system unit whose container user namespace is a static, deterministic
+# map -- never `UserNS=auto`, whose mapping is not stable across container re-creation and would
+# re-own the state directory on a redeploy. Each container kind gets:
+#   - a host account `iforge-<key>` at the registry UID (non-login, never reclaimed); and
+#   - a subordinate range of WIDTH 65536 starting at
+#         base = 1_000_000_000 + (uid - 10100) * 65536
+#     recorded in `/etc/subuid` and `/etc/subgid` under that account and rendered as
+#     `UIDMap=0:<base>:65536` and `GIDMap=0:<base>:65536`.
+# `postiz` (uid 10101) therefore owns 1_000_065_536 .. 1_000_131_071. The formula is keyed on the
+# unique registry UID, so two kinds cannot overlap by construction; the top of the block (10199)
+# ends at 1_006_553_599, well inside the 32-bit UID space. Like a UID, a subordinate range is
+# APPEND-ONLY AND NEVER RECLAIMED (D-13): reassigning one would hand a new companion files owned
+# by the old one. The converge that writes these ranges (plan 06-08) refuses when any OTHER line
+# in `/etc/subuid` or `/etc/subgid` overlaps the computed range.
+#
+# EXCLUSIONS -- values in the rows below that are carve-outs, each with its reason:
+#   - `filebrowser` uid=`preallocated`, not a number from the reserved block. The POSIX account
+#     already exists on every provisioned host with a host-allocated UID and it OWNS FILES ON
+#     DISK. Re-pinning it to a static number would require the state-re-own migration D-10
+#     records as one-way, on hosts that are already running. Same shape as the comment in
+#     `packages/cli/src/runtime/hosted-runtime-contract.ts` about 10001 never having been
+#     renamed: the value is what it is because installs exist, not because it was chosen.
+#   - `filebrowser` minCliVersion=`0.0.0`, i.e. ungated. The kind predates the D-08 emit gate and
+#     every deployed CLI already parses it. A non-zero minimum would make D-15's fail-closed gate
+#     withhold `filebrowser` from a runtime that has not yet reported -- withdrawing a working
+#     companion to enforce a rule that exists to protect kinds that do not exist yet.
+#   - `filebrowser` egress=`bypass`, recorded as an ACCEPTED RESIDUAL rather than a decision. The
+#     nftables redirect at `packages/cli/src/runtime/transparent-egress.ts:59` keys on
+#     `runtimeUid` only, so no companion UID is inside the redirect today and `bypass` is a
+#     description of the shipped state. Bringing companion UIDs into the redirect is Phase 6 OPS
+#     work; this column exists so that change is a column edit with a test behind it.
+#   - `postiz` egress=`bypass`, the SAME accepted residual as `filebrowser`, for a different
+#     mechanism: container traffic leaves through podman's network NAT, outside the runtime-UID
+#     redirect, so no UID-keyed nftables rule sees it. Recorded as the shipped state, not a
+#     decision; bringing container egress under the redirect is its own OPS change.
+#   - `postiz` minCliVersion=`0.14.0`, deliberately ABOVE every CLI deployed today. The kind is
+#     withheld by the emit gate (D-08/D-15) until a CLI that carries the container kind (plan
+#     06-08) is released at or above it. That withholding is the gate working: a runtime whose CLI
+#     cannot run a container kind must never be handed one.
+#
+# key|artifactKind|minCliVersion|uid|port|egress
+filebrowser|binary-sha256|0.0.0|preallocated|9120|bypass
+postiz|oci-digest|0.14.0|10101|9130|bypass
+
+# VERB TABLE -- the curated `filebrowser` toolset (TOOL-08).
+#
+# Six rows, one per INTEGRATE capability in
+# `.planning/phases/05-companion-tool-contract-mcp-fa-ade/COVERAGE.md`. That matrix IS TOOL-08:
+# "a curated verb-level toolset rather than auto-generated coverage of the full API" is not an
+# absence, it is that decision record. The correspondence is one-to-one in BOTH directions and is
+# a committed test -- `backend/tests/test_companion_tools_list.py::test_toolset_matches_coverage_matrix`
+# -- so a capability cannot be added to the agent's reach without appearing in the decision record,
+# and a row cannot be dropped without the matrix noticing (T-5-15).
+#
+# SORTED by kind then verb, and the parser ENFORCES it in both languages, naming the first
+# out-of-order pair. Set equality alone would leave two rows of one kind with no defined position,
+# and the exposed `tools/list` order is asserted as a SEQUENCE against this order -- a client that
+# renders the catalog positionally must not watch it reshuffle between two identical reads.
+#
+# CAP UNITS, and why two verbs of one class differ. `read_file` and `write_file` both bind
+# `bytes`: their blast radius is the size of the payload, not the number of calls, and a per-call
+# cap of one bounds nothing when one call can move a gigabyte. `delete_path` and `move_path` both
+# bind `records`: `DELETE /api/resources` is BULK-CAPABLE, so a `calls` cap of one would permit a
+# single call that removes an entire tree -- the cap unit has to count the things destroyed, not
+# the requests that destroyed them. `list_dir` and `create_dir` bind `calls`, where one call is
+# one directory and the request count IS the blast radius.
+#
+# VERB TABLE EXCLUSIONS -- every filebrowser capability the matrix opted OUT of, with the reason,
+# recorded HERE and not merely by absence. Curation must never become undisclosed capability
+# removal: a reader has to be able to disagree with a specific sentence rather than notice a gap.
+#   - `search`. The endpoint path is NOT pinned by research -- the cited API-design source "did
+#     not detail search" -- so integrating it would mean inventing a path. Re-evaluate once the
+#     path is confirmed against a running instance; an invented path is a request to an address
+#     nobody verified.
+#   - `/api/auth/*` (`auth.login`, `auth.renew`, `auth.signup`). Never an agent surface. The
+#     façade holds the credential (TOOL-01) and the agent must not touch authentication at all;
+#     password and passkey methods are already disabled in the shipped companion config.
+#   - `/api/access`, permission-rule management. The permission boundary is what the façade
+#     enforces AGAINST; a tool that edits the boundary is a tool that removes the boundary.
+#   - `/api/share*` (`share.create`, `share.list`, `share.delete`) and the public share surface.
+#     Exfiltration primitives: a share link is a credential-free read path AROUND the façade, so
+#     every guarantee this registry makes would be bypassable by one call. `share` is already
+#     `false` in the shipped `userDefaults.account.permissions`.
+#   - `users.*` and `groups.*`, user and group administration. Operator-only; `admin` is already
+#     `false` in the shipped `userDefaults.account.permissions`.
+#   - `settings.*`, companion configuration. Owned by the runtime manifest, and `disableSettings`
+#     is already `true` in the shipped config. A tool here would let an agent rewrite the
+#     configuration the rest of this contract depends on.
+#   - `realtime` / the event stream. `realtime` is `false` in the shipped config, so the
+#     capability is off on every deployed instance -- a row would describe something absent.
+#   - `preview` / thumbnail rendering. Adds no capability over the raw read, and binary image
+#     bytes are a poor fit for the untrusted-content envelope (TOOL-06).
+#
+# `delete_path` is `destroy` class. It is omitted from `tools/list` until the tenant enables it
+# AND refused by name at call time (D-06, both halves) -- the row's presence here is the
+# classification, never the permission.
+#
+# verb|kind|verb|class|method|pathTemplate|readProbe|capUnit|argsIn
+verb|filebrowser|create_dir|create|POST|/api/resources|list_dir|calls|query
+verb|filebrowser|delete_path|destroy|DELETE|/api/resources|list_dir|records|query
+verb|filebrowser|list_dir|read|GET|/api/resources|-|calls|query
+verb|filebrowser|move_path|mutate|PATCH|/api/resources|list_dir|records|query
+verb|filebrowser|read_file|read|GET|/api/raw|-|bytes|query
+verb|filebrowser|write_file|create|POST|/api/resources|list_dir|bytes|query
+
+# VERB TABLE -- the curated `postiz` toolset (TOOL-08 for the second kind, plan 06-06).
+#
+# Six rows, one per INTEGRATE capability in
+# `.planning/phases/06-first-companion-end-to-end/COVERAGE.md`, decided against the route table of
+# `apps/backend/src/public-api/routes/v1/public.integrations.controller.ts` at Postiz tag `v2.24.0`
+# (`@Controller('/public/v1')`, 31 handlers) and re-read at that tag when these rows landed. Postiz
+# started from its OWN full-coverage baseline: no filebrowser opt-out was carried over. The
+# correspondence is asserted PER KIND by
+# `backend/tests/test_companion_tools_list.py::test_toolset_matches_coverage_matrix` -- filebrowser
+# rows against the Phase 5 matrix, these rows against the Phase 6 one.
+#
+# PATHS. Every path begins `/api/public/v1/`: the image's nginx proxies `/api/` to the Postiz
+# backend, whose controller is mounted at `/public/v1`. Host and port stay out of the row -- they
+# come from this kind's `port` column (9130) and the loopback address. None of the six carries a
+# path parameter; the executor issues `pathTemplate` verbatim.
+#
+# CLASSES AND CAP UNITS. `create_post` is the only non-read verb. It binds `records` because one
+# call can create one post per listed channel, so its debit is the number of post items it would
+# create, not the request count; it declares `list_posts` as its read probe (D-13). The five reads
+# bind `calls`. NO POSTIZ VERB IS `destroy` CLASS THIS PHASE, so no Postiz tool can delete a remote
+# post or disconnect a channel, and the destroy gate is unchanged.
+#
+# POSTIZ VERB TABLE EXCLUSIONS -- every capability the Phase 6 matrix opted OUT of, one line each,
+# recorded HERE and not merely by absence, so a reader can disagree with a specific sentence:
+#   - path-parameter verbs: `posts.delete`, `posts.delete_group`, `posts.missing_content`,
+#     `posts.settings`, `posts.status`, `posts.release_id`, `integrations.find_slot`,
+#     `integrations.settings`, `analytics.platform`, `analytics.post`. Not needed yet: the executor
+#     issues pathTemplate verbatim, and substitution is its own registry-grammar and SSRF change
+#     (the two post deletes are destroy class besides).
+#   - `integrations.oauth_url`. Begins an OAuth connection of a social account -- a human action in
+#     Postiz's own UI; the platform registers no provider apps this phase.
+#   - `integrations.trigger`. Runs provider-side tools whose side effects no read probe can preview.
+#   - `integrations.delete`. Disconnecting a social channel is a tenant action in Postiz's own UI,
+#     and it is destroy class with a path parameter besides.
+#   - `uploads.file`. A multipart binary body; argsIn is a query string or one JSON body.
+#   - `uploads.from_url`. Makes the companion fetch an agent-supplied URL -- an SSRF primitive
+#     around the façade's no-URL-argument rule (T-5-07).
+#   - `users.list`. User administration; it lists the platform-bootstrapped owner identity.
+#   - `debug.post_timeline`, `debug.account`, `debug.channels`, `debug.activity`. Debug surfaces
+#     exposing account, channel and organisation internals no agent task needs.
+#   - `video.generate`, `video.function`, `clipping.start`. AI generation whose spend is
+#     companion-originated LLM spend, unmetered this milestone (PLAT-03); the deployment leaves the
+#     provider keys unset.
+#   - `clipping.list`, `clipping.get`. Clippings cannot be started on this deployment, so the list
+#     is always empty (and `clipping.get` carries a path parameter besides).
+#
+# verb|kind|verb|class|method|pathTemplate|readProbe|capUnit|argsIn
+verb|postiz|create_post|create|POST|/api/public/v1/posts|list_posts|records|body
+verb|postiz|is_connected|read|GET|/api/public/v1/is-connected|-|calls|query
+verb|postiz|list_groups|read|GET|/api/public/v1/groups|-|calls|query
+verb|postiz|list_integrations|read|GET|/api/public/v1/integrations|-|calls|query
+verb|postiz|list_notifications|read|GET|/api/public/v1/notifications|-|calls|query
+verb|postiz|list_posts|read|GET|/api/public/v1/posts|-|calls|query

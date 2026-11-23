@@ -1,0 +1,62 @@
+{
+	"name": "clawdi",
+	"private": true,
+	"license": "MIT",
+	"workspaces": [
+		"apps/*",
+		"packages/*"
+	],
+	"catalog": {
+		"react": "19.2.8",
+		"react-dom": "19.2.8",
+		"@types/react": "^19.2.18",
+		"@types/react-dom": "^19.2.5",
+		"typescript": "^7.0.2",
+		"zod": "^4.5.4",
+		"tailwindcss": "^4.3.3",
+		"@tailwindcss/postcss": "^4.3.3",
+		"@tailwindcss/vite": "^4.3.3",
+		"@tanstack/react-query": "^5.102.8",
+		"lucide-react": "^1.39.0"
+	},
+	"scripts": {
+		"dev": "turbo dev --filter=./apps/*",
+		"build": "turbo build",
+		"typecheck": "turbo typecheck",
+		"test": "scripts/test.sh",
+		"test:local": "turbo test:internal",
+		"check": "biome ci .",
+		"check:fix": "biome check --write .",
+		"generate-api": "scripts/openapi-typescript.sh http://localhost:8000/openapi.json -o packages/shared/src/api/api.generated.ts",
+		"lint": "biome lint .",
+		"lint:fix": "biome lint --write .",
+		"format": "biome format --write .",
+		"prepare": "node scripts/install-git-hooks.mjs"
+	},
+	"devDependencies": {
+		"@biomejs/biome": "^2.5.11",
+		"lefthook": "^2.1.12",
+		"turbo": "^2.10.12",
+		"typescript": "catalog:"
+	},
+	"engines": {
+		"node": "24.x",
+		"bun": ">=1.4.0"
+	},
+	"packageManager": "bun@1.4.0",
+	"overrides": {
+		"dompurify": "3.4.14",
+		"fast-uri": "4.1.2",
+		"hono": "4.13.3",
+		"ip-address": "10.5.0",
+		"js-cookie": "3.0.8",
+		"js-yaml": "4.3.0",
+		"nf3": "0.3.24",
+		"protobufjs": "7.6.5",
+		"qs": "6.15.3",
+		"tar": "7.5.22"
+	},
+	"patchedDependencies": {
+		"libsignal@6.0.0": "patches/libsignal@6.0.0.patch"
+	}
+}

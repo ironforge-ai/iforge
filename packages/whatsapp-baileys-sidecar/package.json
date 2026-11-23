@@ -1,0 +1,22 @@
+{
+	"name": "@clawdi/whatsapp-baileys-sidecar",
+	"version": "0.1.0",
+	"private": true,
+	"type": "module",
+	"scripts": {
+		"build": "tsc -p tsconfig.build.json",
+		"start": "node dist/index.js",
+		"typecheck": "tsc --noEmit",
+		"test": "../../scripts/test.sh sidecar",
+		"test:internal": "vitest run"
+	},
+	"dependencies": {
+		"baileys": "npm:@whiskeysockets/baileys@7.0.0-rc14",
+		"pino": "^10.3.1"
+	},
+	"devDependencies": {
+		"@types/node": "^24.13.3",
+		"typescript": "catalog:",
+		"vitest": "4.1.11"
+	}
+}

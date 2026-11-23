@@ -1,0 +1,570 @@
+import { describe, expect, test } from "bun:test";
+import type { DeploymentOperation } from "@/hosted/billing/contracts";
+import {
+	canCancelOperation,
+	canDelete,
+	canQueryDeploymentProjection,
+	canRestart,
+	canStart,
+	canStop,
+	DEPLOYMENT_CREATION_TRANSITION_TIMEOUT_MS,
+	DEPLOYMENT_RECONCILIATION_POLL_INTERVAL_MS,
+	DEPLOYMENT_TRANSITION_ESCALATION_MS,
+	DEPLOYMENT_TRANSITIONAL_POLL_INTERVAL_MS,
+	type DeploymentOperationVerb,
+	deploymentPollingState,
+	deploymentRefetchInterval,
+	deploymentRuntimeStatusPresentation,
+	deploymentStatusFromResource,
+	deploymentStatusLabel,
+	deploymentStatusTone,
+	deploymentTerminalIsAvailable,
+	isRunningStatus,
+	isTerminalStatus,
+	isTransitionalStatus,
+	KNOWN_DEPLOYMENT_STATUSES,
+	parseDeploymentStatus,
+	shouldPollDeployments,
+} from "@/hosted/deployment-status";
+import { hostedDeploymentFixture } from "@/hosted/hosted-deployment.test-fixture";
+
+const runtimeUiEndpoint = {
+	runtime: "openclaw",
+	role: "control_ui",
+	url: "https://runtime.example/",
+	auth_mode: "openclaw_token",
+	browser_mode: "embedded_and_top_level",
+} as const;
+
+function acceptedOperation(verb: DeploymentOperationVerb): DeploymentOperation {
+	return {
+		name: `operations/${verb}-polling`,
+		metadata: {
+			"@type": "type.googleapis.com/clawdi.v2.DeploymentOperationMetadata",
+			deploymentId: "hdep_polling",
+			verb: verb as DeploymentOperation["metadata"]["verb"],
+			targetGeneration: 2,
+			manifestETag: "manifest-polling",
+			createTime: "2026-07-25T00:00:00Z",
+			updateTime: "2026-07-25T00:00:00Z",
+		},
+		done: false,
+		response: null,
+	};
+}
+
+describe("DeploymentStatus", () => {
+	test("offers repair after post-ready health loss without admitting unproven or retired runtimes", () => {
+		const deployment = hostedDeploymentFixture({
+			status: "failed",
+			failure: {
+				type: "https://api.clawdi.ai/problems/runtime_unreachable",
+				title: "Runtime unreachable",
+				detail: "Fresh runtime health was not restored during the grace period.",
+				status: 503,
+				code: "runtime_unreachable",
+				phase: "reconcile",
+				retryable: true,
+				conditionReason: "RuntimeUnreachable",
+				conditionMessage: "Runtime unreachable",
+				observedGeneration: 1,
+			},
+		});
+		expect(deploymentTerminalIsAvailable(deployment)).toBe(true);
+		const status = deployment.resource.status;
+		if (!status?.failure) throw new Error("expected deployment failure");
+		for (const code of ["runtime_configuration_failed", "storage_full"]) {
+			expect(
+				deploymentTerminalIsAvailable({
+					...deployment,
+					resource: {
+						...deployment.resource,
+						status: { ...status, failure: { ...status.failure, code } },
+					},
+				}),
+			).toBe(true);
+		}
+		for (const changed of [
+			{ driver_applied_generation: 0 },
+			{ observedGeneration: 0 },
+			{ failure: { ...status.failure, code: "runtime_readiness_timeout" } },
+			{ failure: { ...status.failure, observedGeneration: 0 } },
+			{ deleted_at: "2026-09-11T00:00:00Z" },
+		]) {
+			expect(
+				deploymentTerminalIsAvailable({
+					...deployment,
+					resource: {
+						...deployment.resource,
+						status: { ...status, ...changed },
+					},
+				}),
+			).toBe(false);
+		}
+		expect(
+			deploymentTerminalIsAvailable({
+				...deployment,
+				resource: {
+					...deployment.resource,
+					spec: { ...deployment.resource.spec, desired_lifecycle: "stopped" },
+				},
+			}),
+		).toBe(false);
+		expect(
+			deploymentTerminalIsAvailable({
+				...deployment,
+				compute_slot_occupancy: {
+					occupies_slot: false,
+					backing_infra: "absent",
+					reason: "authoritative_absence",
+				},
+			}),
+		).toBe(false);
+	});
+
+	test("normalizes known hosted backend statuses", () => {
+		for (const raw of KNOWN_DEPLOYMENT_STATUSES) {
+			const status = parseDeploymentStatus(raw.toUpperCase());
+			expect(status).toEqual({ kind: raw, raw, known: true });
+		}
+	});
+
+	test("maps the ready legacy alias to running", () => {
+		expect(parseDeploymentStatus(" ready ")).toEqual({
+			kind: "running",
+			raw: "running",
+			known: true,
+		});
+	});
+
+	test("preserves unknown statuses without exposing them to users", () => {
+		const status = parseDeploymentStatus("queued_for_drain");
+		expect(status).toEqual({
+			kind: "unknown",
+			raw: "queued_for_drain",
+			known: false,
+			reason: "unrecognized",
+		});
+		expect(deploymentStatusLabel(status)).toBe("Status unavailable");
+		expect(deploymentStatusTone(status)).toBe("warning");
+	});
+
+	test("models a missing authoritative status as its own unknown state", () => {
+		const deployment = hostedDeploymentFixture({ status: null });
+		const status = deploymentStatusFromResource(deployment.resource.status);
+
+		expect(status).toEqual({
+			kind: "unknown",
+			raw: null,
+			known: false,
+			reason: "status_unavailable",
+		});
+		expect(deploymentStatusLabel(status)).toBe("Status unavailable");
+		expect(deploymentStatusTone(status)).toBe("warning");
+		expect(isRunningStatus(status)).toBe(false);
+		expect(canStart(status)).toBe(false);
+		expect(canStop(status)).toBe(false);
+		expect(canRestart(status)).toBe(false);
+		expect(canDelete(status)).toBe(false);
+		expect(canQueryDeploymentProjection(status)).toBe(false);
+	});
+
+	test("labels and tones the hosted backend statuses", () => {
+		const expected = [
+			["creating", "Starting", "info"],
+			["starting", "Starting", "info"],
+			["running", "Running", "success"],
+			["stopping", "Stopping", "info"],
+			["stopped", "Stopped", "neutral"],
+			["restarting", "Restarting", "success"],
+			["updating", "Updating", "success"],
+			["failed", "Failed", "destructive"],
+			["deleting", "Deleting", "info"],
+			["deleted", "Deleted", "neutral"],
+		] as const;
+
+		for (const [raw, label, tone] of expected) {
+			const status = parseDeploymentStatus(raw);
+			expect(deploymentStatusLabel(status)).toBe(label);
+			expect(deploymentStatusTone(status)).toBe(tone);
+		}
+	});
+
+	test("surfaces current post-ready runtime health degradation without changing lifecycle", () => {
+		const deployment = hostedDeploymentFixture({ status: "running" });
+		const status = deployment.resource.status;
+		if (!status) throw new Error("Expected fixture status");
+		const degradedStatus = {
+			...status,
+			conditions: [
+				{
+					type: "Degraded" as const,
+					status: "True" as const,
+					observedGeneration: status.observedGeneration,
+					lastTransitionTime: "2026-08-02T12:00:00Z",
+					reason: "RuntimeHealthDegraded",
+					message: "Fresh runtime health is temporarily unavailable",
+				},
+			],
+		};
+
+		expect(deploymentRuntimeStatusPresentation(degradedStatus)).toEqual({
+			status: { kind: "running", raw: "running", known: true },
+			label: "Temporarily unavailable",
+			tone: "warning",
+		});
+		expect(
+			deploymentRuntimeStatusPresentation({
+				...degradedStatus,
+				conditions: [
+					{ ...degradedStatus.conditions[0], observedGeneration: status.observedGeneration - 1 },
+				],
+			}).label,
+		).toBe("Running");
+	});
+
+	test("classifies terminal and transitional states", () => {
+		for (const raw of ["running", "stopped", "failed", "deleted"]) {
+			const status = parseDeploymentStatus(raw);
+			expect(isTerminalStatus(status)).toBe(true);
+			expect(isTransitionalStatus(status)).toBe(false);
+		}
+
+		for (const raw of [
+			"creating",
+			"starting",
+			"stopping",
+			"restarting",
+			"updating",
+			"deleting",
+			"future_status",
+		]) {
+			const status = parseDeploymentStatus(raw);
+			expect(isTerminalStatus(status)).toBe(false);
+			expect(isTransitionalStatus(status)).toBe(true);
+		}
+	});
+
+	test("drives lifecycle gates from hosted backend statuses", () => {
+		const expectations = [
+			["creating", false, false, false],
+			["starting", false, true, false],
+			["running", false, true, true],
+			["stopping", false, false, false],
+			["stopped", true, false, false],
+			["restarting", false, false, false],
+			["updating", false, false, false],
+			["failed", true, false, true],
+			["deleting", false, false, false],
+			["deleted", false, false, false],
+			["future_status", false, false, false],
+		] as const;
+
+		expect(isRunningStatus(parseDeploymentStatus("running"))).toBe(true);
+		expect(isRunningStatus(parseDeploymentStatus("ready"))).toBe(true);
+		expect(isRunningStatus(parseDeploymentStatus("restarting"))).toBe(true);
+		expect(isRunningStatus(parseDeploymentStatus("updating"))).toBe(true);
+		expect(isRunningStatus(parseDeploymentStatus("stopped"))).toBe(false);
+		expect(isRunningStatus(parseDeploymentStatus("stopping"))).toBe(false);
+
+		for (const [raw, start, stop, restart] of expectations) {
+			const status = parseDeploymentStatus(raw);
+			expect(canStart(status)).toBe(start);
+			expect(canStop(status)).toBe(stop);
+			expect(canRestart(status)).toBe(restart);
+		}
+	});
+
+	test("does not query a projection after stopped compute has released it", () => {
+		expect(canQueryDeploymentProjection(parseDeploymentStatus("stopped"))).toBe(false);
+		expect(canQueryDeploymentProjection(parseDeploymentStatus("deleted"))).toBe(false);
+		expect(canQueryDeploymentProjection(parseDeploymentStatus("starting"))).toBe(true);
+		expect(canQueryDeploymentProjection(parseDeploymentStatus("running"))).toBe(true);
+		expect(canQueryDeploymentProjection(parseDeploymentStatus("failed"))).toBe(true);
+	});
+
+	test("disables delete once deletion is in progress or complete", () => {
+		expect(canDelete(parseDeploymentStatus("running"))).toBe(true);
+		expect(canDelete(parseDeploymentStatus("failed"))).toBe(true);
+		expect(canDelete(parseDeploymentStatus("deleting"))).toBe(false);
+		expect(canDelete(parseDeploymentStatus("deleted"))).toBe(false);
+		expect(canDelete(parseDeploymentStatus("future_status"))).toBe(false);
+	});
+
+	test("gates cancellation on the backend cancel acceptance contract", () => {
+		expect(canCancelOperation(undefined)).toBe(false);
+		expect(canCancelOperation(null)).toBe(false);
+		for (const verb of [
+			"create",
+			"start",
+			"stop",
+			"restart",
+			"update",
+			"delete",
+			"rename",
+		] as const) {
+			const inFlight = acceptedOperation(verb);
+			expect(canCancelOperation(inFlight)).toBe(true);
+		}
+		const done = acceptedOperation("delete");
+		done.done = true;
+		expect(canCancelOperation(done)).toBe(false);
+	});
+
+	test("refuses cancellation for backend-managed image cohort operations", () => {
+		for (const verb of ["migrate_image", "rollback_image"] as const) {
+			const operation = acceptedOperation(verb);
+			expect(canCancelOperation(operation)).toBe(false);
+		}
+	});
+
+	test("classifies whether any deployment is non-terminal", () => {
+		expect(
+			shouldPollDeployments([
+				{ status: "running" },
+				{ status: "stopped" },
+				{ status: "failed" },
+				{ status: "deleted" },
+			]),
+		).toBe(false);
+		expect(shouldPollDeployments([{ status: "running" }, { status: "creating" }])).toBe(true);
+		expect(shouldPollDeployments([{ status: "running" }, { status: "starting" }])).toBe(true);
+		expect(shouldPollDeployments([{ status: "running" }, { status: "stopping" }])).toBe(true);
+		expect(shouldPollDeployments([{ status: "running" }, { status: "restarting" }])).toBe(true);
+		expect(shouldPollDeployments([{ status: "running" }, { status: "updating" }])).toBe(true);
+		expect(shouldPollDeployments([{ status: "running" }, { status: "deleting" }])).toBe(true);
+		expect(shouldPollDeployments([{ status: "new_backend_status" }])).toBe(true);
+		expect(shouldPollDeployments([{ status: null }])).toBe(true);
+		expect(shouldPollDeployments([])).toBe(false);
+		expect(shouldPollDeployments(undefined)).toBe(false);
+	});
+
+	test("polls a missing authoritative status on the bounded convergence cadence", () => {
+		const nowMs = Date.parse("2026-07-25T00:00:00Z");
+		const pending = deploymentPollingState(
+			[hostedDeploymentFixture({ id: "hdep_unknown", status: null })],
+			new Map(),
+			nowMs,
+		);
+
+		expect(pending.refetchInterval).toBe(DEPLOYMENT_TRANSITIONAL_POLL_INTERVAL_MS);
+		expect(pending.transitions.get("hdep_unknown")).toEqual({
+			kind: "converging",
+			verb: null,
+			startedAtMs: nowMs,
+		});
+	});
+
+	test("polls a lifecycle operation only while it is plausibly converging", () => {
+		const nowMs = Date.parse("2026-07-25T00:00:00Z");
+		const deployment = hostedDeploymentFixture({
+			id: "hdep_polling",
+			status: "starting",
+			acceptedOperation: acceptedOperation("start"),
+		});
+		const pending = deploymentPollingState([deployment], new Map(), nowMs);
+
+		expect(pending.refetchInterval).toBe(DEPLOYMENT_TRANSITIONAL_POLL_INTERVAL_MS);
+		expect(pending.transitions.get("hdep_polling")).toEqual({
+			kind: "converging",
+			verb: "start",
+			startedAtMs: nowMs,
+		});
+	});
+
+	test("stops convergence polling when the accepted operation has failed", () => {
+		const operation = acceptedOperation("create");
+		operation.done = true;
+		operation.error = { code: 5, message: "provider unavailable", details: [] };
+		const failed = deploymentPollingState(
+			[hostedDeploymentFixture({ status: "starting", acceptedOperation: operation })],
+			new Map(),
+			Date.parse("2026-07-27T00:00:00Z"),
+		);
+
+		expect(failed.refetchInterval).toBe(DEPLOYMENT_RECONCILIATION_POLL_INTERVAL_MS);
+		expect(failed.transitions.size).toBe(0);
+	});
+
+	test("drops fast plan-change polling immediately when it reaches a terminal state", () => {
+		const nowMs = Date.parse("2026-07-25T00:00:00Z");
+		const operation = acceptedOperation("plan_change");
+		const pending = deploymentPollingState(
+			[
+				hostedDeploymentFixture({
+					id: "hdep_polling",
+					status: "updating",
+					acceptedOperation: operation,
+				}),
+			],
+			new Map(),
+			nowMs,
+		);
+		const terminal = deploymentPollingState(
+			[
+				hostedDeploymentFixture({
+					id: "hdep_polling",
+					status: "running",
+					runtimeUiEndpoint,
+					acceptedOperation: operation,
+				}),
+			],
+			pending.trackers,
+			nowMs + DEPLOYMENT_TRANSITIONAL_POLL_INTERVAL_MS,
+		);
+
+		expect(terminal.refetchInterval).toBe(DEPLOYMENT_RECONCILIATION_POLL_INTERVAL_MS);
+		expect(terminal.refetchInterval).not.toBe(DEPLOYMENT_TRANSITIONAL_POLL_INTERVAL_MS);
+		expect(terminal.transitions.size).toBe(0);
+		expect(terminal.trackers.size).toBe(0);
+	});
+
+	test("keeps fast polling a create through the measured ten-minute setup window", () => {
+		const acceptedAtMs = Date.parse("2026-07-29T05:00:00Z");
+		const operation = acceptedOperation("create");
+		operation.metadata.deploymentId = "hdep_slow_create";
+		operation.metadata.createTime = "2026-07-29T05:00:00Z";
+		operation.metadata.updateTime = "2026-07-29T05:00:00Z";
+		const creating = hostedDeploymentFixture({
+			id: "hdep_slow_create",
+			status: "creating",
+			acceptedOperation: operation,
+		});
+		const accepted = deploymentPollingState([creating], new Map(), acceptedAtMs);
+		const lastFast = deploymentPollingState(
+			[creating],
+			accepted.trackers,
+			Date.parse("2026-07-29T05:09:59Z"),
+		);
+		const delayed = deploymentPollingState(
+			[creating],
+			lastFast.trackers,
+			Date.parse("2026-07-29T05:10:00Z"),
+		);
+		const running = deploymentPollingState(
+			[
+				hostedDeploymentFixture({
+					id: "hdep_slow_create",
+					status: "running",
+					runtimeUiEndpoint,
+					acceptedOperation: operation,
+				}),
+			],
+			delayed.trackers,
+			Date.parse("2026-07-29T05:10:01Z"),
+		);
+
+		expect([accepted.refetchInterval, lastFast.refetchInterval]).toEqual([
+			DEPLOYMENT_TRANSITIONAL_POLL_INTERVAL_MS,
+			DEPLOYMENT_TRANSITIONAL_POLL_INTERVAL_MS,
+		]);
+		expect(delayed.refetchInterval).toBe(DEPLOYMENT_RECONCILIATION_POLL_INTERVAL_MS);
+		expect(delayed.transitions.get("hdep_slow_create")?.kind).toBe("timed_out");
+		expect(DEPLOYMENT_CREATION_TRANSITION_TIMEOUT_MS).toBe(10 * 60_000);
+		expect(running.refetchInterval).toBe(DEPLOYMENT_RECONCILIATION_POLL_INTERVAL_MS);
+		expect(running.transitions.size).toBe(0);
+		expect(running.trackers.size).toBe(0);
+		const awaitingPublication = deploymentPollingState(
+			[
+				hostedDeploymentFixture({
+					id: "hdep_slow_create",
+					status: "running",
+					acceptedOperation: { ...operation, done: true },
+				}),
+			],
+			delayed.trackers,
+			Date.parse("2026-07-29T05:10:01Z"),
+		);
+		expect(awaitingPublication.refetchInterval).toBe(DEPLOYMENT_TRANSITIONAL_POLL_INTERVAL_MS);
+		expect(awaitingPublication.transitions.get("hdep_slow_create")?.kind).toBe("converging");
+	});
+
+	test("escalates a transition stuck past the escalation window with reconciliation polling intact", () => {
+		const acceptedAtMs = Date.parse("2026-07-29T05:00:00Z");
+		const operation = acceptedOperation("update");
+		operation.metadata.deploymentId = "hdep_stuck_update";
+		operation.metadata.createTime = "2026-07-29T05:00:00Z";
+		operation.metadata.updateTime = "2026-07-29T05:00:00Z";
+		const stuck = hostedDeploymentFixture({
+			id: "hdep_stuck_update",
+			status: "updating",
+			acceptedOperation: operation,
+		});
+		const accepted = deploymentPollingState([stuck], new Map(), acceptedAtMs);
+		const stillTimedOut = deploymentPollingState(
+			[stuck],
+			accepted.trackers,
+			Date.parse("2026-07-29T05:14:59Z"),
+		);
+		const escalated = deploymentPollingState(
+			[stuck],
+			stillTimedOut.trackers,
+			Date.parse("2026-07-29T05:15:00Z"),
+		);
+
+		expect(stillTimedOut.transitions.get("hdep_stuck_update")?.kind).toBe("timed_out");
+		expect(escalated.transitions.get("hdep_stuck_update")).toMatchObject({
+			kind: "escalated",
+			verb: "update",
+		});
+		expect(escalated.refetchInterval).toBe(DEPLOYMENT_RECONCILIATION_POLL_INTERVAL_MS);
+		expect(DEPLOYMENT_TRANSITION_ESCALATION_MS).toBe(15 * 60_000);
+	});
+
+	test("drops the escalation as soon as the deployment reaches a terminal state", () => {
+		const operation = acceptedOperation("restart");
+		operation.metadata.deploymentId = "hdep_stuck_restart";
+		operation.metadata.createTime = "2026-07-29T05:00:00Z";
+		operation.metadata.updateTime = "2026-07-29T05:00:00Z";
+		const stuck = hostedDeploymentFixture({
+			id: "hdep_stuck_restart",
+			status: "restarting",
+			acceptedOperation: operation,
+		});
+		const escalated = deploymentPollingState(
+			[stuck],
+			new Map(),
+			Date.parse("2026-07-29T05:20:00Z"),
+		);
+		const resolved = deploymentPollingState(
+			[
+				hostedDeploymentFixture({
+					id: "hdep_stuck_restart",
+					status: "running",
+					runtimeUiEndpoint,
+					acceptedOperation: operation,
+				}),
+			],
+			escalated.trackers,
+			Date.parse("2026-07-29T05:21:00Z"),
+		);
+
+		expect(escalated.transitions.get("hdep_stuck_restart")?.kind).toBe("escalated");
+		expect(resolved.transitions.size).toBe(0);
+		expect(resolved.trackers.size).toBe(0);
+	});
+
+	test("cancels fast polling on a failed accepted operation before escalation matters", () => {
+		const operation = acceptedOperation("create");
+		operation.done = true;
+		operation.error = { code: 1, message: "cancelled", details: [] };
+		const result = deploymentPollingState(
+			[hostedDeploymentFixture({ status: "deleting", acceptedOperation: operation })],
+			new Map(),
+			Date.parse("2026-07-29T05:20:00Z"),
+		);
+
+		expect(result.refetchInterval).toBe(DEPLOYMENT_RECONCILIATION_POLL_INTERVAL_MS);
+		expect(result.transitions.size).toBe(0);
+	});
+
+	test("schedules a modest reconciliation interval for steady inventory", () => {
+		const deployments = [
+			hostedDeploymentFixture({ status: "running", runtimeUiEndpoint }),
+			hostedDeploymentFixture({ id: "hdep_stopped", status: "stopped" }),
+			hostedDeploymentFixture({ id: "hdep_failed", status: "failed" }),
+		];
+		expect(deploymentRefetchInterval(deployments)).toBe(DEPLOYMENT_RECONCILIATION_POLL_INTERVAL_MS);
+		expect(DEPLOYMENT_RECONCILIATION_POLL_INTERVAL_MS).toBe(60_000);
+	});
+});

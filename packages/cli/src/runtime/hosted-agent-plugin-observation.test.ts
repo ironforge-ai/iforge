@@ -1,0 +1,330 @@
+import { afterEach, describe, expect, test } from "bun:test";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
+import type { RuntimeAppliedState } from "./applied-state";
+import { runtimeContentSha256, writeRuntimeAppliedState } from "./applied-state";
+import { applyRuntimeBundleChannelsToManifestLoad } from "./channels";
+import { readHostedAgentPluginsObservation } from "./hosted-agent-plugin-observation";
+import {
+	hostedAgentPluginOwnershipIdentity,
+	hostedAgentPluginReceiptsPath,
+	writeHostedAgentPluginReceipt,
+} from "./hosted-agent-plugin-package";
+import { cacheRuntimeLastGoodManifest, runtimeRecoverableSecretValues } from "./manifest-secrets";
+import { parseHostedRuntimeBundleV2 } from "./manifest-source";
+import { readHostedRuntimeObserved } from "./observed";
+import { getRuntimePaths, type RuntimePaths } from "./paths";
+
+const roots: string[] = [];
+const originalEnv = { ...process.env };
+const installationId = "11111111-1111-4111-8111-111111111111";
+const sourceRevision = "a".repeat(64);
+
+afterEach(() => {
+	process.env = { ...originalEnv };
+	for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
+});
+
+function tempPaths(): RuntimePaths {
+	const root = mkdtempSync(join(tmpdir(), "clawdi-agent-plugin-observation-"));
+	roots.push(root);
+	process.env.CLAWDI_SERVICE_STATE_DIR = join(root, "state");
+	process.env.CLAWDI_RUN_DIR = join(root, "run");
+	process.env.CLAWDI_RUNTIME_HOME = join(root, "home");
+	const paths = getRuntimePaths({ mode: "hosted" });
+	mkdirSync(paths.serviceStateRoot, { recursive: true });
+	return paths;
+}
+
+function installation(version: string, digest: string) {
+	return {
+		installationId,
+		version,
+		agentPluginsSchema: "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json" as const,
+		source: {
+			type: "github" as const,
+			url: "https://github.com/Clawdi-AI/store",
+			path: "v2/plugins/clawdi",
+			commit: "b".repeat(40),
+		},
+		contentDigest: `sha256-tree-v1:${digest.repeat(64)}`,
+	};
+}
+
+function appliedState(): RuntimeAppliedState {
+	return {
+		schemaVersion: "clawdi.runtimeAppliedState.v2",
+		appliedAt: "2026-08-15T00:00:00.000Z",
+		instanceId: "runtime-agent-plugin-observation",
+		etag: `"sha256:${sourceRevision}"`,
+		sourceRevision,
+		generation: 3,
+		applyGeneration: 7,
+		manifestETag: '"manifest-agent-plugin-observation"',
+		applyReceiptId: "apply-receipt-agent-plugin-observation",
+		bootNonce: "boot-nonce-agent-plugin-observation",
+		contentIdentity: {
+			sourcePath: "https://runtime.test/v1/runtime/manifest",
+			sha256: "c".repeat(64),
+		},
+		activated: {},
+		providerIds: [],
+		projectedProviderIds: {},
+	};
+}
+
+function writeAppliedManifest(
+	paths: RuntimePaths,
+	desired: ReturnType<typeof installation>,
+): RuntimeAppliedState {
+	mkdirSync(dirname(paths.manifestLastGood), { recursive: true, mode: 0o700 });
+	const bundle = JSON.parse(
+		readFileSync(
+			join(import.meta.dir, "../../../../test-fixtures/runtime-bundle-v2.golden.json"),
+			"utf8",
+		),
+	) as {
+		sourceRevision: string;
+		applyGeneration?: number;
+		secretValues: Record<string, string>;
+		manifest: Record<string, unknown>;
+	};
+	bundle.sourceRevision = sourceRevision;
+	bundle.applyGeneration = 7;
+	bundle.manifest = {
+		...bundle.manifest,
+		instanceId: "runtime-agent-plugin-observation",
+		generation: 3,
+		agentPlugins: {
+			schemaVersion: 1,
+			installations: { clawdi: desired },
+		},
+	};
+	const load = applyRuntimeBundleChannelsToManifestLoad(
+		parseHostedRuntimeBundleV2(bundle, "test://plugin-observation"),
+		paths,
+	);
+	cacheRuntimeLastGoodManifest(load.sourceBundle, paths, load.secretValues, load.manifest);
+	const applied = appliedState();
+	applied.contentIdentity.sha256 = runtimeContentSha256({
+		manifest: load.sourceBundle,
+		secretValues: runtimeRecoverableSecretValues(load.manifest, load.secretValues),
+	});
+	writeRuntimeAppliedState(applied, paths);
+	return applied;
+}
+
+function writeReceipt(paths: RuntimePaths, desired: ReturnType<typeof installation>): void {
+	writeHostedAgentPluginReceipt(
+		{
+			schemaVersion: "clawdi.hostedAgentPluginReceipts.v2",
+			runtime: "openclaw",
+			installations: {
+				clawdi: {
+					...desired,
+					ownershipIdentity: hostedAgentPluginOwnershipIdentity("clawdi", desired),
+					nativeId: "clawdi",
+				},
+			},
+		},
+		paths,
+	);
+}
+
+function failedWatchStatus(
+	desired: ReturnType<typeof installation>,
+	generation: number,
+	revision = "1".repeat(64),
+) {
+	return {
+		event: {
+			status: "error",
+			agentPlugins: {
+				schemaVersion: 1,
+				installations: [
+					{
+						installationId,
+						name: "clawdi",
+						version: desired.version,
+						contentDigest: desired.contentDigest,
+						sourceRevision: revision,
+						generation,
+						status: "failed",
+						errorCode: "reconcile_failed",
+					},
+				],
+			},
+		},
+	};
+}
+
+describe("hosted Agent Plugin heartbeat observation", () => {
+	test("keeps Agent Plugin evidence on the v2 companion heartbeat", async () => {
+		const paths = tempPaths();
+		const desired = installation("1.0.0", "d");
+		const applied = writeAppliedManifest(paths, desired);
+		writeReceipt(paths, desired);
+
+		expect(await readHostedRuntimeObserved(paths, { appliedState: applied })).not.toHaveProperty(
+			"agentPlugins",
+		);
+		expect(
+			(
+				await readHostedRuntimeObserved(paths, {
+					appliedState: applied,
+					includeAgentPlugins: true,
+				})
+			)?.agentPlugins?.installations[0]?.status,
+		).toBe("installed");
+	});
+
+	test("reports only the identity-fenced failed revision instead of an old receipt", () => {
+		const paths = tempPaths();
+		const previous = installation("1.0.0", "d");
+		const desired = installation("1.1.0", "e");
+		writeAppliedManifest(paths, previous);
+		writeReceipt(paths, previous);
+
+		const observed = readHostedAgentPluginsObservation({
+			paths,
+			applied: appliedState(),
+			watchStatus: failedWatchStatus(desired, 8),
+		});
+
+		expect(observed?.installations).toEqual([
+			{
+				installationId,
+				name: "clawdi",
+				version: "1.1.0",
+				contentDigest: `sha256-tree-v1:${"e".repeat(64)}`,
+				sourceRevision: "1".repeat(64),
+				generation: 8,
+				status: "failed",
+				errorCode: "reconcile_failed",
+			},
+		]);
+	});
+
+	test("reports the rolled-back receipt after last-good advances", () => {
+		const paths = tempPaths();
+		const previous = installation("1.0.0", "d");
+		const desired = installation("1.1.0", "e");
+		writeAppliedManifest(paths, desired);
+		writeReceipt(paths, previous);
+
+		const observed = readHostedAgentPluginsObservation({
+			paths,
+			applied: appliedState(),
+			watchStatus: null,
+		});
+
+		expect(observed?.installations[0]?.version).toBe("1.0.0");
+		expect(observed?.installations[0]?.status).toBe("installed");
+	});
+
+	test("ignores failure evidence older than the applied receipt identity", () => {
+		const paths = tempPaths();
+		const desired = installation("1.0.0", "d");
+		writeAppliedManifest(paths, desired);
+		writeReceipt(paths, desired);
+
+		const observed = readHostedAgentPluginsObservation({
+			paths,
+			applied: appliedState(),
+			watchStatus: failedWatchStatus(desired, 6),
+		});
+
+		expect(observed?.installations).toEqual([
+			{
+				installationId,
+				name: "clawdi",
+				version: "1.0.0",
+				contentDigest: `sha256-tree-v1:${"d".repeat(64)}`,
+				sourceRevision,
+				generation: 7,
+				status: "installed",
+			},
+		]);
+	});
+
+	test("reports a failed attempt at the applied generation with a newer revision", () => {
+		const paths = tempPaths();
+		const desired = installation("1.0.0", "d");
+		writeAppliedManifest(paths, desired);
+		writeReceipt(paths, desired);
+
+		const observed = readHostedAgentPluginsObservation({
+			paths,
+			applied: appliedState(),
+			watchStatus: failedWatchStatus(desired, 7),
+		});
+
+		expect(observed?.installations).toEqual([
+			{
+				installationId,
+				name: "clawdi",
+				version: "1.0.0",
+				contentDigest: `sha256-tree-v1:${"d".repeat(64)}`,
+				sourceRevision: "1".repeat(64),
+				generation: 7,
+				status: "failed",
+				errorCode: "reconcile_failed",
+			},
+		]);
+	});
+
+	test("reports a failed reconvergence at the applied identity", () => {
+		const paths = tempPaths();
+		const desired = installation("1.0.0", "d");
+		writeAppliedManifest(paths, desired);
+		writeReceipt(paths, desired);
+
+		const observed = readHostedAgentPluginsObservation({
+			paths,
+			applied: appliedState(),
+			watchStatus: failedWatchStatus(desired, 7, sourceRevision),
+		});
+
+		expect(observed?.installations).toEqual([
+			{
+				installationId,
+				name: "clawdi",
+				version: "1.0.0",
+				contentDigest: `sha256-tree-v1:${"d".repeat(64)}`,
+				sourceRevision,
+				generation: 7,
+				status: "failed",
+				errorCode: "reconcile_failed",
+			},
+		]);
+	});
+
+	test("keeps heartbeat readable and reports unknown when the receipt is corrupt", () => {
+		const paths = tempPaths();
+		const desired = installation("1.0.0", "d");
+		writeAppliedManifest(paths, desired);
+		const receiptPath = hostedAgentPluginReceiptsPath(paths);
+		mkdirSync(dirname(receiptPath), { recursive: true });
+		writeFileSync(receiptPath, "{", { mode: 0o600 });
+
+		expect(
+			readHostedAgentPluginsObservation({
+				paths,
+				applied: appliedState(),
+				watchStatus: null,
+			})?.installations,
+		).toEqual([
+			{
+				installationId,
+				name: "clawdi",
+				version: "1.0.0",
+				contentDigest: `sha256-tree-v1:${"d".repeat(64)}`,
+				sourceRevision,
+				generation: 7,
+				status: "unknown",
+				errorCode: "receipt_unreadable",
+			},
+		]);
+	});
+});

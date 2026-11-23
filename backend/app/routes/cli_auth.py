@@ -1,0 +1,516 @@
+"""CLI authentication routes.
+
+The published device-named endpoints below are a legacy browser-approved
+API-key bootstrap, not an RFC 8628 device grant. The CLI doesn't have any
+credentials yet, so it asks the browser-authenticated dashboard to approve
+one API key:
+
+  1. CLI calls /device with no auth — backend returns a long secret
+     `device_code` (kept on the CLI) and a short `user_code` (printed in
+     terminal + put in the browser URL).
+  2. The user opens the dashboard, signs in with Clerk, and approves the
+     authorization. That endpoint mints an API key and stashes the raw
+     value on the device_authorizations row.
+  3. The CLI polls /poll with the device_code; on the first successful
+     read it gets the api_key, the row is consumed, and the raw key is
+     wiped from the DB.
+
+This remains additive for existing released CLI clients. New first-party CLI
+login uses Clerk's Public OAuth App Authorization Code + PKCE flow instead.
+"""
+
+import secrets
+from datetime import UTC, datetime, timedelta
+from urllib.parse import quote
+
+import httpx
+from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
+from pydantic import BaseModel, Field, ValidationError
+from sqlalchemy import delete, func, select
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.core.auth import AuthContext, require_oauth_cli_auth, require_web_auth
+from app.core.client_ip import trusted_client_ip
+from app.core.config import settings
+from app.core.database import get_session
+from app.models.device_authorization import DeviceAuthorization
+from app.schemas.cli_auth import (
+    DesktopSessionTicketResponse,
+    DeviceApproveRequest,
+    DeviceDenyRequest,
+    DeviceLookupResponse,
+    DevicePollRequest,
+    DevicePollResponse,
+    DeviceStartRequest,
+    DeviceStartResponse,
+    DeviceTerminalResponse,
+    OAuthConfigResponse,
+    OAuthRevokeRequest,
+    OAuthRevokeResponse,
+)
+from app.services.api_key import mint_api_key
+from app.services.app_setting_registry import CLERK_CLI_OAUTH_SPEC
+from app.services.app_settings import AppSettingUnavailable, resolve_app_setting
+from app.services.clerk_backend import clerk_backend_headers, clerk_backend_url
+from app.services.clerk_cli_oauth_settings import ClerkCliOAuthSetting
+from app.services.distributed_state import SharedRateLimitExceeded, consume_shared_rate_limit
+
+router = APIRouter(prefix="/cli/auth", tags=["cli-auth"])
+
+# Crockford-ish alphabet, no 0/O/1/I/L — read aloud over Zoom without "is that
+# an oh or a zero" detours. 32 chars → log2(32) = 5 bits/char × 8 chars = 40
+# bits of user_code entropy, gated by short TTL and Clerk auth on approve.
+_USER_CODE_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"
+_USER_CODE_LEN = 8
+_DEVICE_TTL = timedelta(minutes=10)
+_POLL_INTERVAL_SEC = 2
+_DESKTOP_SESSION_TTL_SEC = 60
+
+
+class _ClerkSignInToken(BaseModel):
+    token: str = Field(min_length=1, max_length=8192)
+
+
+# Hard cap on rows in `device_authorizations` at any moment. The endpoint is
+# unauthenticated by design (CLI has no key yet), so without a ceiling a bot
+# loop can inflate the table indefinitely. 10 000 covers ~1 666 concurrent
+# users mid-flow given the 10-min TTL — orders of magnitude above plausible
+# real load. Above the cap we 429 instead of inserting; legitimate users
+# retry in ≤ 10 min once expired rows clear.
+_MAX_ACTIVE_DEVICES = 10_000
+
+# Shared rolling-window throttle for the unauthenticated legacy bootstrap
+# endpoints. Protects against a single client hammering /device or
+# /poll faster than legitimate user-driven retries — without it, a
+# bot loop fits inside the global table cap but still chews DB
+# round-trips. PostgreSQL keeps the limit authoritative across API workers.
+_DEVICE_RATE_WINDOW_S = 60.0
+# 90/min: a normal legacy browser-approved bootstrap is 1× POST /device + N× POST /poll
+# (poll cadence is ~2s). A user who takes the full 60s before approving
+# in-browser hits 1 + 30 = 31 calls inside one window. The previous 30
+# cap reliably 429'd that legitimate path; the CLI surfaces 429 as a
+# fatal "polling failed" and the user has to retry the whole flow.
+# 90 keeps the bot-loop ceiling tight (an attacker still can't fit
+# multiple full flows / second per IP) while leaving headroom for
+# clock skew, network jitter, and a leisurely tab-switch.
+_DEVICE_PER_IP_MAX = 90
+# Hard cap on distinct buckets the limiter tracks at once. The
+# /poll route buckets on `body.device_code`, which an
+# unauthenticated client controls — without this cap an attacker
+# could spam unique random codes and inflate shared state indefinitely.
+# Cap × per-bucket cost
+# (~90 timestamps each) keeps the limiter bounded regardless of
+# request rate. Each active flow can occupy three buckets: the
+# /device IP, /poll IP, and device code. The 32 000 cap covers all
+# `_MAX_ACTIVE_DEVICES` (10 000) flows plus modest headroom.
+_DEVICE_RATE_MAX_BUCKETS = 32_000
+_DEVICE_RATE_NAMESPACE = "cli-device-flow"
+
+
+async def _oauth_setting_or_503(db: AsyncSession) -> ClerkCliOAuthSetting:
+    try:
+        oauth_setting = await resolve_app_setting(db, CLERK_CLI_OAUTH_SPEC)
+    except AppSettingUnavailable as error:
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "OAuth CLI authentication is not configured",
+        ) from error
+    if not oauth_setting.enabled:
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "OAuth CLI authentication is not configured",
+        )
+    return oauth_setting
+
+
+async def _oauth_public_config_or_503(db: AsyncSession) -> OAuthConfigResponse:
+    oauth_setting = await _oauth_setting_or_503(db)
+    return OAuthConfigResponse(
+        issuer=oauth_setting.issuer,
+        client_id=oauth_setting.client_id,
+        audience=oauth_setting.audience,
+        authorized_parties=oauth_setting.authorized_parties,
+        redirect_uri=oauth_setting.redirect_uri,
+    )
+
+
+@router.get("/oauth/config", response_model=OAuthConfigResponse)
+async def get_oauth_config(db: AsyncSession = Depends(get_session)) -> OAuthConfigResponse:
+    """Return only the Public OAuth App values needed by the local CLI."""
+    return await _oauth_public_config_or_503(db)
+
+
+@router.post("/oauth/revoke", response_model=OAuthRevokeResponse)
+async def revoke_oauth_refresh_grant(
+    body: OAuthRevokeRequest,
+    auth: AuthContext = Depends(require_oauth_cli_auth),
+    db: AsyncSession = Depends(get_session),
+) -> OAuthRevokeResponse:
+    """Revoke a Clerk OAuth refresh grant without logging or returning it.
+
+    Clerk's Backend API identifies the OAuth application in the path and
+    accepts the refresh token as `token`. JWT access tokens are self-contained
+    and remain valid until their normal expiry; this only prevents refreshes.
+    """
+    _ = auth
+    oauth_setting = await _oauth_setting_or_503(db)
+    application_id = oauth_setting.application_id
+    secret_key = settings.clerk_secret_key
+    if not application_id or not secret_key:
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "OAuth CLI revocation is not configured",
+        )
+
+    escaped_application_id = quote(application_id, safe="")
+    url = clerk_backend_url(f"oauth_applications/{escaped_application_id}/revoke_token")
+    headers = clerk_backend_headers()
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            response = await client.post(
+                url,
+                headers=headers,
+                json={"token": body.refresh_token.get_secret_value()},
+            )
+    except httpx.TimeoutException:
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "OAuth CLI revocation is temporarily unavailable",
+        ) from None
+    except httpx.HTTPError:
+        raise HTTPException(
+            status.HTTP_502_BAD_GATEWAY,
+            "OAuth CLI revocation failed",
+        ) from None
+
+    if response.status_code >= 500:
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "OAuth CLI revocation is temporarily unavailable",
+        )
+    if not 200 <= response.status_code < 300:
+        raise HTTPException(status.HTTP_502_BAD_GATEWAY, "OAuth CLI revocation failed")
+    return OAuthRevokeResponse(status="revoked")
+
+
+@router.post("/oauth/desktop-ticket", response_model=DesktopSessionTicketResponse)
+async def create_desktop_session_ticket(
+    response: Response,
+    auth: AuthContext = Depends(require_oauth_cli_auth),
+) -> DesktopSessionTicketResponse:
+    """Exchange the first-party CLI identity for a one-use browser session ticket."""
+    clerk_id = auth.user.clerk_id
+    if not clerk_id or not settings.clerk_secret_key:
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "Desktop sign-in is not configured",
+        )
+
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            upstream = await client.post(
+                clerk_backend_url("sign_in_tokens"),
+                headers=clerk_backend_headers(),
+                json={
+                    "user_id": clerk_id,
+                    "expires_in_seconds": _DESKTOP_SESSION_TTL_SEC,
+                },
+            )
+    except httpx.TimeoutException:
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "Desktop sign-in is temporarily unavailable",
+        ) from None
+    except httpx.HTTPError:
+        raise HTTPException(
+            status.HTTP_502_BAD_GATEWAY,
+            "Desktop sign-in failed",
+        ) from None
+
+    if upstream.status_code >= 500:
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "Desktop sign-in is temporarily unavailable",
+        )
+    if not 200 <= upstream.status_code < 300:
+        raise HTTPException(status.HTTP_502_BAD_GATEWAY, "Desktop sign-in failed")
+    try:
+        sign_in = _ClerkSignInToken.model_validate_json(upstream.content)
+    except ValidationError:
+        raise HTTPException(status.HTTP_502_BAD_GATEWAY, "Desktop sign-in failed") from None
+
+    response.headers["Cache-Control"] = "no-store"
+    return DesktopSessionTicketResponse(
+        ticket=sign_in.token,
+        expires_in=_DESKTOP_SESSION_TTL_SEC,
+    )
+
+
+async def _check_device_rate_limit(bucket_key: str) -> None:
+    """Raise 429 if `bucket_key` has hit the legacy bootstrap cap on
+    endpoints inside the rolling window. The key is the real
+    client IP for `/device` (no device_code yet) and the
+    device_code itself for `/poll` (each in-flight authorization gets its own
+    bucket, so one user's polling cannot 429 another). The shared service uses
+    an exact sliding window, hashes untrusted keys before persistence, expires
+    idle buckets, and enforces the namespace-wide bucket bound atomically.
+    """
+    try:
+        await consume_shared_rate_limit(
+            namespace=_DEVICE_RATE_NAMESPACE,
+            key=bucket_key,
+            limit=_DEVICE_PER_IP_MAX,
+            window=timedelta(seconds=_DEVICE_RATE_WINDOW_S),
+            max_buckets=_DEVICE_RATE_MAX_BUCKETS,
+        )
+    except SharedRateLimitExceeded as error:
+        raise HTTPException(
+            status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="device flow rate limit exceeded",
+            headers={"Retry-After": str(error.retry_after_seconds)},
+        ) from error
+
+
+def _generate_user_code() -> str:
+    return "".join(secrets.choice(_USER_CODE_ALPHABET) for _ in range(_USER_CODE_LEN))
+
+
+def _generate_device_code() -> str:
+    return secrets.token_urlsafe(32)  # 43 chars
+
+
+def _expire_if_due(da: DeviceAuthorization) -> bool:
+    """Return True if `da` is past its TTL. Mutates `status` to 'expired' so
+    callers don't have to remember to do it."""
+    if da.expires_at < datetime.now(UTC):
+        if da.status == "pending":
+            da.status = "expired"
+        return True
+    return False
+
+
+@router.post("/device", response_model=DeviceStartResponse)
+async def start_device_flow(
+    body: DeviceStartRequest,
+    request: Request,
+    db: AsyncSession = Depends(get_session),
+):
+    # Bucket on the real client IP (proxy-aware) so concurrent
+    # CLI logins behind the same reverse proxy don't share a single
+    # 90/min bucket.
+    await _check_device_rate_limit(trusted_client_ip(request))
+    # Bound the (unauthenticated) write surface: prune anything past TTL and
+    # refuse new inserts above a hard ceiling. Cheap — both queries hit the
+    # same indexed column. Worst-case growth between calls is bounded by
+    # `_MAX_ACTIVE_DEVICES`, ensuring a spam loop can't fill the table or
+    # exhaust the user_code namespace.
+    await db.execute(
+        delete(DeviceAuthorization).where(DeviceAuthorization.expires_at < datetime.now(UTC))
+    )
+    active = (await db.execute(select(func.count()).select_from(DeviceAuthorization))).scalar_one()
+    if active >= _MAX_ACTIVE_DEVICES:
+        await db.commit()
+        raise HTTPException(
+            status.HTTP_429_TOO_MANY_REQUESTS,
+            "Too many active authorizations — try again in a few minutes.",
+        )
+
+    # Retry on the rare user_code collision — 8 chars from a 32-char alphabet
+    # makes ~1 in a trillion at typical concurrency, but the unique-index will
+    # raise IntegrityError anyway and we'd rather handle it cleanly here.
+    # Catch only the integrity error so a real DB failure (connection, schema
+    # drift) surfaces as a 500 instead of being masked as "user_code collision".
+    for _ in range(5):
+        device_code = _generate_device_code()
+        user_code = _generate_user_code()
+        da = DeviceAuthorization(
+            device_code=device_code,
+            user_code=user_code,
+            client_label=body.client_label,
+            expires_at=datetime.now(UTC) + _DEVICE_TTL,
+        )
+        db.add(da)
+        try:
+            await db.commit()
+            break
+        except IntegrityError:
+            await db.rollback()
+    else:
+        raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, "Could not allocate user_code")
+
+    return DeviceStartResponse(
+        device_code=device_code,
+        user_code=user_code,
+        verification_uri=f"{settings.web_origin.rstrip('/')}/cli-authorize?code={user_code}",
+        expires_in=int(_DEVICE_TTL.total_seconds()),
+        interval=_POLL_INTERVAL_SEC,
+    )
+
+
+@router.post("/poll", response_model=DevicePollResponse)
+async def poll_device_flow(
+    body: DevicePollRequest,
+    request: Request,
+    db: AsyncSession = Depends(get_session),
+):
+    # Two buckets, both must pass:
+    #
+    # 1. IP bucket. A flood of unique random device_codes from
+    #    one IP would otherwise allocate a fresh bucket per
+    #    request and bypass throttling (round-53 P1: each new
+    #    device_code spawns a new dict entry). This 90/min
+    #    per-real-IP budget caps the burst even if every
+    #    incoming code is unique. Behind a trusted proxy
+    #    `trusted_client_ip` keys on CF-Connecting-IP, then the
+    #    proxy-appended (rightmost) X-Forwarded-For entry, never
+    #    the client-chosen left end of the chain.
+    # 2. device_code bucket. Each in-flight authorization gets
+    #    its own 90/min budget so a legitimate user polling at
+    #    2s cadence (~30 polls per 60s window) never collides
+    #    with another flow that shares the same client IP.
+    await _check_device_rate_limit(f"poll-ip:{trusted_client_ip(request)}")
+    await _check_device_rate_limit(f"poll:{body.device_code}")
+    # `with_for_update()` is what makes one-shot delivery actually one-shot.
+    # Two CLIs accidentally polling the same device_code would otherwise both
+    # read `approved` + `api_key_raw` under READ COMMITTED isolation and both
+    # commit the consume — both clients walk away thinking they got the only
+    # key. The row lock serializes the read+update so the second poller sees
+    # the cleared row and falls through to "expired".
+    da = (
+        await db.execute(
+            select(DeviceAuthorization)
+            .where(DeviceAuthorization.device_code == body.device_code)
+            .with_for_update()
+        )
+    ).scalar_one_or_none()
+
+    # Don't tell an unauthenticated caller whether a device_code "exists" vs
+    # "expired" — fold both into the same response.
+    if not da:
+        return DevicePollResponse(status="expired")
+
+    if _expire_if_due(da):
+        await db.commit()
+        return DevicePollResponse(status="expired")
+
+    if da.status == "denied":
+        return DevicePollResponse(status="denied")
+
+    if da.status == "pending":
+        return DevicePollResponse(status="pending")
+
+    if da.status == "approved":
+        # One-shot delivery. Capture the raw key, blank the row, and flag the
+        # status so a second poll behaves as if the authorization expired.
+        api_key = da.api_key_raw
+        if not api_key:
+            return DevicePollResponse(status="expired")
+        da.api_key_raw = None
+        da.status = "consumed"
+        await db.commit()
+        return DevicePollResponse(status="approved", api_key=api_key)
+
+    # `consumed` and any future statuses → expired from the CLI's perspective.
+    return DevicePollResponse(status="expired")
+
+
+async def _load_device_or_404(
+    user_code: str, db: AsyncSession, *, lock: bool = False
+) -> DeviceAuthorization:
+    """Look up a device authorization by user_code.
+
+    `lock=True` takes a row-level lock for read+modify use sites (approve,
+    deny). The lookup endpoint stays lockless because it's a pure read and
+    locking would hold the row across the round-trip to the React UI.
+    """
+    stmt = select(DeviceAuthorization).where(DeviceAuthorization.user_code == user_code.upper())
+    if lock:
+        stmt = stmt.with_for_update()
+    da = (await db.execute(stmt)).scalar_one_or_none()
+    if not da:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Authorization request not found")
+    return da
+
+
+@router.get("/lookup", response_model=DeviceLookupResponse)
+async def lookup_device_flow(
+    code: str,
+    auth: AuthContext = Depends(require_web_auth),
+    db: AsyncSession = Depends(get_session),
+):
+    """Web dashboard reads this to render the approve screen."""
+    _ = auth  # require_web_auth gates access; the Clerk identity isn't used here.
+    da = await _load_device_or_404(code, db)
+    if _expire_if_due(da):
+        await db.commit()
+    return DeviceLookupResponse(
+        user_code=da.user_code,
+        client_label=da.client_label,
+        status=da.status,
+        expires_at=da.expires_at,
+    )
+
+
+@router.post("/approve", response_model=DeviceTerminalResponse)
+async def approve_device_flow(
+    body: DeviceApproveRequest,
+    auth: AuthContext = Depends(require_web_auth),
+    db: AsyncSession = Depends(get_session),
+):
+    # Lock the row for the duration of the approve transaction. Without it a
+    # double-click in the browser can drive two concurrent /approve calls,
+    # both see `pending`, both mint API keys — and the user ends up with two
+    # active keys mapped to the same device_code (the second one wins for
+    # one-shot delivery, the first dangles forever).
+    da = await _load_device_or_404(body.user_code, db, lock=True)
+
+    if _expire_if_due(da):
+        await db.commit()
+        raise HTTPException(status.HTTP_410_GONE, "Authorization request expired")
+
+    if da.status != "pending":
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            f"Authorization is already {da.status}",
+        )
+
+    label = (da.client_label or "CLI device flow")[:200]
+    minted = await mint_api_key(
+        db,
+        user_id=auth.user_id,
+        label=label,
+        commit=False,
+    )
+
+    da.status = "approved"
+    da.user_id = auth.user_id
+    da.api_key_id = minted.api_key.id
+    da.api_key_raw = minted.raw_key
+    await db.commit()
+
+    return DeviceTerminalResponse(status="approved")
+
+
+@router.post("/deny", response_model=DeviceTerminalResponse)
+async def deny_device_flow(
+    body: DeviceDenyRequest,
+    auth: AuthContext = Depends(require_web_auth),
+    db: AsyncSession = Depends(get_session),
+):
+    _ = auth
+    da = await _load_device_or_404(body.user_code, db, lock=True)
+
+    if _expire_if_due(da):
+        await db.commit()
+        raise HTTPException(status.HTTP_410_GONE, "Authorization request expired")
+
+    if da.status != "pending":
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            f"Authorization is already {da.status}",
+        )
+
+    da.status = "denied"
+    await db.commit()
+    return DeviceTerminalResponse(status="denied")

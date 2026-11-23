@@ -1,0 +1,201 @@
+import { existsSync, readFileSync } from "node:fs";
+import { join } from "node:path";
+import { writePrivateFileAtomic } from "../lib/private-file";
+import {
+	getHermesRawConfigValue,
+	type HermesConfigTransaction,
+	reconcileHermesConfigValue,
+} from "./hermes-config";
+import { mergeRuntimeEnvWithProviderPlaceholders } from "./hosted-provider-resolution";
+import type { RuntimeManifest } from "./manifest-contract";
+import type { RuntimeName, RuntimeRunSettings, RuntimeServiceName } from "./run-config";
+
+const MANAGED_LOCALE_BLOCK_START = "<!-- >>> clawdi managed locale >>>";
+const MANAGED_LOCALE_BLOCK_END = "<!-- <<< clawdi managed locale <<< -->";
+export function managedLocaleBlock(locale: NonNullable<RuntimeManifest["locale"]>): string {
+	return [
+		MANAGED_LOCALE_BLOCK_START,
+		"## Clawdi managed locale",
+		"",
+		`Use \`${locale.language}\` as the default response language unless the user explicitly requests another language.`,
+		`Interpret ambiguous dates and times in \`${locale.timezone}\` unless the user specifies another timezone.`,
+		MANAGED_LOCALE_BLOCK_END,
+	].join("\n");
+}
+export function nextManagedLocaleFileContent(
+	path: string,
+	block: string,
+): {
+	existing: string;
+	next: string;
+} {
+	const existing = existsSync(path) ? readFileSync(path, "utf-8") : "";
+	const start = existing.indexOf(MANAGED_LOCALE_BLOCK_START);
+	const end = existing.indexOf(MANAGED_LOCALE_BLOCK_END);
+	const hasStart = start !== -1;
+	const hasEnd = end !== -1;
+	if (hasStart !== hasEnd || (hasStart && end < start)) {
+		throw new Error(`managed locale block markers are malformed in ${path}`);
+	}
+	if (
+		hasStart &&
+		(existing.indexOf(MANAGED_LOCALE_BLOCK_START, start + MANAGED_LOCALE_BLOCK_START.length) !==
+			-1 ||
+			existing.indexOf(MANAGED_LOCALE_BLOCK_END, end + MANAGED_LOCALE_BLOCK_END.length) !== -1)
+	) {
+		throw new Error(`managed locale block markers are duplicated in ${path}`);
+	}
+
+	let next: string;
+	if (hasStart && hasEnd) {
+		const suffixStart = end + MANAGED_LOCALE_BLOCK_END.length;
+		next = `${existing.slice(0, start)}${block}${existing.slice(suffixStart)}`;
+	} else {
+		const separator = existing.length === 0 ? "" : existing.endsWith("\n") ? "\n" : "\n\n";
+		next = `${existing}${separator}${block}\n`;
+	}
+
+	return { existing, next };
+}
+function updateManagedLocaleFile(path: string, block: string): string {
+	const { existing, next } = nextManagedLocaleFileContent(path, block);
+	if (next === existing) return path;
+	writePrivateFileAtomic(path, next, { mode: 0o600, dirMode: 0o700 });
+	return path;
+}
+function applyHermesDashboardConfig(
+	context: HermesConfigTransaction,
+	auth: NonNullable<RuntimeManifest["hermesDashboardAuth"]>,
+): void {
+	reconcileHermesConfigValue(context, "dashboard.basic_auth", undefined);
+	reconcileHermesConfigValue(context, "dashboard.oauth", {
+		self_hosted: {
+			issuer: auth.issuer,
+			client_id: auth.clientId,
+			scopes: "openid profile email",
+		},
+	});
+	reconcileHermesConfigValue(context, "dashboard.public_url", auth.publicUrl);
+	reconcileHermesConfigValue(context, "dashboard.trusted_proxies", auth.trustedProxies);
+	const currentDisabled = getHermesRawConfigValue(context, "plugins.disabled");
+	if (
+		currentDisabled.exists &&
+		(!Array.isArray(currentDisabled.value) ||
+			currentDisabled.value.some((value) => typeof value !== "string"))
+	) {
+		throw new Error("Hermes config field plugins.disabled must be a string array");
+	}
+	const disabled = new Set(currentDisabled.exists ? (currentDisabled.value as string[]) : []);
+	disabled.add("dashboard_auth/basic");
+	disabled.add("dashboard_auth/nous");
+	disabled.delete("dashboard_auth/self_hosted");
+	reconcileHermesConfigValue(context, "plugins.disabled", [...disabled].sort());
+}
+export function applyHostedRuntimeConfigProjection(
+	runtime: string,
+	manifest: RuntimeManifest,
+	home: string,
+	openClawWorkspaceRoot: string | null,
+	workspaceRoot: string,
+	hermesConfig: HermesConfigTransaction | null,
+): string | null {
+	if (manifest.runtimes[runtime]?.enabled !== true) return null;
+	const locale = manifest.locale;
+	if (runtime === "openclaw") {
+		if (!openClawWorkspaceRoot) throw new Error("OpenClaw official agent workspace is unavailable");
+		return locale
+			? updateManagedLocaleFile(join(openClawWorkspaceRoot, "SOUL.md"), managedLocaleBlock(locale))
+			: null;
+	}
+	if (runtime === "hermes") {
+		if (!hermesConfig) throw new Error("Hermes config command is unavailable");
+		const auth = manifest.hermesDashboardAuth;
+		const hermesHome = join(home, ".hermes");
+		reconcileHermesConfigValue(hermesConfig, "terminal.cwd", workspaceRoot);
+		if (auth) applyHermesDashboardConfig(hermesConfig, auth);
+		if (locale) reconcileHermesConfigValue(hermesConfig, "timezone", locale.timezone);
+		return locale
+			? updateManagedLocaleFile(join(hermesHome, "SOUL.md"), managedLocaleBlock(locale))
+			: null;
+	}
+	return null;
+}
+export function resolvedRuntimeServiceSettings(
+	manifest: RuntimeManifest,
+	runtime: RuntimeName,
+	service: RuntimeServiceName,
+	settings: RuntimeRunSettings,
+	providerEnv: Record<string, string>,
+): RuntimeRunSettings {
+	const merged = mergeRuntimeEnvWithProviderPlaceholders(
+		runtime,
+		withHermesManagedAiDefaults(manifest, runtime, settings) ?? settings,
+		providerEnv,
+		service,
+	);
+	return merged;
+}
+export function resolvedRuntimeSettings(
+	manifest: RuntimeManifest,
+	runtime: string,
+	settings: RuntimeRunSettings | undefined,
+	providerEnv: Record<string, string>,
+): RuntimeRunSettings | undefined {
+	return mergeRuntimeEnvWithProviderPlaceholders(
+		runtime,
+		withHermesManagedAiDefaults(manifest, runtime, settings),
+		providerEnv,
+	);
+}
+
+function withHermesManagedAiDefaults(
+	manifest: RuntimeManifest,
+	runtime: string,
+	settings: RuntimeRunSettings | undefined,
+): RuntimeRunSettings | undefined {
+	const desired = manifest.runtimes[runtime];
+	const providerId = desired?.primary_model?.provider_id;
+	const provider = providerId ? manifest.projection?.providers?.[providerId] : undefined;
+	if (
+		runtime !== "hermes" ||
+		!desired?.enabled ||
+		!providerId ||
+		provider?.managed_by !== "clawdi" ||
+		provider.status === "error" ||
+		provider.apiMode !== "openai_responses" ||
+		settings?.secretEnv?.HERMES_API_CALL_STALE_TIMEOUT !== undefined
+	)
+		return settings;
+	return {
+		...settings,
+		prependPath: settings?.prependPath ?? [],
+		// Maximum native Codex context floor, not a dynamic-policy equivalent.
+		// Hermes provider/model config and its user .env still take precedence.
+		env: { HERMES_API_CALL_STALE_TIMEOUT: "1200", ...settings?.env },
+	};
+}
+export function mergeRuntimeSecretEnv(
+	runtimeName: string,
+	settings: RuntimeRunSettings | undefined,
+	providerSecretEnv: Record<string, string>,
+	serviceName?: string,
+): Record<string, string> {
+	const scope = `runtime ${runtimeName}${serviceName ? ` service ${serviceName}` : ""}`;
+	const merged = { ...providerSecretEnv };
+	const runtimeSecretEnv = settings?.secretEnv ?? {};
+	for (const [envName, ref] of Object.entries(runtimeSecretEnv)) {
+		const existing = merged[envName];
+		if (existing !== undefined && existing !== ref) {
+			throw new Error(
+				`${scope} secretEnv.${envName} conflicts with provider secret ref ${existing}`,
+			);
+		}
+		merged[envName] = ref;
+	}
+	for (const envName of Object.keys(settings?.env ?? {})) {
+		if (merged[envName] !== undefined) {
+			throw new Error(`${scope} defines ${envName} in both env and secretEnv`);
+		}
+	}
+	return merged;
+}

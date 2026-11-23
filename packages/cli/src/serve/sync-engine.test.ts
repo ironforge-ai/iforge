@@ -1,0 +1,2224 @@
+import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
+import { createHash } from "node:crypto";
+import {
+	existsSync,
+	mkdirSync,
+	mkdtempSync,
+	readFileSync,
+	rmSync,
+	symlinkSync,
+	writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
+import type { AgentAdapter, RawSession, SkillModule } from "../adapters/base";
+import { adapterRegistry } from "../adapters/registry";
+import { AgentSkillSyncNotFoundError, ApiClient, ApiError } from "../lib/api-client";
+import { setAuth } from "../lib/config";
+import { planSessionUpload, sessionFence } from "../lib/session-upload";
+import {
+	persistFencedSessionEntry,
+	persistFencedSessionSourceRevisions,
+	readFencedSessionEntry,
+	readSessionsLock,
+} from "../lib/sessions-lock";
+import {
+	computeSkillFolderHash,
+	readSkillProjectionClaimsForAgent,
+	recordProjectSkillMaterialization,
+	recordSkillProjectionClaim,
+} from "../lib/skills-lock";
+import { computeSkillArchiveHash } from "../lib/tar";
+import { releaseManagedSkill, reserveManagedSkill } from "../runtime/managed-skill-reservation";
+import { RetryQueue } from "./queue";
+import {
+	classifyHeartbeatFailure,
+	connectedProjectSkillDeliveryEnabled,
+	enqueueChangedSessionsAfterStability,
+	filterValidSkillKeysForSync,
+	heartbeatDelayMs,
+	heartbeatLoop,
+	isAuthFailure,
+	isOversizedUploadError,
+	isPermanentUploadError,
+	isSafelyTerminalRuntimeObservationFailure,
+	isSkillSyncServerEvent,
+	lastSyncErrorForSseReconnect,
+	processQueueItem,
+	projectRefreshDelayMs,
+	reconcileAgentSkillProjection,
+	reconcileAgentSkillProjectionListing,
+	reconcileDelayMs,
+	resolveOwningSkillKey,
+	runSyncEngine,
+	SyncHealth,
+	skillInvalidationKey,
+	staleSkillProjectionProjectIds,
+	stopForDisconnectedAgent,
+} from "./sync-engine";
+
+function queueModules(adapter: AgentAdapter, projectId = "project-1") {
+	return {
+		sessions: adapter.sessions
+			? { module: adapter.sessions, protocol: "snapshot-v1" as const }
+			: null,
+		skills: adapter.skills ? { module: adapter.skills, getProjectId: () => projectId } : null,
+	};
+}
+
+function sessionQueueFence(
+	api: ApiClient,
+	adapter: AgentAdapter,
+	sourceSessionKey: string,
+	environmentId = "agent-1",
+) {
+	const fence = sessionFence(api, {
+		environmentId,
+		adapter: adapter.agentType,
+		sourceSessionKey,
+	});
+	return {
+		api_origin: fence.apiOrigin,
+		environment_id: fence.environmentId,
+		adapter: fence.adapter,
+		source_session_key: fence.sourceSessionKey,
+	};
+}
+
+describe("stable session enqueue abort fence", () => {
+	it("does not enqueue after collection finishes into an abort", async () => {
+		const abort = new AbortController();
+		const queued: unknown[] = [];
+		const inFlight = new Map<string, string>();
+		abort.abort();
+		const result = await enqueueChangedSessionsAfterStability({
+			abort: abort.signal,
+			sessions: [
+				{
+					localSessionId: "session-1",
+					projectPath: null,
+					startedAt: new Date(0),
+					endedAt: null,
+					messageCount: 1,
+					inputTokens: 0,
+					outputTokens: 0,
+					cacheReadTokens: 0,
+					model: null,
+					modelsUsed: [],
+					durationSeconds: null,
+					summary: null,
+					messages: [{ role: "user", content: "not queued" }],
+					rawFilePath: "/sessions/1.jsonl",
+				},
+			],
+			queue: {
+				enqueueWhenAvailable: async (item: unknown) => {
+					queued.push(item);
+					return 1;
+				},
+			},
+			lastPushedHash: new Map(),
+			inFlightHash: inFlight,
+			protocol: "snapshot-v1",
+			fenceFor: () => ({
+				apiOrigin: "https://cloud.example.test",
+				environmentId: "agent-1",
+				adapter: "hermes",
+				sourceSessionKey: "session-1",
+			}),
+		});
+
+		expect(result.enqueued).toBe(0);
+		expect(queued).toEqual([]);
+		expect(inFlight.size).toBe(0);
+	});
+
+	it("backfills the source revision when the confirmed content hash still matches", async () => {
+		const root = mkdtempSync(join(tmpdir(), "session-revision-backfill-"));
+		const originalHome = process.env.HOME;
+		try {
+			process.env.HOME = root;
+			const session: RawSession = {
+				localSessionId: "session-1",
+				projectPath: null,
+				startedAt: new Date(0),
+				endedAt: null,
+				messageCount: 1,
+				inputTokens: 0,
+				outputTokens: 0,
+				cacheReadTokens: 0,
+				model: null,
+				modelsUsed: [],
+				durationSeconds: null,
+				summary: null,
+				messages: [{ role: "user", content: "already synced" }],
+				rawFilePath: "/sessions/1.jsonl",
+				sourceRevision: "source-r2",
+			};
+			const plan = planSessionUpload(session, "snapshot-v1");
+			const fence = {
+				apiOrigin: "https://cloud.example.test",
+				environmentId: "agent-1",
+				adapter: "hermes" as const,
+				sourceSessionKey: session.localSessionId,
+			};
+			persistFencedSessionEntry(fence, {
+				protocol: plan.protocol,
+				local_hash: plan.localHash,
+				snapshot_hash: plan.localHash,
+			});
+			const queued: unknown[] = [];
+			const result = await enqueueChangedSessionsAfterStability({
+				abort: new AbortController().signal,
+				sessions: [session],
+				queue: {
+					enqueueWhenAvailable: async (item: unknown) => {
+						queued.push(item);
+						return 1;
+					},
+				},
+				lastPushedHash: new Map([[session.localSessionId, plan.localHash]]),
+				inFlightHash: new Map(),
+				protocol: plan.protocol,
+				fenceFor: () => fence,
+			});
+
+			persistFencedSessionSourceRevisions(result.confirmedSourceRevisions);
+
+			expect(result.enqueued).toBe(0);
+			expect(queued).toEqual([]);
+			expect(readFencedSessionEntry(readSessionsLock(), fence)?.source_revision).toBe("source-r2");
+		} finally {
+			if (originalHome === undefined) delete process.env.HOME;
+			else process.env.HOME = originalHome;
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+});
+
+describe("Session deletion convergence", () => {
+	it("caches server suppression without uploading and refreshes after local changes", async () => {
+		const root = mkdtempSync(join(tmpdir(), "session-suppression-"));
+		const originalHome = process.env.HOME;
+		const originalState = process.env.CLAWDI_STATE_DIR;
+		const originalFetch = globalThis.fetch;
+		const originalWrite = process.stderr.write;
+		const requests: string[] = [];
+		const logs: string[] = [];
+		let queue: RetryQueue | undefined;
+		try {
+			process.env.HOME = root;
+			process.env.CLAWDI_STATE_DIR = join(root, "serve");
+			const session: RawSession = {
+				localSessionId: "deleted-session",
+				projectPath: "/project",
+				startedAt: new Date(0),
+				endedAt: null,
+				messageCount: 1,
+				inputTokens: 0,
+				outputTokens: 0,
+				cacheReadTokens: 0,
+				model: null,
+				modelsUsed: [],
+				durationSeconds: null,
+				summary: null,
+				messages: [{ role: "user", content: "first" }],
+				rawFilePath: "/sessions/deleted-session.jsonl",
+			};
+			const adapter = adapterRegistry.hermes.create();
+			const sessions = adapter.sessions;
+			if (!sessions) throw new Error("Hermes fixture requires Sessions");
+			sessions.resolve = async () => session;
+			globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+				const request = input instanceof Request ? input : new Request(input, init);
+				const path = new URL(request.url).pathname;
+				requests.push(path);
+				if (path === "/v1/sessions/batch") {
+					return new Response(
+						JSON.stringify({
+							created: 0,
+							updated: 0,
+							unchanged: 0,
+							needs_content: [session.localSessionId],
+							rejected: [],
+							suppressed: [session.localSessionId],
+						}),
+						{ headers: { "content-type": "application/json" } },
+					);
+				}
+				return new Response("unexpected content upload", { status: 500 });
+			}) as typeof fetch;
+			process.stderr.write = ((chunk: string | Uint8Array) => {
+				logs.push(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8"));
+				return true;
+			}) as typeof process.stderr.write;
+
+			const retryQueue = new RetryQueue({ agentType: "hermes" });
+			queue = retryQueue;
+			const lastPushedSessionHash = new Map<string, string>();
+			const abortController = new AbortController();
+			const api = new ApiClient({ requireAuth: false });
+			const processCurrent = async () => {
+				const hash = createHash("sha256").update(JSON.stringify(session.messages)).digest("hex");
+				retryQueue.enqueue({
+					kind: "session_push",
+					...sessionQueueFence(api, adapter, session.localSessionId),
+					local_session_id: session.localSessionId,
+					content_hash: hash,
+					enqueued_at: new Date().toISOString(),
+					attempts: 0,
+				});
+				const item = retryQueue.peek();
+				if (!item) throw new Error("expected queued Session");
+				const outcome = await processQueueItem(
+					{
+						environmentId: "agent-1",
+						adapter,
+						abort: abortController.signal,
+						abortController,
+					},
+					api,
+					retryQueue,
+					item,
+					queueModules(adapter),
+					new Map(),
+					lastPushedSessionHash,
+					new Map(),
+				);
+				expect(outcome).toBe("applied");
+				expect(lastPushedSessionHash.get(session.localSessionId)).toBe(hash);
+				expect(
+					readFencedSessionEntry(
+						readSessionsLock(),
+						sessionFence(api, {
+							environmentId: "agent-1",
+							adapter: "hermes",
+							sourceSessionKey: session.localSessionId,
+						}),
+					)?.local_hash,
+				).toBe(hash);
+			};
+
+			await processCurrent();
+			session.messages.push({ role: "assistant", content: "changed" });
+			session.messageCount = 2;
+			await processCurrent();
+
+			expect(requests).toEqual(["/v1/sessions/batch", "/v1/sessions/batch"]);
+			expect(logs.join("")).toContain('"event":"engine.session_sync_suppressed"');
+			expect(logs.join("")).not.toContain('"event":"engine.session_pushed"');
+		} finally {
+			await queue?.flushPersist();
+			globalThis.fetch = originalFetch;
+			process.stderr.write = originalWrite;
+			if (originalHome === undefined) delete process.env.HOME;
+			else process.env.HOME = originalHome;
+			if (originalState === undefined) delete process.env.CLAWDI_STATE_DIR;
+			else process.env.CLAWDI_STATE_DIR = originalState;
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("re-reads newer session content at drain", async () => {
+		const root = mkdtempSync(join(tmpdir(), "session-current-drain-"));
+		const originalHome = process.env.HOME;
+		const originalState = process.env.CLAWDI_STATE_DIR;
+		const originalFetch = globalThis.fetch;
+		let queue: RetryQueue | undefined;
+		try {
+			process.env.HOME = root;
+			process.env.CLAWDI_STATE_DIR = join(root, "serve");
+			const enqueuedSession: RawSession = {
+				localSessionId: "current-session",
+				projectPath: "/project",
+				startedAt: new Date(0),
+				endedAt: new Date(1_000),
+				messageCount: 1,
+				inputTokens: 1,
+				outputTokens: 0,
+				cacheReadTokens: 0,
+				model: null,
+				modelsUsed: [],
+				durationSeconds: 1,
+				summary: "current content",
+				messages: [{ role: "user", content: "before enqueue" }],
+				rawFilePath: "/sessions/current-session.jsonl",
+			};
+			const currentSession: RawSession = {
+				...enqueuedSession,
+				messageCount: 2,
+				messages: [
+					...enqueuedSession.messages,
+					{ role: "assistant", content: "appended after enqueue" },
+				],
+			};
+			const queuedHash = createHash("sha256")
+				.update(JSON.stringify(enqueuedSession.messages))
+				.digest("hex");
+			const currentHash = createHash("sha256")
+				.update(JSON.stringify(currentSession.messages))
+				.digest("hex");
+			const adapter = adapterRegistry.hermes.create();
+			const sessions = adapter.sessions;
+			if (!sessions) throw new Error("Hermes fixture requires Sessions");
+			let resolveCalls = 0;
+			sessions.resolve = async () => {
+				resolveCalls += 1;
+				return currentSession;
+			};
+			let sentMetadata: Record<string, unknown> | undefined;
+			let sentMessages: unknown;
+			globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+				const request = input instanceof Request ? input : new Request(input, init);
+				const path = new URL(request.url).pathname;
+				if (path === "/v1/sessions/batch") {
+					const body = (await request.json()) as { sessions: Array<Record<string, unknown>> };
+					sentMetadata = body.sessions[0];
+					return new Response(
+						JSON.stringify({
+							created: 0,
+							updated: 1,
+							unchanged: 0,
+							needs_content: [currentSession.localSessionId],
+							rejected: [],
+							suppressed: [],
+						}),
+						{ headers: { "content-type": "application/json" } },
+					);
+				}
+				if (path === `/v1/sessions/${currentSession.localSessionId}/upload`) {
+					const file = (await request.formData()).get("file");
+					if (!(file instanceof Blob)) return new Response("missing file", { status: 400 });
+					sentMessages = JSON.parse(await file.text());
+					return new Response(JSON.stringify({ status: "uploaded", content_hash: currentHash }), {
+						headers: { "content-type": "application/json" },
+					});
+				}
+				return new Response("unexpected request", { status: 404 });
+			}) as typeof fetch;
+
+			const api = new ApiClient({ requireAuth: false });
+			queue = new RetryQueue({ agentType: "hermes" });
+			queue.enqueue({
+				kind: "session_push",
+				...sessionQueueFence(api, adapter, enqueuedSession.localSessionId),
+				local_session_id: enqueuedSession.localSessionId,
+				content_hash: queuedHash,
+				enqueued_at: new Date().toISOString(),
+				attempts: 0,
+			});
+			const item = queue.peek();
+			if (!item) throw new Error("expected queued session");
+			const abortController = new AbortController();
+			const outcome = await processQueueItem(
+				{
+					environmentId: "agent-1",
+					adapter,
+					abort: abortController.signal,
+					abortController,
+				},
+				api,
+				queue,
+				item,
+				queueModules(adapter),
+				new Map(),
+				new Map(),
+				new Map([[enqueuedSession.localSessionId, queuedHash]]),
+			);
+
+			expect(outcome).toBe("applied");
+			expect(resolveCalls).toBe(1);
+			expect(sentMetadata).toMatchObject({
+				content_hash: currentHash,
+				message_count: 2,
+			});
+			expect(sentMessages).toEqual(currentSession.messages);
+		} finally {
+			await queue?.flushPersist();
+			globalThis.fetch = originalFetch;
+			if (originalHome === undefined) delete process.env.HOME;
+			else process.env.HOME = originalHome;
+			if (originalState === undefined) delete process.env.CLAWDI_STATE_DIR;
+			else process.env.CLAWDI_STATE_DIR = originalState;
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+});
+
+describe("Agent filesystem projection reconcile", () => {
+	async function withProjectionCase(
+		run: (fixture: {
+			root: string;
+			queue: RetryQueue;
+			keys: Set<string>;
+			skills: SkillModule;
+			reconcile: (claims: Map<string, string>, legacy?: ReadonlySet<string>) => Promise<void>;
+		}) => Promise<void>,
+	): Promise<void> {
+		const root = mkdtempSync(join(tmpdir(), "agent-skill-projection-"));
+		const originalHome = process.env.HOME;
+		const originalState = process.env.CLAWDI_STATE_DIR;
+		const originalHermesHome = process.env.HERMES_HOME;
+		let queue: RetryQueue | undefined;
+		try {
+			process.env.HOME = root;
+			process.env.CLAWDI_STATE_DIR = join(root, "serve");
+			process.env.HERMES_HOME = root;
+			const skillsRoot = join(root, "skills");
+			mkdirSync(skillsRoot, { recursive: true });
+			const keys = new Set<string>();
+			const skills = adapterRegistry.hermes.create().skills;
+			if (!skills) throw new Error("Hermes fixture requires Skills");
+			const activeQueue = new RetryQueue({ agentType: "hermes" });
+			queue = activeQueue;
+			await run({
+				root: skillsRoot,
+				queue: activeQueue,
+				keys,
+				skills,
+				reconcile: (claims, trustedLegacyRemoteKeys) =>
+					reconcileAgentSkillProjection({
+						opts: {
+							environmentId: "agent-1",
+							adapter: { agentType: "hermes" },
+						},
+						skills,
+						queue: activeQueue,
+						claims,
+						projectId: "project-1",
+						trustedLegacyRemoteKeys,
+					}),
+			});
+		} finally {
+			await queue?.flushPersist();
+			if (originalHome === undefined) delete process.env.HOME;
+			else process.env.HOME = originalHome;
+			if (originalState === undefined) delete process.env.CLAWDI_STATE_DIR;
+			else process.env.CLAWDI_STATE_DIR = originalState;
+			if (originalHermesHome === undefined) delete process.env.HERMES_HOME;
+			else process.env.HERMES_HOME = originalHermesHome;
+			rmSync(root, { recursive: true, force: true });
+		}
+	}
+
+	it("resolves the root once per reconciliation instead of once per key", async () => {
+		await withProjectionCase(async ({ root, skills, queue, reconcile }) => {
+			for (const key of ["alpha", "beta"]) {
+				const dir = join(root, key);
+				mkdirSync(dir);
+				writeFileSync(join(dir, "SKILL.md"), `# ${key}\n`);
+			}
+			const rootDir = spyOn(skills, "rootDir");
+			try {
+				await reconcile(new Map());
+				expect(rootDir).toHaveBeenCalledTimes(1);
+				await reconcile(new Map());
+				expect(rootDir).toHaveBeenCalledTimes(2);
+				expect(queue.all().map((item) => ("skill_key" in item ? item.skill_key : null))).toEqual([
+					"alpha",
+					"beta",
+				]);
+			} finally {
+				rootDir.mockRestore();
+			}
+		});
+	});
+
+	it("durably deletes a claimed nested key missing after directory removal", async () => {
+		await withProjectionCase(async ({ queue, reconcile }) => {
+			await reconcile(new Map([["category/demo", "claimed-hash"]]));
+			const item = queue.peek();
+			expect(item?.kind).toBe("skill_delete");
+			expect(item && "skill_key" in item ? item.skill_key : undefined).toBe("category/demo");
+			expect(item && "agent_id" in item ? item.agent_id : undefined).toBe("agent-1");
+			expect(item && "project_id" in item ? item.project_id : undefined).toBe("project-1");
+		});
+	});
+
+	it("retains the delete queue item and claim on a dedicated 404, then releases both on 204", async () => {
+		await withProjectionCase(async ({ queue }) => {
+			recordSkillProjectionClaim({
+				agentType: "hermes",
+				agentId: "agent-1",
+				projectId: "project-1",
+				skillKey: "claimed",
+				hash: "claimed-hash",
+			});
+			queue.enqueue({
+				kind: "skill_delete",
+				agent_id: "agent-1",
+				project_id: "project-1",
+				skill_key: "claimed",
+				enqueued_at: new Date().toISOString(),
+				attempts: 0,
+			});
+			const item = queue.peek();
+			if (item?.kind !== "skill_delete") throw new Error("expected queued delete");
+
+			const originalFetch = globalThis.fetch;
+			const requests: Request[] = [];
+			let responseStatus = 404;
+			try {
+				globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+					requests.push(input instanceof Request ? input : new Request(input, init));
+					return responseStatus === 204
+						? new Response(null, { status: 204 })
+						: new Response('{"detail":"Agent not found"}', { status: 404 });
+				}) as typeof fetch;
+				const adapter = adapterRegistry.hermes.create();
+				const abortController = new AbortController();
+				const opts = {
+					environmentId: "agent-1",
+					adapter,
+					abort: abortController.signal,
+					abortController,
+				};
+				const api = new ApiClient({ requireAuth: false });
+
+				await expect(
+					processQueueItem(
+						opts,
+						api,
+						queue,
+						item,
+						queueModules(adapter),
+						new Map(),
+						new Map(),
+						new Map(),
+					),
+				).rejects.toBeInstanceOf(AgentSkillSyncNotFoundError);
+				expect(isPermanentUploadError(new AgentSkillSyncNotFoundError("missing"))).toBe(false);
+				expect(queue.peek()?.version).toBe(item.version);
+				expect(
+					readSkillProjectionClaimsForAgent("hermes", "agent-1").map((claim) => claim.project_id),
+				).toEqual(["project-1"]);
+				expect(requests.map((request) => new URL(request.url).pathname)).toEqual([
+					"/v1/agents/agent-1/skills/sync/claimed",
+				]);
+
+				responseStatus = 204;
+				await processQueueItem(
+					opts,
+					api,
+					queue,
+					item,
+					queueModules(adapter),
+					new Map(),
+					new Map(),
+					new Map(),
+				);
+				expect(queue.depth).toBe(0);
+				expect(readSkillProjectionClaimsForAgent("hermes", "agent-1")).toEqual([]);
+			} finally {
+				globalThis.fetch = originalFetch;
+			}
+		});
+	});
+
+	it("uses only a complete-listing key as migration evidence for an unclaimed legacy row", async () => {
+		await withProjectionCase(async ({ queue, reconcile }) => {
+			await reconcile(new Map());
+			expect(queue.depth).toBe(0);
+			await reconcile(new Map(), new Set(["legacy"]));
+			expect(queue.peek()?.kind).toBe("skill_delete");
+		});
+	});
+
+	it("treats a current Agent-Project SSE key as an absence or local reproject hint", async () => {
+		await withProjectionCase(async ({ root, queue, keys, reconcile }) => {
+			await reconcile(new Map(), new Set(["legacy-absent"]));
+			expect(queue.peek()?.kind).toBe("skill_delete");
+
+			const local = join(root, "legacy-present");
+			mkdirSync(local, { recursive: true });
+			writeFileSync(join(local, "SKILL.md"), "# Local remains authoritative\n");
+			keys.add("legacy-present");
+			await reconcile(new Map(), new Set(["legacy-present"]));
+			expect(
+				queue.all().find((item) => "skill_key" in item && item.skill_key === "legacy-present")
+					?.kind,
+			).toBe("skill_push");
+			expect(existsSync(join(local, "SKILL.md"))).toBe(true);
+		});
+	});
+
+	it("never reconciles or drains a Project materialization as agent_sync", async () => {
+		await withProjectionCase(async ({ root, queue, keys, reconcile }) => {
+			const local = join(root, "shared", "review-pr__alice");
+			mkdirSync(local, { recursive: true });
+			writeFileSync(join(local, "SKILL.md"), "# Project-owned\n");
+			keys.add("shared/review-pr__alice");
+			recordProjectSkillMaterialization({
+				agentType: "hermes",
+				localSkillKey: "shared/review-pr__alice",
+				sourceProjectId: "project-shared",
+				sourceSkillKey: "review-pr",
+				contentHash: "source-hash",
+			});
+
+			await reconcile(new Map(), new Set(["shared/review-pr__alice"]));
+			expect(queue.depth).toBe(0);
+			writeFileSync(join(local, "SKILL.md"), "# Locally edited but still Project-owned\n");
+			await reconcile(new Map());
+			expect(queue.depth).toBe(0);
+
+			recordSkillProjectionClaim({
+				agentType: "hermes",
+				agentId: "agent-1",
+				projectId: "project-old",
+				skillKey: "shared/review-pr__alice",
+				hash: "stale-agent-hash",
+			});
+			await reconcile(new Map());
+			const cleanup = queue.peek();
+			if (cleanup?.kind !== "skill_delete") throw new Error("expected projection cleanup");
+			const cleanupFetch = globalThis.fetch;
+			const requests: Request[] = [];
+			try {
+				globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+					requests.push(input instanceof Request ? input : new Request(input, init));
+					return new Response(null, { status: 204 });
+				}) as typeof fetch;
+				const abortController = new AbortController();
+				const adapter = adapterRegistry.hermes.create();
+				const outcome = await processQueueItem(
+					{
+						environmentId: "agent-1",
+						adapter,
+						abort: abortController.signal,
+						abortController,
+					},
+					new ApiClient({ requireAuth: false }),
+					queue,
+					cleanup,
+					queueModules(adapter),
+					new Map(),
+					new Map(),
+					new Map(),
+				);
+				expect(outcome).toBe("applied");
+				expect(new URL(requests[0]?.url ?? "http://invalid").searchParams.get("project_id")).toBe(
+					"project-old",
+				);
+				expect(readSkillProjectionClaimsForAgent("hermes", "agent-1")).toEqual([]);
+				expect(existsSync(join(local, "SKILL.md"))).toBe(true);
+			} finally {
+				globalThis.fetch = cleanupFetch;
+			}
+
+			queue.enqueue({
+				kind: "skill_push",
+				agent_id: "agent-1",
+				project_id: "project-1",
+				skill_key: "shared/review-pr__alice",
+				new_hash: "queued-before-fence",
+				enqueued_at: new Date().toISOString(),
+				attempts: 0,
+			});
+			const queued = queue.peek();
+			if (!queued) throw new Error("expected queued Skill push");
+			let requestCount = 0;
+			const originalFetch = globalThis.fetch;
+			try {
+				globalThis.fetch = Object.assign(
+					async () => {
+						requestCount++;
+						return new Response("unexpected", { status: 500 });
+					},
+					{ preconnect: originalFetch.preconnect },
+				);
+				const abortController = new AbortController();
+				const adapter = adapterRegistry.hermes.create();
+				const outcome = await processQueueItem(
+					{
+						environmentId: "agent-1",
+						adapter,
+						abort: abortController.signal,
+						abortController,
+					},
+					new ApiClient({ requireAuth: false }),
+					queue,
+					queued,
+					queueModules(adapter),
+					new Map(),
+					new Map(),
+					new Map(),
+				);
+				expect(outcome).toBe("absent");
+				expect(queue.depth).toBe(0);
+				expect(requestCount).toBe(0);
+			} finally {
+				globalThis.fetch = originalFetch;
+			}
+		});
+	});
+
+	it("reserved handoff deletes the old projection without touching the managed target", async () => {
+		await withProjectionCase(async ({ root, queue, keys, reconcile }) => {
+			const target = join(root, "managed");
+			mkdirSync(target, { recursive: true });
+			writeFileSync(join(target, "SKILL.md"), "# Managed\n");
+			keys.add("managed");
+			reserveManagedSkill({
+				targetDir: target,
+				id: "managed",
+				version: 1,
+				digest: "a".repeat(64),
+				manager: "local-setup",
+			});
+			recordSkillProjectionClaim({
+				agentType: "hermes",
+				agentId: "agent-1",
+				projectId: "project-old",
+				skillKey: "managed",
+				hash: "user-hash",
+			});
+			await reconcile(new Map());
+			expect(queue.peek()?.kind).toBe("skill_delete");
+			expect(existsSync(join(target, "SKILL.md"))).toBe(true);
+		});
+	});
+
+	it("reservation rollback replaces its pending delete with the unchanged user push", async () => {
+		await withProjectionCase(async ({ root, queue, keys, reconcile }) => {
+			const target = join(root, "demo");
+			mkdirSync(target, { recursive: true });
+			writeFileSync(join(target, "SKILL.md"), "# User\n");
+			keys.add("demo");
+			const hash = await computeSkillFolderHash(target);
+			reserveManagedSkill({
+				targetDir: target,
+				id: "demo",
+				version: 1,
+				digest: "a".repeat(64),
+				manager: "local-setup",
+			});
+			await reconcile(new Map([["demo", hash]]));
+			expect(queue.peek()?.kind).toBe("skill_delete");
+			releaseManagedSkill({
+				targetDir: target,
+				id: "demo",
+				manager: "local-setup",
+				removeTarget: () => undefined,
+			});
+			await reconcile(new Map([["demo", hash]]));
+			expect(queue.peek()?.kind).toBe("skill_push");
+		});
+	});
+
+	it("retains old-Project cleanup identity across reassignment", async () => {
+		await withProjectionCase(async () => {
+			recordSkillProjectionClaim({
+				agentType: "hermes",
+				agentId: "agent-1",
+				projectId: "project-old",
+				skillKey: "demo",
+				hash: "old-hash",
+			});
+			expect(staleSkillProjectionProjectIds("hermes", "agent-1", "demo", "project-new")).toEqual([
+				"project-old",
+			]);
+			expect(
+				staleSkillProjectionProjectIds("hermes", "different-agent", "demo", "project-new"),
+			).toEqual([]);
+		});
+	});
+
+	it("enqueues old-Project exact claims after restart when local content is absent", async () => {
+		await withProjectionCase(async ({ queue, reconcile }) => {
+			recordSkillProjectionClaim({
+				agentType: "hermes",
+				agentId: "agent-1",
+				projectId: "project-old",
+				skillKey: "gone",
+				hash: "old-hash",
+			});
+			await reconcile(new Map());
+			expect(queue.peek()?.kind).toBe("skill_delete");
+			await queue.flushPersist();
+			const restarted = new RetryQueue({ agentType: "hermes" });
+			restarted.load();
+			const pending = restarted.peek();
+			expect(pending?.kind).toBe("skill_delete");
+			expect(pending && "project_id" in pending ? pending.project_id : undefined).toBe("project-1");
+		});
+	});
+
+	it("cleans every stale Project before projecting current bytes and retries partial cleanup", async () => {
+		await withProjectionCase(async ({ root, queue, keys, reconcile }) => {
+			const originalHermesHome = process.env.HERMES_HOME;
+			const originalFetch = globalThis.fetch;
+			try {
+				process.env.HERMES_HOME = dirname(root);
+				const local = join(root, "demo");
+				mkdirSync(local, { recursive: true });
+				writeFileSync(join(local, "SKILL.md"), "# Current\n");
+				keys.add("demo");
+				for (const projectId of ["project-old-a", "project-old-b"]) {
+					recordSkillProjectionClaim({
+						agentType: "hermes",
+						agentId: "agent-1",
+						projectId,
+						skillKey: "demo",
+						hash: `hash-${projectId}`,
+					});
+				}
+				await reconcile(new Map());
+				const item = queue.peek();
+				if (!item) throw new Error("expected queued Skill projection");
+
+				let failSecondOldProject = true;
+				const calls: string[] = [];
+				globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+					const request = input instanceof Request ? input : new Request(input, init);
+					const url = new URL(request.url);
+					if (request.method === "DELETE") {
+						const projectId = url.searchParams.get("project_id") ?? "missing";
+						calls.push(`delete:${projectId}`);
+						if (projectId === "project-old-b" && failSecondOldProject) {
+							return new Response("offline", { status: 503 });
+						}
+						return new Response(null, { status: 204 });
+					}
+					if (request.method === "POST") {
+						calls.push("upload:project-1");
+						return new Response(JSON.stringify({ version: 1 }), {
+							headers: { "content-type": "application/json" },
+						});
+					}
+					return new Response("unexpected", { status: 404 });
+				}) as typeof fetch;
+
+				const adapter = adapterRegistry.hermes.create();
+				const abortController = new AbortController();
+				const opts = {
+					environmentId: "agent-1",
+					adapter,
+					abort: abortController.signal,
+					abortController,
+				};
+				const api = new ApiClient({ requireAuth: false });
+				await expect(
+					processQueueItem(
+						opts,
+						api,
+						queue,
+						item,
+						queueModules(adapter),
+						new Map(),
+						new Map(),
+						new Map(),
+					),
+				).rejects.toThrow(/503/);
+				expect(calls).not.toContain("upload:project-1");
+				expect(
+					readSkillProjectionClaimsForAgent("hermes", "agent-1").map((claim) => claim.project_id),
+				).toEqual(["project-old-b"]);
+
+				failSecondOldProject = false;
+				const retryItem = queue.peek();
+				if (!retryItem) throw new Error("expected retained queue item");
+				await processQueueItem(
+					opts,
+					api,
+					queue,
+					retryItem,
+					queueModules(adapter),
+					new Map(),
+					new Map(),
+					new Map(),
+				);
+				expect(calls.at(-2)).toBe("delete:project-old-b");
+				expect(calls.at(-1)).toBe("upload:project-1");
+				expect(
+					readSkillProjectionClaimsForAgent("hermes", "agent-1").map((claim) => claim.project_id),
+				).toEqual(["project-1"]);
+			} finally {
+				globalThis.fetch = originalFetch;
+				if (originalHermesHome === undefined) delete process.env.HERMES_HOME;
+				else process.env.HERMES_HOME = originalHermesHome;
+			}
+		});
+	});
+
+	it.each([false, true])(
+		"uploads exact symlink bytes and retains cancelled work (cancel=%s)",
+		async (cancel) => {
+			await withProjectionCase(async ({ root, queue, keys, skills, reconcile }) => {
+				const originalHermesHome = process.env.HERMES_HOME;
+				const originalFetch = globalThis.fetch;
+				const rootDir = spyOn(skills, "rootDir");
+				try {
+					process.env.HERMES_HOME = dirname(root);
+					const shared = join(root, "shared");
+					mkdirSync(shared, { recursive: true });
+					writeFileSync(join(shared, "body.md"), "shared body\n");
+					const local = join(root, "demo");
+					mkdirSync(local, { recursive: true });
+					writeFileSync(join(local, "SKILL.md"), "# Demo\n");
+					symlinkSync(join(shared, "body.md"), join(local, "body.md"));
+					keys.add("demo");
+					await reconcile(new Map());
+					rootDir.mockClear();
+					const item = queue.peek();
+					if (!item) throw new Error("expected queued projection");
+
+					const abortController = new AbortController();
+					const pushed = new Map<string, string>();
+					let verifiedHash: string | null = null;
+					globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+						const request = input instanceof Request ? input : new Request(input, init);
+						const form = await request.formData();
+						const archive = form.get("file");
+						const suppliedHash = form.get("content_hash");
+						if (!(archive instanceof Blob) || typeof suppliedHash !== "string") {
+							return new Response("invalid multipart", { status: 400 });
+						}
+						verifiedHash = await computeSkillArchiveHash(
+							Buffer.from(await archive.arrayBuffer()),
+							"demo",
+						);
+						expect(suppliedHash).toBe(verifiedHash);
+						if (cancel) abortController.abort();
+						return new Response(JSON.stringify({ version: 1 }), {
+							headers: { "content-type": "application/json" },
+						});
+					}) as typeof fetch;
+
+					const adapter = adapterRegistry.hermes.create();
+					adapter.skills = skills;
+					const processing = processQueueItem(
+						{
+							environmentId: "agent-1",
+							adapter,
+							abort: abortController.signal,
+							abortController,
+						},
+						new ApiClient({ requireAuth: false }),
+						queue,
+						item,
+						queueModules(adapter),
+						pushed,
+						new Map(),
+						new Map(),
+					);
+					if (cancel) {
+						await expect(processing).rejects.toThrow();
+						expect(queue.peek()).toEqual(item);
+						expect(pushed.size).toBe(0);
+						expect(readSkillProjectionClaimsForAgent("hermes", "agent-1")).toEqual([]);
+					} else {
+						await processing;
+						expect(queue.depth).toBe(0);
+					}
+					expect(verifiedHash).not.toBeNull();
+					expect(rootDir).toHaveBeenCalledTimes(1);
+				} finally {
+					rootDir.mockRestore();
+					globalThis.fetch = originalFetch;
+					if (originalHermesHome === undefined) delete process.env.HERMES_HOME;
+					else process.env.HERMES_HOME = originalHermesHome;
+				}
+			});
+		},
+	);
+
+	it("re-derives missed alias absence after eviction and restart at the same revision", async () => {
+		await withProjectionCase(async ({ root, keys, skills }) => {
+			const originalFetch = globalThis.fetch;
+			let queue = new RetryQueue({ agentType: "hermes", maxItems: 1 });
+			let revision = 7;
+			let includeRevision = true;
+			let remoteKeys = ["legacy-absent"];
+			try {
+				globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+					const request = input instanceof Request ? input : new Request(input, init);
+					const etag = `"${revision}:project-1"`;
+					if (includeRevision && request.headers.get("if-none-match") === etag) {
+						return new Response(null, { status: 304, headers: { etag } });
+					}
+					return new Response(
+						JSON.stringify({
+							items: remoteKeys.map((skillKey) => ({ skill_key: skillKey, name: skillKey })),
+							total: remoteKeys.length,
+						}),
+						{
+							headers: {
+								"content-type": "application/json",
+								...(includeRevision ? { etag } : {}),
+							},
+						},
+					);
+				}) as typeof fetch;
+				const api = new ApiClient({ requireAuth: false });
+				const opts = {
+					environmentId: "agent-1",
+					adapter: { agentType: "hermes" as const },
+				};
+
+				const same = await reconcileAgentSkillProjectionListing({
+					api,
+					opts,
+					skills,
+					queue,
+					claims: new Map(),
+					projectId: "project-1",
+					previousEtag: '"7:project-1"',
+				});
+				expect(same).toEqual({
+					complete: true,
+					changed: false,
+					revision: 7,
+					etag: '"7:project-1"',
+				});
+				expect(queue.depth).toBe(0);
+
+				revision = 8;
+				const missedAbsent = await reconcileAgentSkillProjectionListing({
+					api,
+					opts,
+					skills,
+					queue,
+					claims: new Map(),
+					projectId: "project-1",
+					previousEtag: '"7:project-1"',
+				});
+				expect(missedAbsent.changed).toBe(true);
+				const absenceDelete = queue.peek();
+				expect(absenceDelete?.kind).toBe("skill_delete");
+				await reconcileAgentSkillProjectionListing({
+					api,
+					opts,
+					skills,
+					queue,
+					claims: new Map(),
+					projectId: "project-1",
+					previousEtag: '"8:project-1"',
+					forceComplete: true,
+				});
+				expect(queue.peek()?.version).toBe(absenceDelete?.version);
+
+				// A full offline queue may evict the Skill operation. Once the
+				// unrelated session completes and the daemon restarts, the durable
+				// queue is empty while the remote revision remains unchanged.
+				const sessionVersion = queue.enqueue({
+					kind: "session_push",
+					...sessionQueueFence(api, adapterRegistry.hermes.create(), "session-1"),
+					local_session_id: "session-1",
+					content_hash: "session-hash",
+					enqueued_at: new Date().toISOString(),
+					attempts: 0,
+				});
+				expect(queue.peek()?.kind).toBe("session_push");
+				const sessionItem = queue.peek();
+				if (!sessionItem || sessionItem.version !== sessionVersion) {
+					throw new Error("expected retained session queue item");
+				}
+				queue.markDoneIfVersion(sessionItem);
+				await queue.flushPersist();
+				const restarted = new RetryQueue({ agentType: "hermes", maxItems: 1 });
+				restarted.load();
+				expect(restarted.depth).toBe(0);
+				queue = restarted;
+				const replayed = await reconcileAgentSkillProjectionListing({
+					api,
+					opts,
+					skills,
+					queue,
+					claims: new Map(),
+					projectId: "project-1",
+					previousEtag: '"8:project-1"',
+					forceComplete: true,
+				});
+				expect(replayed).toEqual({
+					complete: true,
+					changed: false,
+					revision: 8,
+					etag: '"8:project-1"',
+				});
+				expect(queue.peek()?.kind).toBe("skill_delete");
+
+				const local = join(root, "legacy-present");
+				mkdirSync(local, { recursive: true });
+				writeFileSync(join(local, "SKILL.md"), "# Never overwritten by listing bytes\n");
+				keys.add("legacy-present");
+				remoteKeys = ["legacy-present"];
+				revision = 9;
+				await reconcileAgentSkillProjectionListing({
+					api,
+					opts,
+					skills,
+					queue,
+					claims: new Map(),
+					projectId: "project-1",
+					previousEtag: '"8:project-1"',
+				});
+				expect(
+					queue.all().find((item) => "skill_key" in item && item.skill_key === "legacy-present")
+						?.kind,
+				).toBe("skill_push");
+				expect(readFileSync(join(local, "SKILL.md"), "utf-8")).toContain("Never overwritten");
+
+				includeRevision = false;
+				remoteKeys = ["unfenced"];
+				const unfenced = await reconcileAgentSkillProjectionListing({
+					api,
+					opts,
+					skills,
+					queue,
+					claims: new Map(),
+					projectId: "project-1",
+					previousEtag: '"9:project-1"',
+				});
+				expect(unfenced.complete).toBe(false);
+				expect(
+					queue.all().some((item) => "skill_key" in item && item.skill_key === "unfenced"),
+				).toBe(false);
+				await queue.flushPersist();
+			} finally {
+				globalThis.fetch = originalFetch;
+			}
+		});
+	});
+
+	it("rejects mixed-ETag pagination as legacy deletion evidence", async () => {
+		await withProjectionCase(async ({ queue, skills }) => {
+			const originalFetch = globalThis.fetch;
+			try {
+				globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+					const request = input instanceof Request ? input : new Request(input, init);
+					const page = Number.parseInt(new URL(request.url).searchParams.get("page") ?? "1", 10);
+					const itemCount = page === 1 ? 200 : 1;
+					const items = Array.from({ length: itemCount }, (_, index) => {
+						const skillKey = page === 1 ? `legacy-${index}` : "legacy-final";
+						return { skill_key: skillKey, name: skillKey };
+					});
+					return new Response(JSON.stringify({ items, total: 201 }), {
+						headers: {
+							"content-type": "application/json",
+							etag: page === 1 ? '"11:project-1:a"' : '"11:project-1:b"',
+						},
+					});
+				}) as typeof fetch;
+
+				const result = await reconcileAgentSkillProjectionListing({
+					api: new ApiClient({ requireAuth: false }),
+					opts: {
+						environmentId: "agent-1",
+						adapter: { agentType: "hermes" },
+					},
+					skills,
+					queue,
+					claims: new Map(),
+					projectId: "project-1",
+					previousEtag: null,
+				});
+				expect(result.complete).toBe(false);
+				expect(queue.depth).toBe(0);
+			} finally {
+				globalThis.fetch = originalFetch;
+			}
+		});
+	});
+
+	it.each([
+		{
+			name: "an empty page before the advertised total",
+			pages: [{ items: [], total: 1 }],
+		},
+		{
+			name: "a short page before the advertised total",
+			pages: [{ items: [{ skill_key: "legacy-short", name: "legacy-short" }], total: 2 }],
+		},
+		{
+			name: "duplicate Skill keys",
+			pages: [
+				{
+					items: [
+						{ skill_key: "legacy-duplicate", name: "legacy-duplicate" },
+						{ skill_key: "legacy-duplicate", name: "legacy-duplicate" },
+					],
+					total: 2,
+				},
+			],
+		},
+		{
+			name: "a total that changes between pages",
+			pages: [
+				{
+					items: Array.from({ length: 200 }, (_, index) => ({
+						skill_key: `legacy-total-${index}`,
+						name: `legacy-total-${index}`,
+					})),
+					total: 201,
+				},
+				{
+					items: [{ skill_key: "legacy-total-final", name: "legacy-total-final" }],
+					total: 202,
+				},
+			],
+		},
+	])("rejects $name as complete legacy deletion evidence", async ({ pages }) => {
+		await withProjectionCase(async ({ queue, skills }) => {
+			const originalFetch = globalThis.fetch;
+			try {
+				globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+					const request = input instanceof Request ? input : new Request(input, init);
+					const page = Number.parseInt(new URL(request.url).searchParams.get("page") ?? "1", 10);
+					const payload = pages[page - 1] ?? { items: [], total: pages[0]?.total ?? 0 };
+					return new Response(JSON.stringify(payload), {
+						headers: { "content-type": "application/json", etag: '"12:project-1"' },
+					});
+				}) as typeof fetch;
+
+				const result = await reconcileAgentSkillProjectionListing({
+					api: new ApiClient({ requireAuth: false }),
+					opts: {
+						environmentId: "agent-1",
+						adapter: { agentType: "hermes" },
+					},
+					skills,
+					queue,
+					claims: new Map(),
+					projectId: "project-1",
+					previousEtag: null,
+				});
+				expect(result.complete).toBe(false);
+				expect(queue.depth).toBe(0);
+			} finally {
+				globalThis.fetch = originalFetch;
+			}
+		});
+	});
+});
+
+describe("daemon SSE routing", () => {
+	it("ignores runtime manifest notifications without dispatching skill work", () => {
+		expect(
+			isSkillSyncServerEvent({
+				type: "runtime_manifest_changed",
+				environment_id: "env-runtime-1",
+			}),
+		).toBe(false);
+	});
+
+	it("turns legacy and Agent projection events into local re-scan keys only", () => {
+		for (const type of [
+			"skill_changed",
+			"skill_deleted",
+			"agent_skill_changed",
+			"agent_skill_deleted",
+		] as const) {
+			expect(
+				skillInvalidationKey(
+					{
+						type,
+						project_id: "project-1",
+						skill_key: "demo",
+						skills_revision: 2,
+						...(type.endsWith("changed") ? { content_hash: "projection-hash" } : {}),
+					},
+					"project-1",
+				),
+			).toBe("demo");
+		}
+		expect(
+			skillInvalidationKey(
+				{
+					type: "skill_deleted",
+					project_id: "other-project",
+					skill_key: "demo",
+					skills_revision: 3,
+				},
+				"project-1",
+			),
+		).toBeNull();
+	});
+});
+
+describe("Pi sessions-only daemon", () => {
+	it("uploads its real fixture without starting any Skills control plane", async () => {
+		const root = mkdtempSync(join(tmpdir(), "clawdi-pi-engine-"));
+		const originalFetch = globalThis.fetch;
+		const originalHome = process.env.HOME;
+		const originalPiHome = process.env.PI_CODING_AGENT_DIR;
+		const originalState = process.env.CLAWDI_STATE_DIR;
+		const originalApiUrl = process.env.CLAWDI_API_URL;
+		const originalAuthToken = process.env.CLAWDI_AUTH_TOKEN;
+		const originalAuthOrigin = process.env.CLAWDI_AUTH_TOKEN_ORIGIN;
+		const requests: Request[] = [];
+		const abortController = new AbortController();
+		try {
+			process.env.HOME = root;
+			process.env.PI_CODING_AGENT_DIR = join(root, "pi-agent");
+			process.env.CLAWDI_STATE_DIR = join(root, "serve");
+			process.env.CLAWDI_API_URL = "https://cloud.example.test";
+			process.env.CLAWDI_AUTH_TOKEN = "clawdi_test_token";
+			process.env.CLAWDI_AUTH_TOKEN_ORIGIN = "https://cloud.example.test";
+			const sessionPath = join(root, "pi-agent", "sessions", "workspace", "session.jsonl");
+			mkdirSync(dirname(sessionPath), { recursive: true });
+			writeFileSync(
+				sessionPath,
+				readFileSync(join(import.meta.dir, "../../tests/fixtures/pi/session-v3.jsonl"), "utf8"),
+			);
+
+			globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+				const request = input instanceof Request ? input : new Request(input, init);
+				requests.push(request.clone());
+				const path = new URL(request.url).pathname;
+				if (path === "/v1/agents/agent-pi") {
+					return Response.json({ id: "agent-pi", default_project_id: "project-1" });
+				}
+				if (path === "/v1/sessions/upload-capabilities") {
+					return new Response('{"detail":"Not found"}', { status: 404 });
+				}
+				if (path === "/v1/sessions/batch") {
+					const body = (await request.json()) as {
+						sessions: Array<{ local_session_id: string; content_protocol: string }>;
+					};
+					expect(body.sessions).toMatchObject([
+						{ local_session_id: "pi.fixture-session", content_protocol: "snapshot-v1" },
+					]);
+					return Response.json({
+						created: 1,
+						updated: 0,
+						unchanged: 0,
+						needs_content: ["pi.fixture-session"],
+						rejected: [],
+						suppressed: [],
+					});
+				}
+				if (path === "/v1/sessions/pi.fixture-session/upload") {
+					const form = await request.formData();
+					const expectedHash = form.get("expected_content_hash");
+					expect(typeof expectedHash).toBe("string");
+					queueMicrotask(() => abortController.abort());
+					return Response.json({ status: "uploaded", content_hash: expectedHash });
+				}
+				if (path === "/v1/agents/agent-pi/sync-heartbeat") {
+					return Response.json({ status: "ok" });
+				}
+				return new Response(`unexpected ${path}`, { status: 500 });
+			}) as typeof fetch;
+
+			await runSyncEngine({
+				environmentId: "agent-pi",
+				adapter: adapterRegistry.pi.create(),
+				abort: abortController.signal,
+				abortController,
+				forcePollWatcher: true,
+			});
+
+			const paths = requests.map((request) => new URL(request.url).pathname);
+			expect(paths).toContain("/v1/sessions/pi.fixture-session/upload");
+			expect(paths).toContain("/v1/agents/agent-pi");
+			expect(paths).not.toContain("/v1/sync/events");
+			expect(paths.some((path) => path.includes("/skills"))).toBe(false);
+			const heartbeat = requests.find((request) =>
+				new URL(request.url).pathname.endsWith("/sync-heartbeat"),
+			);
+			if (!heartbeat) throw new Error("Expected startup heartbeat");
+			expect(await heartbeat.json()).toMatchObject({ last_sync_error: null });
+		} finally {
+			abortController.abort();
+			globalThis.fetch = originalFetch;
+			if (originalHome === undefined) delete process.env.HOME;
+			else process.env.HOME = originalHome;
+			if (originalPiHome === undefined) delete process.env.PI_CODING_AGENT_DIR;
+			else process.env.PI_CODING_AGENT_DIR = originalPiHome;
+			if (originalState === undefined) delete process.env.CLAWDI_STATE_DIR;
+			else process.env.CLAWDI_STATE_DIR = originalState;
+			if (originalApiUrl === undefined) delete process.env.CLAWDI_API_URL;
+			else process.env.CLAWDI_API_URL = originalApiUrl;
+			if (originalAuthToken === undefined) delete process.env.CLAWDI_AUTH_TOKEN;
+			else process.env.CLAWDI_AUTH_TOKEN = originalAuthToken;
+			if (originalAuthOrigin === undefined) delete process.env.CLAWDI_AUTH_TOKEN_ORIGIN;
+			else process.env.CLAWDI_AUTH_TOKEN_ORIGIN = originalAuthOrigin;
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+});
+
+describe("isAuthFailure", () => {
+	// Listing and projection paths both rely on this classifier to decide
+	// whether to abort the daemon vs. log-and-retry. A wrong answer in
+	// either direction is bad: missing a 401 means a revoked key
+	// silently loops forever (the bug Codex flagged), and false-
+	// positives on a transient 5xx would kill a healthy daemon.
+	it.each([401, 403])("treats ApiError(%i) as auth failure", (status) => {
+		const e = new ApiError({ status, body: "", hint: "" });
+		expect(isAuthFailure(e)).toBe(true);
+	});
+
+	it.each([400, 404, 408, 429, 500, 502, 503])(
+		"does not treat ApiError(%i) as auth failure",
+		(status) => {
+			const e = new ApiError({ status, body: "", hint: "" });
+			expect(isAuthFailure(e)).toBe(false);
+		},
+	);
+
+	it("does not treat plain Error as auth failure", () => {
+		expect(isAuthFailure(new Error("boom"))).toBe(false);
+	});
+
+	it("does not treat network errors (ApiError 0) as auth failure", () => {
+		// Network errors normalise to status=0 in the api-client. They
+		// must keep retrying — only an explicit 401/403 from the
+		// server says the key is rejected.
+		const e = new ApiError({ status: 0, body: "", hint: "", isNetwork: true });
+		expect(isAuthFailure(e)).toBe(false);
+	});
+
+	it("does not treat null/undefined/strings as auth failure", () => {
+		expect(isAuthFailure(null)).toBe(false);
+		expect(isAuthFailure(undefined)).toBe(false);
+		expect(isAuthFailure("401")).toBe(false);
+		expect(isAuthFailure({ status: 401 })).toBe(false);
+	});
+});
+
+describe("daemon startup Agent lookup", () => {
+	async function withStartupCase(
+		fetchImpl: (request: Request) => Promise<Response>,
+		run: (fixture: {
+			abortController: AbortController;
+			requests: Request[];
+			logs: string[];
+			root: string;
+		}) => Promise<void>,
+	): Promise<void> {
+		const root = mkdtempSync(join(tmpdir(), "clawdi-daemon-startup-"));
+		const originalFetch = globalThis.fetch;
+		const originalStderrWrite = process.stderr.write;
+		const originalHome = process.env.CLAWDI_HOME;
+		const originalState = process.env.CLAWDI_STATE_DIR;
+		const originalApiUrl = process.env.CLAWDI_API_URL;
+		const originalAuthToken = process.env.CLAWDI_AUTH_TOKEN;
+		const originalAuthOrigin = process.env.CLAWDI_AUTH_TOKEN_ORIGIN;
+		const originalExitCode = process.exitCode;
+		const requests: Request[] = [];
+		const logs: string[] = [];
+		try {
+			process.env.CLAWDI_HOME = join(root, "home");
+			process.env.CLAWDI_STATE_DIR = join(root, "serve");
+			process.env.CLAWDI_API_URL = "https://cloud.example.test";
+			process.env.CLAWDI_AUTH_TOKEN = "clawdi_test_token";
+			process.env.CLAWDI_AUTH_TOKEN_ORIGIN = "https://cloud.example.test";
+			process.exitCode = 0;
+			globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+				const request = input instanceof Request ? input : new Request(input, init);
+				requests.push(request);
+				return fetchImpl(request);
+			}) as typeof fetch;
+			process.stderr.write = ((chunk: string | Uint8Array) => {
+				logs.push(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8"));
+				return true;
+			}) as typeof process.stderr.write;
+			await run({ abortController: new AbortController(), requests, logs, root });
+		} finally {
+			globalThis.fetch = originalFetch;
+			process.stderr.write = originalStderrWrite;
+			if (originalHome === undefined) delete process.env.CLAWDI_HOME;
+			else process.env.CLAWDI_HOME = originalHome;
+			if (originalState === undefined) delete process.env.CLAWDI_STATE_DIR;
+			else process.env.CLAWDI_STATE_DIR = originalState;
+			if (originalApiUrl === undefined) delete process.env.CLAWDI_API_URL;
+			else process.env.CLAWDI_API_URL = originalApiUrl;
+			if (originalAuthToken === undefined) delete process.env.CLAWDI_AUTH_TOKEN;
+			else process.env.CLAWDI_AUTH_TOKEN = originalAuthToken;
+			if (originalAuthOrigin === undefined) delete process.env.CLAWDI_AUTH_TOKEN_ORIGIN;
+			else process.env.CLAWDI_AUTH_TOKEN_ORIGIN = originalAuthOrigin;
+			process.exitCode = originalExitCode ?? 0;
+			rmSync(root, { recursive: true, force: true });
+		}
+	}
+
+	it("retains a preparing session while Skills and heartbeats progress, then recovers without restart", async () => {
+		let heartbeats = 0;
+		let skillDeleted = false;
+		let attempts = 0;
+		let resolved = false;
+		await withStartupCase(
+			async (request) => {
+				const path = new URL(request.url).pathname;
+				if (path.endsWith("sync-heartbeat")) {
+					heartbeats++;
+					return Response.json({ status: "ok" });
+				}
+				if (request.method === "DELETE") {
+					skillDeleted = true;
+					return Response.json({ status: "deleted" });
+				}
+				if (path === "/v1/agents/agent-isolated")
+					return Response.json({ id: "agent-isolated", default_project_id: "project-1" });
+				if (path.includes("/skills"))
+					return Response.json({ skills: [], revision: 1 }, { headers: { ETag: '"skills-1"' } });
+				return new Response("", { status: 404 });
+			},
+			async ({ abortController, root }) => {
+				const adapter: AgentAdapter = {
+					agentType: "codex",
+					detect: async () => true,
+					getVersion: async () => null,
+					sessions: {
+						contentProtocol: async () => {
+							attempts++;
+							if (!skillDeleted || !heartbeats) throw new Error("protocol temporarily unavailable");
+							return "snapshot-v1";
+						},
+						collect: async () => ({ sessions: [], coverage: "complete", dedupedCount: 0 }),
+						resolve: async () => {
+							resolved = true;
+							abortController.abort();
+							return null;
+						},
+						watchPaths: () => [],
+					},
+					skills: {
+						rootDir: () => root,
+						path: (key) => join(root, key),
+						sharedPath: (key) => join(root, key),
+						collect: async () => [],
+						listKeys: async () => [],
+						writeArchive: async () => {},
+						writeSharedArchive: async () => {},
+						remove: async () => {},
+					},
+				};
+				const queue = new RetryQueue({ agentType: "codex" });
+				queue.enqueue({
+					kind: "session_push",
+					local_session_id: "retained",
+					content_hash: "hash",
+					...sessionQueueFence(new ApiClient(), adapter, "retained", "agent-isolated"),
+					enqueued_at: new Date().toISOString(),
+					attempts: 0,
+				});
+				queue.enqueue({
+					kind: "skill_delete",
+					skill_key: "old",
+					agent_id: "agent-isolated",
+					project_id: "project-1",
+					enqueued_at: new Date().toISOString(),
+					attempts: 0,
+				});
+				await queue.flushPersist();
+				const deadline = setTimeout(() => abortController.abort(), 5000);
+				try {
+					await runSyncEngine({
+						environmentId: "agent-isolated",
+						adapter,
+						abort: abortController.signal,
+						abortController,
+						forcePollWatcher: true,
+					});
+					expect(skillDeleted).toBe(true);
+					expect(heartbeats).toBeGreaterThan(0);
+					expect(attempts).toBeGreaterThan(1);
+					expect(resolved).toBe(true);
+					const retained = new RetryQueue({ agentType: "codex" });
+					retained.load();
+					expect(retained.all()).toMatchObject([{ kind: "session_push", attempts: 0 }]);
+				} finally {
+					clearTimeout(deadline);
+					abortController.abort();
+				}
+			},
+		);
+	});
+
+	it("globally revokes auth during local preparation retry without consuming queued work", async () => {
+		let beats = 0;
+		await withStartupCase(
+			async (request) => {
+				if (new URL(request.url).pathname.endsWith("sync-heartbeat")) {
+					beats++;
+					return beats > 1
+						? new Response("revoked", { status: 401 })
+						: Response.json({ status: "ok" });
+				}
+				return Response.json({ id: "agent-retry", default_project_id: "project-1" });
+			},
+			async ({ abortController }) => {
+				const adapter: AgentAdapter = {
+					agentType: "pi",
+					detect: async () => true,
+					getVersion: async () => null,
+					sessions: {
+						contentProtocol: async () => {
+							throw new Error("retry protocol");
+						},
+						collect: async () => ({ sessions: [], coverage: "complete", dedupedCount: 0 }),
+						resolve: async () => null,
+						watchPaths: () => [],
+					},
+				};
+				const queue = new RetryQueue({ agentType: "pi" });
+				queue.enqueue({
+					kind: "session_push",
+					local_session_id: "retained",
+					content_hash: "hash",
+					...sessionQueueFence(new ApiClient(), adapter, "retained", "agent-retry"),
+					enqueued_at: new Date().toISOString(),
+					attempts: 0,
+				});
+				await queue.flushPersist();
+				const deadline = setTimeout(() => abortController.abort(), 2000);
+				try {
+					await runSyncEngine({
+						environmentId: "agent-retry",
+						adapter,
+						abort: abortController.signal,
+						abortController,
+						heartbeatIntervalMs: 10,
+					});
+					expect(process.exitCode).toBe(2);
+					const retained = new RetryQueue({ agentType: "pi" });
+					retained.load();
+					expect(retained.all()).toMatchObject([{ kind: "session_push", attempts: 0 }]);
+				} finally {
+					clearTimeout(deadline);
+					abortController.abort();
+				}
+			},
+		);
+	});
+
+	it("backfills a legacy registration only after the owning Agent lookup succeeds", async () => {
+		await withStartupCase(
+			async () => Response.json({ id: "agent-owned", default_project_id: "project-1" }),
+			async ({ abortController, requests, root }) => {
+				delete process.env.CLAWDI_AUTH_TOKEN;
+				delete process.env.CLAWDI_AUTH_TOKEN_ORIGIN;
+				setAuth({
+					apiKey: "account-a-key",
+					userId: "account-a",
+					endpointBinding: { version: 1, cloudApiOrigin: "https://cloud.example.test" },
+				});
+				const environmentsDir = join(root, "home", "environments");
+				mkdirSync(environmentsDir, { recursive: true });
+				const registrationPath = join(environmentsDir, "codex.json");
+				writeFileSync(
+					registrationPath,
+					`${JSON.stringify({ id: "agent-owned", agentType: "codex", machineId: "machine-a" })}\n`,
+				);
+				globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+					const request = input instanceof Request ? input : new Request(input, init);
+					requests.push(request);
+					abortController.abort();
+					return Response.json({ id: "agent-owned", default_project_id: "project-1" });
+				}) as typeof fetch;
+
+				await runSyncEngine({
+					environmentId: "agent-owned",
+					adapter: adapterRegistry.codex.create(),
+					abort: abortController.signal,
+					abortController,
+					forcePollWatcher: true,
+				});
+
+				expect(requests).toHaveLength(1);
+				expect(new URL(requests[0].url).pathname).toBe("/v1/agents/agent-owned");
+				expect(JSON.parse(readFileSync(registrationPath, "utf8"))).toMatchObject({
+					id: "agent-owned",
+					userId: "account-a",
+				});
+			},
+		);
+	});
+
+	it("self-stops when a legacy registration changes during ownership backfill", async () => {
+		await withStartupCase(
+			async () => Response.json({ id: "agent-old", default_project_id: "project-1" }),
+			async ({ abortController, requests, logs, root }) => {
+				delete process.env.CLAWDI_AUTH_TOKEN;
+				delete process.env.CLAWDI_AUTH_TOKEN_ORIGIN;
+				setAuth({
+					apiKey: "account-a-key",
+					userId: "account-a",
+					endpointBinding: { version: 1, cloudApiOrigin: "https://cloud.example.test" },
+				});
+				const environmentsDir = join(root, "home", "environments");
+				mkdirSync(environmentsDir, { recursive: true });
+				const registrationPath = join(environmentsDir, "codex.json");
+				writeFileSync(
+					registrationPath,
+					`${JSON.stringify({ id: "agent-old", agentType: "codex", machineId: "machine-a" })}\n`,
+				);
+				globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+					const request = input instanceof Request ? input : new Request(input, init);
+					requests.push(request);
+					writeFileSync(
+						registrationPath,
+						`${JSON.stringify({ id: "agent-new", agentType: "codex", machineId: "machine-a" })}\n`,
+					);
+					return Response.json({ id: "agent-old", default_project_id: "project-1" });
+				}) as typeof fetch;
+
+				await runSyncEngine({
+					environmentId: "agent-old",
+					adapter: adapterRegistry.codex.create(),
+					abort: abortController.signal,
+					abortController,
+					forcePollWatcher: true,
+				});
+
+				expect(requests).toHaveLength(1);
+				const registration = JSON.parse(readFileSync(registrationPath, "utf8"));
+				expect(registration).toMatchObject({ id: "agent-new" });
+				expect(Object.hasOwn(registration, "userId")).toBe(false);
+				expect(process.exitCode).toBe(2);
+				expect(abortController.signal.aborted).toBe(true);
+				expect(logs.join("")).toContain('"event":"engine.agent_disconnected"');
+				expect(logs.join("")).toContain("registration changed");
+			},
+		);
+	});
+
+	it("self-stops a stale engine whose local registration points at another Agent", async () => {
+		await withStartupCase(
+			async () => Response.json({ id: "agent-old", default_project_id: "project-1" }),
+			async ({ abortController, requests, logs, root }) => {
+				const environmentsDir = join(root, "home", "environments");
+				mkdirSync(environmentsDir, { recursive: true });
+				writeFileSync(
+					join(environmentsDir, "codex.json"),
+					`${JSON.stringify({ id: "agent-new", agentType: "codex", machineId: "machine-a" })}\n`,
+				);
+
+				await runSyncEngine({
+					environmentId: "agent-old",
+					adapter: adapterRegistry.codex.create(),
+					abort: abortController.signal,
+					abortController,
+					forcePollWatcher: true,
+				});
+
+				expect(requests).toHaveLength(1);
+				expect(new URL(requests[0].url).pathname).toBe("/v1/agents/agent-old");
+				expect(process.exitCode).toBe(2);
+				expect(abortController.signal.aborted).toBe(true);
+				expect(logs.join("")).toContain("registration changed");
+			},
+		);
+	});
+
+	it("maps the stable archived-Agent 403 to disconnected guidance and a no-restart stop", async () => {
+		await withStartupCase(
+			async () =>
+				new Response('{"detail":{"code":"agent_disconnected","message":"Agent is disconnected"}}', {
+					status: 403,
+					headers: { "content-type": "application/json" },
+				}),
+			async ({ abortController, requests, logs }) => {
+				await runSyncEngine({
+					environmentId: "agent-disconnected",
+					adapter: adapterRegistry.hermes.create(),
+					abort: abortController.signal,
+					abortController,
+					forcePollWatcher: true,
+				});
+
+				expect(requests).toHaveLength(1);
+				expect(new URL(requests[0].url).pathname).toBe("/v1/agents/agent-disconnected");
+				expect(process.exitCode).toBe(2);
+				expect(abortController.signal.aborted).toBe(true);
+				expect(logs.join("")).toContain('"level":"info","event":"engine.agent_disconnected"');
+				expect(logs.join("")).toContain("This installation is disconnected");
+				expect(logs.join("")).toContain("retained data");
+				expect(logs.join("")).not.toContain('"event":"engine.auth_failed"');
+			},
+		);
+	});
+
+	it("maps a heartbeat agent_rebound to the disconnected self-stop path", async () => {
+		await withStartupCase(
+			async () =>
+				new Response('{"detail":{"code":"agent_rebound","message":"Agent moved"}}', {
+					status: 403,
+					headers: { "content-type": "application/json" },
+				}),
+			async ({ abortController, logs, requests }) => {
+				const opts = {
+					environmentId: "agent-rebound",
+					adapter: adapterRegistry.pi.create(),
+					abort: abortController.signal,
+					abortController,
+					forcePollWatcher: true,
+				};
+				await heartbeatLoop(
+					opts,
+					new ApiClient({ requireAuth: false, abortSignal: abortController.signal }),
+					new RetryQueue({ agentType: "pi" }),
+					abortController.signal,
+					() => ({ last_revision_seen: null, last_sync_error: null }),
+					(hint) => stopForDisconnectedAgent(opts, hint),
+				);
+
+				expect(requests).toHaveLength(1);
+				expect(new URL(requests[0].url).pathname).toBe("/v1/agents/agent-rebound/sync-heartbeat");
+				expect(process.exitCode).toBe(2);
+				expect(abortController.signal.aborted).toBe(true);
+				expect(logs.join("")).toContain('"event":"engine.agent_disconnected"');
+				expect(logs.join("")).not.toContain('"event":"engine.auth_failed"');
+			},
+		);
+	});
+
+	it("keeps an ambiguous 404 on a safe legacy-compatible stop path", async () => {
+		await withStartupCase(
+			async () => new Response('{"detail":"Agent not found"}', { status: 404 }),
+			async ({ abortController, requests, logs, root }) => {
+				const environmentsDir = join(root, "home", "environments");
+				mkdirSync(environmentsDir, { recursive: true });
+				const registrationPath = join(environmentsDir, "hermes.json");
+				const registration = `${JSON.stringify({
+					id: "agent-disconnected",
+					agentType: "hermes",
+					machineId: "machine-old",
+				})}\n`;
+				writeFileSync(registrationPath, registration);
+				await runSyncEngine({
+					environmentId: "agent-disconnected",
+					adapter: adapterRegistry.hermes.create(),
+					abort: abortController.signal,
+					abortController,
+					forcePollWatcher: true,
+				});
+
+				expect(requests).toHaveLength(1);
+				expect(new URL(requests[0].url).pathname).toBe("/v1/agents/agent-disconnected");
+				expect(readFileSync(registrationPath, "utf8")).toBe(registration);
+				expect(process.exitCode).toBe(2);
+				expect(abortController.signal.aborted).toBe(true);
+				expect(logs.join("")).toContain('"level":"info","event":"engine.agent_disconnected"');
+				expect(logs.join("")).toContain("Agent was not found");
+				expect(logs.join("")).not.toContain("retained data");
+				expect(logs.join("")).not.toContain('"level":"error","event":"engine.agent_disconnected"');
+			},
+		);
+	});
+
+	it("keeps an unrelated 403 on the established auth-failure stop path", async () => {
+		await withStartupCase(
+			async () =>
+				new Response('{"detail":"Forbidden"}', {
+					status: 403,
+					headers: { "content-type": "application/json" },
+				}),
+			async ({ abortController, logs }) => {
+				await runSyncEngine({
+					environmentId: "agent-forbidden",
+					adapter: adapterRegistry.hermes.create(),
+					abort: abortController.signal,
+					abortController,
+					forcePollWatcher: true,
+				});
+
+				expect(process.exitCode).toBe(2);
+				expect(abortController.signal.aborted).toBe(true);
+				expect(logs.join("")).toContain('"level":"error","event":"engine.auth_failed"');
+				expect(logs.join("")).not.toContain('"event":"engine.agent_disconnected"');
+			},
+		);
+	});
+
+	it("keeps server failures on the ordinary retry and fatal path", async () => {
+		await withStartupCase(
+			async () => new Response("offline", { status: 503 }),
+			async ({ abortController, requests }) => {
+				await expect(
+					runSyncEngine({
+						environmentId: "agent-offline",
+						adapter: adapterRegistry.hermes.create(),
+						abort: abortController.signal,
+						abortController,
+						forcePollWatcher: true,
+					}),
+				).rejects.toThrow(/503/);
+
+				expect(requests).toHaveLength(3);
+				expect(
+					requests.every((request) => new URL(request.url).pathname === "/v1/agents/agent-offline"),
+				).toBe(true);
+				expect(process.exitCode).toBe(0);
+				expect(abortController.signal.aborted).toBe(false);
+			},
+		);
+	});
+
+	it("keeps network failures on the ordinary retry and fatal path", async () => {
+		await withStartupCase(
+			async () => {
+				throw new TypeError("fetch failed");
+			},
+			async ({ abortController, requests }) => {
+				await expect(
+					runSyncEngine({
+						environmentId: "agent-network-offline",
+						adapter: adapterRegistry.hermes.create(),
+						abort: abortController.signal,
+						abortController,
+						forcePollWatcher: true,
+					}),
+				).rejects.toMatchObject({ status: 0, isNetwork: true });
+
+				expect(requests).toHaveLength(3);
+				expect(process.exitCode).toBe(0);
+				expect(abortController.signal.aborted).toBe(false);
+			},
+		);
+	});
+});
+
+describe("live-sync transient failure classification", () => {
+	it("keeps unrelated unresolved errors after transport and resource successes", () => {
+		const health = new SyncHealth();
+		health.set("projection", "skill:broken", "skill projection evidence: disk busy");
+		health.set("transport", "sse", "sse_disconnect:http_502");
+		health.set("push", "session:healthy", "session upload failed");
+		health.set("transport", "auth", "auth_revoked: rejected");
+
+		expect(health.project()).toBe("auth_revoked: rejected");
+		health.clear("transport", "auth");
+
+		health.clear("transport", "sse");
+		expect(health.project()).toBe("skill projection evidence: disk busy");
+
+		health.clear("push", "session:healthy");
+		expect(health.project()).toBe("skill projection evidence: disk busy");
+
+		health.clear("projection", "skill:broken");
+		health.set("push", "skill:foo", "permanent: upload rejected");
+		health.setIfAbsent("push", "skill:foo", "skill foo push was not applied", true);
+		expect(health.project()).toBe("permanent: upload rejected");
+		health.set("push", "skill_scan:foo", "skill foo scan failed");
+		health.clear("push", "skill_scan:foo");
+		expect(health.project()).toBe("permanent: upload rejected");
+		health.set("push", "skills_scan", "periodic skills scan failed");
+		health.clear("push", "skills_scan");
+		expect(health.project()).toBe("permanent: upload rejected");
+		health.clear("push", "skill:foo");
+		health.setIfAbsent("push", "skill:foo", "skill foo push was not applied", true);
+		expect(health.project()).toBe("skill foo push was not applied");
+		health.clearTransient("push", "skill:foo");
+		health.set("push", "session:deleted", "deleted session failed permanently");
+		health.set("push", "session:present", "present session still failing");
+		health.clearAbsent("push", "session:", new Set(["session:present"]));
+		expect(health.project()).toBe("present session still failing");
+
+		health.clear("push", "session:present");
+		expect(health.project()).toBeNull();
+	});
+
+	it("does not surface transient SSE reconnects as last_sync_error", () => {
+		expect(
+			lastSyncErrorForSseReconnect({
+				reason: "http_502",
+				classification: "transient",
+			}),
+		).toBeNull();
+	});
+
+	it("surfaces sustained SSE reconnects as last_sync_error", () => {
+		expect(
+			lastSyncErrorForSseReconnect({
+				reason: "http_502",
+				classification: "sustained",
+			}),
+		).toBe("sse_disconnect:http_502");
+	});
+
+	it("classifies early heartbeat failures as transient and repeated failures as sustained", () => {
+		expect(classifyHeartbeatFailure(1)).toBe("transient");
+		expect(classifyHeartbeatFailure(3)).toBe("transient");
+		expect(classifyHeartbeatFailure(4)).toBe("sustained");
+	});
+
+	it("retires only the explicit terminal stale-observation protocol code", () => {
+		expect(
+			isSafelyTerminalRuntimeObservationFailure({
+				response: { status: 422 },
+				error: {
+					detail: { code: "runtime_observation_captured_at_too_old" },
+				},
+			}),
+		).toBe(true);
+		for (const [status, code] of [
+			[409, "runtime_observation_identity_conflict"],
+			[409, "runtime_observation_event_conflict"],
+			[422, "runtime_observation_captured_at_in_future"],
+			[422, "runtime_observation_identity_conflict"],
+		] as const) {
+			expect(
+				isSafelyTerminalRuntimeObservationFailure({
+					response: { status },
+					error: { detail: { code } },
+				}),
+			).toBe(false);
+		}
+	});
+});
+
+describe("reconcileDelayMs", () => {
+	it("renews the Connected capability lease inside its ten-minute freshness window", () => {
+		expect(reconcileDelayMs(() => 0)).toBe(240_000);
+		expect(reconcileDelayMs(() => 0.5)).toBe(300_000);
+		expect(reconcileDelayMs(() => 1)).toBe(360_000);
+		expect(reconcileDelayMs(() => 1)).toBeLessThan(10 * 60_000);
+	});
+
+	it("keeps Legacy V1 and Hosted V2 deployments off the Connected lease path", () => {
+		expect(connectedProjectSkillDeliveryEnabled("hosted")).toBe(false);
+		expect(connectedProjectSkillDeliveryEnabled(" HOSTED ")).toBe(false);
+		expect(connectedProjectSkillDeliveryEnabled("local")).toBe(true);
+		expect(connectedProjectSkillDeliveryEnabled(undefined)).toBe(true);
+	});
+});
+
+describe("daemon control-plane cadences", () => {
+	it("keeps heartbeat jitter inside the dashboard freshness window", () => {
+		expect(heartbeatDelayMs(() => 0)).toBe(45_000);
+		expect(heartbeatDelayMs(() => 0.5)).toBe(60_000);
+		expect(heartbeatDelayMs(() => 1)).toBe(75_000);
+	});
+
+	it("keeps project refresh off the heartbeat cadence", () => {
+		expect(projectRefreshDelayMs(() => 0)).toBe(240_000);
+		expect(projectRefreshDelayMs(() => 0.5)).toBe(300_000);
+		expect(projectRefreshDelayMs(() => 1)).toBe(360_000);
+	});
+});
+
+describe("resolveOwningSkillKey — dotfile component rejection", () => {
+	// Prod observed 728 `engine.queue_drop_permanent` 422 events
+	// in the codex daemon log post-#66 deploy. gstack ships its
+	// own bundled sub-skills FOR OTHER AGENTS at paths like
+	// `~/.codex/skills/gstack/.agents/skills/<sub>/SKILL.md`.
+	// fs.watch fires for those, the resolver greedily returned
+	// the deepest SKILL.md match, and server's
+	// SKILL_KEY_PATTERN rejected with 422 (every component must
+	// start with [A-Za-z0-9]).
+	//
+	// The fix returns null on any path with a dotfile-prefixed
+	// component. NOT walk-up to outer skill — that would convert
+	// 422s into 413 cascades because the outer `gstack` folder
+	// is the 1 GB monster that already trips the 25 MB upload
+	// cap. The companion fix in lib/tar.ts excludes those
+	// dotfile subtrees from the OUTER skill's tarball so it
+	// stays under the cap.
+
+	let tmp: string;
+	beforeEach(() => {
+		tmp = mkdtempSync(join(tmpdir(), "skill-key-resolve-"));
+	});
+	afterEach(() => {
+		rmSync(tmp, { recursive: true, force: true });
+	});
+
+	function makeSkillMd(...segments: string[]) {
+		const dir = join(tmp, ...segments);
+		mkdirSync(dir, { recursive: true });
+		writeFileSync(join(dir, "SKILL.md"), "---\nname: x\n---\n");
+	}
+
+	it("returns null when ANY path component starts with a dot (gstack shape)", () => {
+		makeSkillMd("gstack");
+		makeSkillMd("gstack", ".agents", "skills", "gstack-autoplan");
+
+		// fs.watch fires on the deep nested file; resolver MUST
+		// NOT enqueue. Pre-fix this returned
+		// `gstack/.agents/skills/gstack-autoplan` and 422'd.
+		expect(resolveOwningSkillKey(tmp, "gstack/.agents/skills/gstack-autoplan")).toBeNull();
+	});
+
+	it("returns null even when the dotfile is at the leaf (.../foo/.cache/x)", () => {
+		makeSkillMd("foo");
+		mkdirSync(join(tmp, "foo", ".cache", "x"), { recursive: true });
+		expect(resolveOwningSkillKey(tmp, "foo/.cache/x")).toBeNull();
+	});
+
+	it("returns the deepest valid skill_key for nested layouts (Hermes)", () => {
+		// `category/foo/SKILL.md` exists but no dotfile in path.
+		// Resolver returns the deepest match.
+		makeSkillMd("category", "foo");
+		expect(resolveOwningSkillKey(tmp, "category/foo")).toBe("category/foo");
+		expect(resolveOwningSkillKey(tmp, "category/foo/references")).toBe("category/foo");
+	});
+
+	it("returns the top-level dir for flat layouts (Claude Code / Codex)", () => {
+		makeSkillMd("autoplan");
+		expect(resolveOwningSkillKey(tmp, "autoplan")).toBe("autoplan");
+		expect(resolveOwningSkillKey(tmp, "autoplan/references/pattern.md")).toBe("autoplan");
+	});
+
+	it("returns null for a path with no SKILL.md ancestor", () => {
+		expect(resolveOwningSkillKey(tmp, "no-skill-here")).toBeNull();
+		expect(resolveOwningSkillKey(tmp, "deep/nested/no-skill")).toBeNull();
+	});
+});
+
+describe("filterValidSkillKeysForSync", () => {
+	it("drops adapter-listed keys the backend would reject", () => {
+		expect(
+			filterValidSkillKeysForSync(
+				["valid-skill", ".system", "category/nested", "category/.cache/sub", "team/download"],
+				{ logSkipped: false },
+			),
+		).toEqual(["valid-skill", "category/nested"]);
+	});
+});
+
+describe("resolveOwningSkillKey — Windows path separator", () => {
+	// Codex flagged: on Windows, watcher.ts builds pathFromRoot
+	// via path.join() → backslash-separated. A `/`-only split
+	// missed dotfile components like `gstack\.agents\...`,
+	// re-enabling the 422 spam this fix is meant to stop. The
+	// resolver now splits on both `/` and `\`.
+	let tmp: string;
+	beforeEach(() => {
+		tmp = mkdtempSync(join(tmpdir(), "skill-key-resolve-win-"));
+	});
+	afterEach(() => {
+		rmSync(tmp, { recursive: true, force: true });
+	});
+
+	it("rejects backslash-separated paths with dotfile components", () => {
+		// Synthetic Windows-style input. Resolver doesn't actually
+		// touch the filesystem for the dotfile check, so we don't
+		// need a real backslash-named directory on macOS — the
+		// rejection happens before any fs access.
+		expect(resolveOwningSkillKey(tmp, "gstack\\.agents\\skills\\gstack-autoplan")).toBeNull();
+	});
+
+	it("rejects mixed-separator paths with dotfile components", () => {
+		// Windows clients can produce mixed separators (e.g.
+		// path.join joining a path that already had `/`).
+		expect(resolveOwningSkillKey(tmp, "gstack/.agents\\skills/foo")).toBeNull();
+	});
+});
+
+describe("isOversizedUploadError", () => {
+	// The drain loop branches on this to demote oversize drops from
+	// `error` to `warn` (no heartbeat poison). Misclassifying a 400
+	// validation error as oversized would silently swallow real bugs.
+	it("treats ApiError(413) as oversized", () => {
+		expect(isOversizedUploadError(new ApiError({ status: 413, body: "", hint: "" }))).toBe(true);
+	});
+
+	it("treats pre-flight 'Skill tarball exceeds' as oversized", () => {
+		expect(isOversizedUploadError(new Error("Skill tarball exceeds 26214400 bytes"))).toBe(true);
+	});
+
+	it("does not treat other 4xx as oversized", () => {
+		for (const status of [400, 404, 422]) {
+			expect(isOversizedUploadError(new ApiError({ status, body: "", hint: "" }))).toBe(false);
+		}
+	});
+
+	it("does not treat unrelated Errors as oversized", () => {
+		expect(isOversizedUploadError(new Error("symlink(s) pointing outside"))).toBe(false);
+		expect(isOversizedUploadError(new Error("boom"))).toBe(false);
+	});
+});

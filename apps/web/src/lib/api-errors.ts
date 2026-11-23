@@ -1,0 +1,163 @@
+import { toast } from "sonner";
+import { ACCOUNT_SUSPENDED_CODE } from "@/lib/account-suspension";
+
+/**
+ * Cloud-api (`useApi` / openapi-fetch) error model + normalization.
+ *
+ * The cloud-api backend raises FastAPI `HTTPException`s whose body is
+ * `{ "detail": "<message-or-code>" }`. `ApiError` captures the status + parsed
+ * detail; `ApiNetworkError` covers transport failures (offline / our own
+ * client-side timeout abort). `normalizeApiError` turns either into a single,
+ * user-facing sentence — hiding raw 5xx/gateway internals and reading a 401 as
+ * "sign in again" — mirroring the hosted billing surfaces' error handling.
+ */
+
+export class ApiError extends Error {
+	constructor(
+		public status: number,
+		public detail: string,
+		public code: string | null = null,
+	) {
+		super(`API ${status}: ${detail}`);
+		this.name = "ApiError";
+	}
+}
+
+/**
+ * Transport-level failure: the request never produced an HTTP response (the
+ * network is down, DNS failed, the host is unreachable, or our client-side
+ * timeout aborted it). Distinct from `ApiError` (which always carries a real
+ * status) so the UI can offer a "check your connection / try again" path
+ * instead of a raw status message.
+ */
+export class ApiNetworkError extends Error {
+	constructor(
+		public readonly kind: "timeout" | "offline",
+		options?: { cause?: unknown },
+	) {
+		super(kind === "timeout" ? "API request timed out" : "API request failed");
+		this.name = "ApiNetworkError";
+		if (options?.cause !== undefined) this.cause = options.cause;
+	}
+}
+
+export function parseApiDetail(detail: string): unknown {
+	try {
+		const body = JSON.parse(detail) as { detail?: unknown };
+		return body.detail ?? body;
+	} catch {
+		return detail;
+	}
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null;
+}
+
+export function apiErrorCode(value: unknown): string | null {
+	if (!isRecord(value)) return null;
+	if (typeof value.code === "string") return value.code;
+	return isRecord(value.detail) && typeof value.detail.code === "string" ? value.detail.code : null;
+}
+
+/**
+ * The single "we do not know what happened" sentence in the app. Shared by
+ * `formatApiError`'s terminal fallback and `normalizeApiError`'s unknown-error
+ * arm so there is exactly one such string, not two that can drift apart.
+ */
+const GENERIC_ERROR_COPY = "Something went wrong. Please try again.";
+
+/**
+ * Turn a cloud-api `detail` into displayable text.
+ *
+ * Probe order, and why: a `message` key wins, so surfaces that deliberately
+ * send prose (`{error, message}` — sharing, membership) are unaffected. Then a
+ * STRING `code` key, returned BARE on purpose: `normalizeApiError` already owns
+ * what a bare code such as `billing_required` becomes as customer copy, and
+ * duplicating that here would give the two entry points different copy for the
+ * same body.
+ *
+ * Terminal guarantee (W-04 / WR-05 / UI-REVIEW blocker 1): for an
+ * object-shaped detail this function NEVER returns its input verbatim. Phase 03
+ * made FastAPI's `detail` an object (`{"code": "billing_required"}`), and the
+ * old `return detail` handed that raw JSON to `ApiErrorPanel` as customer copy
+ * on the very screen a billing-locked user is sent to in order to pay. No
+ * backend payload shape — present or future — can become customer copy here.
+ */
+export function formatApiError(detail: string): string {
+	const parsed = parseApiDetail(detail);
+	if (typeof parsed === "string") return parsed;
+	if (typeof parsed === "object" && parsed !== null) {
+		const message = (parsed as { message?: unknown }).message;
+		if (typeof message === "string") return message;
+		const code = (parsed as { code?: unknown }).code;
+		if (typeof code === "string") return code;
+	}
+	return GENERIC_ERROR_COPY;
+}
+
+/** Auth expired / invalid token mid-session (401). Needs re-auth, not a retry. */
+export function isApiAuthError(error: unknown): boolean {
+	return error instanceof ApiError && error.status === 401;
+}
+
+export function isAccountSuspendedError(error: unknown): boolean {
+	return error instanceof ApiError && error.status === 401 && error.code === ACCOUNT_SUSPENDED_CODE;
+}
+
+/** True not-found from the API. Transport failures must not collapse to 404 UI. */
+export function isApiNotFoundError(error: unknown): boolean {
+	return error instanceof ApiError && error.status === 404;
+}
+
+/** Backend fault (5xx) or rate-limit (429) — transient; safe to retry. */
+export function isApiServerError(error: unknown): boolean {
+	return error instanceof ApiError && (error.status >= 500 || error.status === 429);
+}
+
+/** True when the request never reached the server (offline / DNS / timeout). */
+export function isApiNetworkError(error: unknown): boolean {
+	return error instanceof ApiNetworkError;
+}
+
+/**
+ * Turn a cloud-api error into a single user-facing sentence. Hides backend
+ * internals (raw 5xx/gateway bodies), reads a 401 as a re-auth prompt, and
+ * hides internal error codes while passing user-facing sentences through.
+ */
+export function normalizeApiError(error: unknown): string {
+	if (error instanceof ApiNetworkError) {
+		return error.kind === "timeout"
+			? "This is taking longer than usual. Check your connection and try again."
+			: "We couldn't reach the service. Check your connection and try again.";
+	}
+	if (error instanceof ApiError) {
+		if (isAccountSuspendedError(error)) {
+			return "Your account has been deactivated and can no longer access iforge.";
+		}
+		if (error.status === 401) {
+			return "Your session has expired. Please sign in again to continue.";
+		}
+		if (error.status >= 500 || error.status === 429) {
+			return "The service is having trouble right now. Please try again in a moment.";
+		}
+		const message = formatApiError(error.detail);
+		// A bare snake_case token is an internal code, not product copy.
+		if (/^[a-z0-9_]+$/.test(message)) {
+			return "The request could not be completed. Review the details and try again.";
+		}
+		return message;
+	}
+	return GENERIC_ERROR_COPY;
+}
+
+/**
+ * Mutation `onError` handler for cloud-api (`useApi`) hooks: toast `title` with
+ * the normalized, internal-free error copy as the description.
+ */
+export function toastApiError(title: string) {
+	return (error: unknown) => {
+		if (isAccountSuspendedError(error)) return;
+		toast.error(title, { description: normalizeApiError(error) });
+	};
+}

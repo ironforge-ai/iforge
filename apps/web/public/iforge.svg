@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  iforge brand mark. THE authored source.
+
+  Every shipped raster in this repository is generated from this one file by
+  scripts/generate-brand-assets.sh. It serves all six shipped asset paths: the
+  multi-size favicon container, the shipped vector favicon, the Apple touch
+  icon, both PWA rasters, and the in-app logo rendered in the sidebar, on the
+  redeem gate, and on the public share page.
+
+  Promoted from brand/candidates/monogram.svg, selected by a human at the
+  blocking decision gate on 2026-09-10 (plan 03.3-12). The geometry is a
+  lowercase i standing on a base bar, knocked out of a solid rounded plate.
+
+  Authored from scratch for iforge. Not traced from, derived from, or
+  recoloured from any pre-existing artwork (MIGR-04).
+
+  Three renderer constraints, each of which fails SILENTLY on this host and
+  each of which was measured rather than assumed (plan 03.3-12):
+
+  1. Colour lives in exactly one place, the fill attribute on the root element.
+     Do not switch it to currentColor. The rasteriser available here is
+     ImageMagick's internal MSVG fallback, since rsvg-convert is absent, and it
+     renders currentColor as a fully transparent canvas with no error at all.
+     Light accent #c96442, dark accent #d97757.
+  2. fill-rule="evenodd" is declared explicitly and must survive any
+     minification. MSVG ignores subpath winding under the nonzero default, so
+     without it the counters of the i and the plate knockouts fill solid and
+     the letterform disappears.
+  3. This comment contains no double hyphen. A double hyphen inside an XML
+     comment is ill-formed XML and MSVG discards the ENTIRE document, which
+     would generate six blank assets with no error anywhere.
+-->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512" fill="#c96442" role="img" aria-label="iforge">
+  <path fill-rule="evenodd" d="M144 52 L368 52 C418.81 52 460 93.19 460 144 L460 368 C460 418.81 418.81 460 368 460 L144 460 C93.19 460 52 418.81 52 368 L52 144 C52 93.19 93.19 52 144 52 Z M214 106 L298 106 L298 190 L214 190 Z M214 230 L298 230 L298 366 L360 366 L360 406 L152 406 L152 366 L214 366 Z"/>
+</svg>

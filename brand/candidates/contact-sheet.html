@@ -1,0 +1,154 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>iforge brand mark candidates</title>
+<style>
+:root {
+  --accent-light: #c96442;
+  --accent-dark: #d97757;
+  --ground-light: #fafaf8;
+  --ground-dark: #11100f;
+  --neutral-light: #1f1e1a;
+  --neutral-dark: #e5e4e2;
+  --border-light: #e2e1de;
+  --border-dark: #282825;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  padding: 40px 32px 96px;
+  background: var(--ground-light);
+  color: var(--neutral-light);
+  font: 400 14px/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+h1 { font-size: 20px; font-weight: 600; letter-spacing: -0.01em; margin: 0 0 8px; }
+h2 { font-size: 18px; font-weight: 600; letter-spacing: -0.01em; margin: 0 0 6px; }
+h3 { font-size: 12px; font-weight: 500; margin: 0 0 16px; }
+p  { margin: 0 0 10px; max-width: 68ch; }
+code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
+.meta { color: #676661; }
+.intro { border-bottom: 1px solid var(--border-light); padding-bottom: 24px; margin-bottom: 8px; }
+.intro ol { max-width: 68ch; padding-left: 20px; }
+.intro li { margin-bottom: 6px; }
+.sources { padding-left: 20px; }
+
+section.candidate {
+  border-top: 1px solid var(--border-light);
+  padding-top: 32px;
+  margin-top: 40px;
+}
+.grounds { display: flex; flex-wrap: wrap; gap: 24px; margin-top: 24px; }
+.ground {
+  flex: 1 1 460px;
+  border: 1px solid var(--border-light);
+  border-radius: 10px;
+  padding: 20px;
+}
+.ground.light { background: var(--ground-light); }
+.ground.dark  { background: var(--ground-dark); border-color: var(--border-dark); color: var(--neutral-dark); }
+.ground.dark h3 { color: #8a8985; }
+
+.row { margin-bottom: 28px; }
+.row:last-child { margin-bottom: 0; }
+.rowlabel {
+  display: block;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+  letter-spacing: 0.02em;
+  color: #676661;
+  margin-bottom: 12px;
+}
+.ground.dark .rowlabel { color: #8a8985; }
+.swatches { display: flex; align-items: flex-end; gap: 24px; flex-wrap: wrap; }
+.swatch { display: flex; flex-direction: column; align-items: center; gap: 8px; }
+.swatch .cap {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 10px;
+  color: #676661;
+}
+.ground.dark .swatch .cap { color: #8a8985; }
+.mark { display: block; }
+.mask {
+  -webkit-mask-repeat: no-repeat; mask-repeat: no-repeat;
+  -webkit-mask-position: center;  mask-position: center;
+  -webkit-mask-size: contain;     mask-size: contain;
+}
+
+.maskable { margin-top: 28px; }
+.maskframe {
+  position: relative;
+  width: 512px; height: 512px;
+  background: var(--ground-light);
+  border: 1px solid var(--border-light);
+  border-radius: 10px;
+}
+.maskframe img { display: block; width: 512px; height: 512px; }
+.safe {
+  position: absolute;
+  top: 50%; left: 50%;
+  width: 79.883%; height: 79.883%;
+  transform: translate(-50%, -50%);
+  pointer-events: none;
+}
+.safe.circle { border: 2px dashed #c96442; border-radius: 50%; }
+.safe.square { border: 1px solid #67666199; }
+.legend { margin-top: 10px; }
+
+.inapp { margin-top: 24px; }
+.inapp .box {
+  display: flex; align-items: center; justify-content: center;
+  border: 1px dashed #67666166; border-radius: 8px;
+}
+</style>
+</head>
+<body>
+<div class="intro">
+<h1>iforge brand mark candidates</h1>
+<p>Three concepts. Exactly one ships, and everything downstream is blocked on the choice: six generated asset files, the manifest theme colour, the newly wired SVG favicon and three in-app logo sites, one of which is a public unauthenticated share page.</p>
+<p><strong>Judge at 16px first.</strong> It is the binding constraint. Every other size forgives more than it does.</p>
+<ol>
+<li>Does it still read as itself in the 16px column?</li>
+<li>Does it hold on the dark ground as well as the light one?</li>
+<li>Does it survive with the colour taken away, in the neutral rows?</li>
+<li>Does anything cross the 409px safe circle in the maskable panel?</li>
+</ol>
+<p class="meta">Every swatch references the candidate file by relative path; nothing here is an inlined copy, so this sheet cannot drift from the sources. The recoloured rows use the same file as a CSS alpha mask, which is what "one file inverts" means in practice.</p>
+<p class="meta">Sources:</p>
+<ul class="sources meta"><li><code>brand/candidates/monogram.svg</code></li>
+<li><code>brand/candidates/geometric.svg</code></li>
+<li><code>brand/candidates/wordmark.svg</code></li>
+<li><code>brand/candidates/wordmark-monogram.svg</code></li></ul>
+</div>
+<section class="candidate">
+<h2>A. Monogram</h2>
+<p>A lowercase i standing on a base bar, knocked out of a solid rounded plate. The plate carries the mass, so what survives at 16px is a filled tile with a letter cut into it rather than a thin letter floating on nothing.</p>
+<p class="meta"><code>brand/candidates/monogram.svg</code> &middot; sizes below are px square</p>
+<div class="grounds"><div class="ground light"><h3>LIGHT GROUND</h3><div class="row"><span class="rowlabel">accent #c96442 / on light ground #fafaf8 / the file rendered as it ships</span><div class="swatches"><div class="swatch"><img class="mark" src="monogram.svg" alt="" style="width:16px;height:16px"><span class="cap">16</span></div><div class="swatch"><img class="mark" src="monogram.svg" alt="" style="width:32px;height:32px"><span class="cap">32</span></div><div class="swatch"><img class="mark" src="monogram.svg" alt="" style="width:180px;height:180px"><span class="cap">180</span></div><div class="swatch"><img class="mark" src="monogram.svg" alt="" style="width:512px;height:512px"><span class="cap">512</span></div></div></div><div class="row"><span class="rowlabel">neutral #1f1e1a / on light ground / same file, recoloured through an alpha mask</span><div class="swatches"><div class="swatch"><div class="mark mask" style="width:16px;height:16px;background-color:#1f1e1a;-webkit-mask-image:url('monogram.svg');mask-image:url('monogram.svg')"></div><span class="cap">16</span></div><div class="swatch"><div class="mark mask" style="width:32px;height:32px;background-color:#1f1e1a;-webkit-mask-image:url('monogram.svg');mask-image:url('monogram.svg')"></div><span class="cap">32</span></div><div class="swatch"><div class="mark mask" style="width:180px;height:180px;background-color:#1f1e1a;-webkit-mask-image:url('monogram.svg');mask-image:url('monogram.svg')"></div><span class="cap">180</span></div><div class="swatch"><div class="mark mask" style="width:512px;height:512px;background-color:#1f1e1a;-webkit-mask-image:url('monogram.svg');mask-image:url('monogram.svg')"></div><span class="cap">512</span></div></div></div></div><div class="ground dark"><h3>DARK GROUND</h3><div class="row"><span class="rowlabel">accent #d97757 / on dark ground #11100f / same file, dark-mode accent</span><div class="swatches"><div class="swatch"><div class="mark mask" style="width:16px;height:16px;background-color:#d97757;-webkit-mask-image:url('monogram.svg');mask-image:url('monogram.svg')"></div><span class="cap">16</span></div><div class="swatch"><div class="mark mask" style="width:32px;height:32px;background-color:#d97757;-webkit-mask-image:url('monogram.svg');mask-image:url('monogram.svg')"></div><span class="cap">32</span></div><div class="swatch"><div class="mark mask" style="width:180px;height:180px;background-color:#d97757;-webkit-mask-image:url('monogram.svg');mask-image:url('monogram.svg')"></div><span class="cap">180</span></div><div class="swatch"><div class="mark mask" style="width:512px;height:512px;background-color:#d97757;-webkit-mask-image:url('monogram.svg');mask-image:url('monogram.svg')"></div><span class="cap">512</span></div></div></div><div class="row"><span class="rowlabel">neutral #e5e4e2 / on dark ground / monochrome survival, inverted</span><div class="swatches"><div class="swatch"><div class="mark mask" style="width:16px;height:16px;background-color:#e5e4e2;-webkit-mask-image:url('monogram.svg');mask-image:url('monogram.svg')"></div><span class="cap">16</span></div><div class="swatch"><div class="mark mask" style="width:32px;height:32px;background-color:#e5e4e2;-webkit-mask-image:url('monogram.svg');mask-image:url('monogram.svg')"></div><span class="cap">32</span></div><div class="swatch"><div class="mark mask" style="width:180px;height:180px;background-color:#e5e4e2;-webkit-mask-image:url('monogram.svg');mask-image:url('monogram.svg')"></div><span class="cap">180</span></div><div class="swatch"><div class="mark mask" style="width:512px;height:512px;background-color:#e5e4e2;-webkit-mask-image:url('monogram.svg');mask-image:url('monogram.svg')"></div><span class="cap">512</span></div></div></div></div></div>
+<div class="maskable"><h3>MASKABLE SAFE ZONE / 512px render with the centred 409px safe circle over it</h3><div class="maskframe"><img src="monogram.svg" alt=""><div class="safe square"></div><div class="safe circle"></div></div><p class="meta legend">Dashed circle and solid square are both 409px: 80% of the 512px canvas. Nothing in the mark may cross either. A launcher that applies a circular mask keeps only what is inside the circle.</p></div>
+</section>
+<section class="candidate">
+<h2>B. Geometric</h2>
+<p>An anvil cut down to two solid masses: a face tapering left into a horn, and a body flaring to a foot. No letterform anywhere. The waisted anvil was drawn first and rejected because at 16px a thin waist between two bars reads as a serif capital I.</p>
+<p class="meta"><code>brand/candidates/geometric.svg</code> &middot; sizes below are px square</p>
+<div class="grounds"><div class="ground light"><h3>LIGHT GROUND</h3><div class="row"><span class="rowlabel">accent #c96442 / on light ground #fafaf8 / the file rendered as it ships</span><div class="swatches"><div class="swatch"><img class="mark" src="geometric.svg" alt="" style="width:16px;height:16px"><span class="cap">16</span></div><div class="swatch"><img class="mark" src="geometric.svg" alt="" style="width:32px;height:32px"><span class="cap">32</span></div><div class="swatch"><img class="mark" src="geometric.svg" alt="" style="width:180px;height:180px"><span class="cap">180</span></div><div class="swatch"><img class="mark" src="geometric.svg" alt="" style="width:512px;height:512px"><span class="cap">512</span></div></div></div><div class="row"><span class="rowlabel">neutral #1f1e1a / on light ground / same file, recoloured through an alpha mask</span><div class="swatches"><div class="swatch"><div class="mark mask" style="width:16px;height:16px;background-color:#1f1e1a;-webkit-mask-image:url('geometric.svg');mask-image:url('geometric.svg')"></div><span class="cap">16</span></div><div class="swatch"><div class="mark mask" style="width:32px;height:32px;background-color:#1f1e1a;-webkit-mask-image:url('geometric.svg');mask-image:url('geometric.svg')"></div><span class="cap">32</span></div><div class="swatch"><div class="mark mask" style="width:180px;height:180px;background-color:#1f1e1a;-webkit-mask-image:url('geometric.svg');mask-image:url('geometric.svg')"></div><span class="cap">180</span></div><div class="swatch"><div class="mark mask" style="width:512px;height:512px;background-color:#1f1e1a;-webkit-mask-image:url('geometric.svg');mask-image:url('geometric.svg')"></div><span class="cap">512</span></div></div></div></div><div class="ground dark"><h3>DARK GROUND</h3><div class="row"><span class="rowlabel">accent #d97757 / on dark ground #11100f / same file, dark-mode accent</span><div class="swatches"><div class="swatch"><div class="mark mask" style="width:16px;height:16px;background-color:#d97757;-webkit-mask-image:url('geometric.svg');mask-image:url('geometric.svg')"></div><span class="cap">16</span></div><div class="swatch"><div class="mark mask" style="width:32px;height:32px;background-color:#d97757;-webkit-mask-image:url('geometric.svg');mask-image:url('geometric.svg')"></div><span class="cap">32</span></div><div class="swatch"><div class="mark mask" style="width:180px;height:180px;background-color:#d97757;-webkit-mask-image:url('geometric.svg');mask-image:url('geometric.svg')"></div><span class="cap">180</span></div><div class="swatch"><div class="mark mask" style="width:512px;height:512px;background-color:#d97757;-webkit-mask-image:url('geometric.svg');mask-image:url('geometric.svg')"></div><span class="cap">512</span></div></div></div><div class="row"><span class="rowlabel">neutral #e5e4e2 / on dark ground / monochrome survival, inverted</span><div class="swatches"><div class="swatch"><div class="mark mask" style="width:16px;height:16px;background-color:#e5e4e2;-webkit-mask-image:url('geometric.svg');mask-image:url('geometric.svg')"></div><span class="cap">16</span></div><div class="swatch"><div class="mark mask" style="width:32px;height:32px;background-color:#e5e4e2;-webkit-mask-image:url('geometric.svg');mask-image:url('geometric.svg')"></div><span class="cap">32</span></div><div class="swatch"><div class="mark mask" style="width:180px;height:180px;background-color:#e5e4e2;-webkit-mask-image:url('geometric.svg');mask-image:url('geometric.svg')"></div><span class="cap">180</span></div><div class="swatch"><div class="mark mask" style="width:512px;height:512px;background-color:#e5e4e2;-webkit-mask-image:url('geometric.svg');mask-image:url('geometric.svg')"></div><span class="cap">512</span></div></div></div></div></div>
+<div class="maskable"><h3>MASKABLE SAFE ZONE / 512px render with the centred 409px safe circle over it</h3><div class="maskframe"><img src="geometric.svg" alt=""><div class="safe square"></div><div class="safe circle"></div></div><p class="meta legend">Dashed circle and solid square are both 409px: 80% of the 512px canvas. Nothing in the mark may cross either. A launcher that applies a circular mask keeps only what is inside the circle.</p></div>
+</section>
+<section class="candidate">
+<h2>C1. Wordmark (in-app logo half of the pairing)</h2>
+<p>The full name in a squared geometric alphabet drawn as outlines, so it needs no font file. Sized by WIDTH below, not height. This half never goes in a square icon slot.</p>
+<p class="meta"><code>brand/candidates/wordmark.svg</code> &middot; sizes below are px wide</p>
+<div class="grounds"><div class="ground light"><h3>LIGHT GROUND</h3><div class="row"><span class="rowlabel">accent #c96442 / on light ground #fafaf8 / the file rendered as it ships</span><div class="swatches"><div class="swatch"><img class="mark" src="wordmark.svg" alt="" style="width:16px;height:auto"><span class="cap">16w</span></div><div class="swatch"><img class="mark" src="wordmark.svg" alt="" style="width:32px;height:auto"><span class="cap">32w</span></div><div class="swatch"><img class="mark" src="wordmark.svg" alt="" style="width:180px;height:auto"><span class="cap">180w</span></div><div class="swatch"><img class="mark" src="wordmark.svg" alt="" style="width:512px;height:auto"><span class="cap">512w</span></div></div></div><div class="row"><span class="rowlabel">neutral #1f1e1a / on light ground / same file, recoloured through an alpha mask</span><div class="swatches"><div class="swatch"><div class="mark mask" style="width:16px;height:6px;background-color:#1f1e1a;-webkit-mask-image:url('wordmark.svg');mask-image:url('wordmark.svg')"></div><span class="cap">16</span></div><div class="swatch"><div class="mark mask" style="width:32px;height:12px;background-color:#1f1e1a;-webkit-mask-image:url('wordmark.svg');mask-image:url('wordmark.svg')"></div><span class="cap">32</span></div><div class="swatch"><div class="mark mask" style="width:180px;height:68px;background-color:#1f1e1a;-webkit-mask-image:url('wordmark.svg');mask-image:url('wordmark.svg')"></div><span class="cap">180</span></div><div class="swatch"><div class="mark mask" style="width:512px;height:193px;background-color:#1f1e1a;-webkit-mask-image:url('wordmark.svg');mask-image:url('wordmark.svg')"></div><span class="cap">512</span></div></div></div></div><div class="ground dark"><h3>DARK GROUND</h3><div class="row"><span class="rowlabel">accent #d97757 / on dark ground #11100f / same file, dark-mode accent</span><div class="swatches"><div class="swatch"><div class="mark mask" style="width:16px;height:6px;background-color:#d97757;-webkit-mask-image:url('wordmark.svg');mask-image:url('wordmark.svg')"></div><span class="cap">16</span></div><div class="swatch"><div class="mark mask" style="width:32px;height:12px;background-color:#d97757;-webkit-mask-image:url('wordmark.svg');mask-image:url('wordmark.svg')"></div><span class="cap">32</span></div><div class="swatch"><div class="mark mask" style="width:180px;height:68px;background-color:#d97757;-webkit-mask-image:url('wordmark.svg');mask-image:url('wordmark.svg')"></div><span class="cap">180</span></div><div class="swatch"><div class="mark mask" style="width:512px;height:193px;background-color:#d97757;-webkit-mask-image:url('wordmark.svg');mask-image:url('wordmark.svg')"></div><span class="cap">512</span></div></div></div><div class="row"><span class="rowlabel">neutral #e5e4e2 / on dark ground / monochrome survival, inverted</span><div class="swatches"><div class="swatch"><div class="mark mask" style="width:16px;height:6px;background-color:#e5e4e2;-webkit-mask-image:url('wordmark.svg');mask-image:url('wordmark.svg')"></div><span class="cap">16</span></div><div class="swatch"><div class="mark mask" style="width:32px;height:12px;background-color:#e5e4e2;-webkit-mask-image:url('wordmark.svg');mask-image:url('wordmark.svg')"></div><span class="cap">32</span></div><div class="swatch"><div class="mark mask" style="width:180px;height:68px;background-color:#e5e4e2;-webkit-mask-image:url('wordmark.svg');mask-image:url('wordmark.svg')"></div><span class="cap">180</span></div><div class="swatch"><div class="mark mask" style="width:512px;height:193px;background-color:#e5e4e2;-webkit-mask-image:url('wordmark.svg');mask-image:url('wordmark.svg')"></div><span class="cap">512</span></div></div></div></div></div>
+<div class="maskable inapp"><h3>THE THREE REAL IN-APP RENDER BOXES / 36px sidebar, 40px redeem page, 28px public share header</h3><div class="swatches"><div class="swatch"><div class="box" style="width:28px;height:28px"><img class="mark" src="wordmark.svg" alt="" style="width:28px;height:auto"></div><span class="cap">28px box</span></div><div class="swatch"><div class="box" style="width:36px;height:36px"><img class="mark" src="wordmark.svg" alt="" style="width:36px;height:auto"></div><span class="cap">36px box</span></div><div class="swatch"><div class="box" style="width:40px;height:40px"><img class="mark" src="wordmark.svg" alt="" style="width:40px;height:auto"></div><span class="cap">40px box</span></div></div><p class="meta legend">Those three boxes are SQUARE in the code today (size-9, size-10, size-7). A horizontal wordmark dropped into a square box is what you are looking at: at 36px wide the x-height is about 6px. Choosing this option means the three call sites need wider boxes, and plan 03.3-13 is currently written to leave those boxes untouched.</p></div>
+</section>
+<section class="candidate">
+<h2>C2. Companion monogram (icon half of the pairing)</h2>
+<p>A squared F for forge in the same construction as the wordmark. The wordmark already carries the i, and a lone lowercase i at 16px is a bar and a dot that says nothing, so the icon half takes the forge initial instead.</p>
+<p class="meta"><code>brand/candidates/wordmark-monogram.svg</code> &middot; sizes below are px square</p>
+<div class="grounds"><div class="ground light"><h3>LIGHT GROUND</h3><div class="row"><span class="rowlabel">accent #c96442 / on light ground #fafaf8 / the file rendered as it ships</span><div class="swatches"><div class="swatch"><img class="mark" src="wordmark-monogram.svg" alt="" style="width:16px;height:16px"><span class="cap">16</span></div><div class="swatch"><img class="mark" src="wordmark-monogram.svg" alt="" style="width:32px;height:32px"><span class="cap">32</span></div><div class="swatch"><img class="mark" src="wordmark-monogram.svg" alt="" style="width:180px;height:180px"><span class="cap">180</span></div><div class="swatch"><img class="mark" src="wordmark-monogram.svg" alt="" style="width:512px;height:512px"><span class="cap">512</span></div></div></div><div class="row"><span class="rowlabel">neutral #1f1e1a / on light ground / same file, recoloured through an alpha mask</span><div class="swatches"><div class="swatch"><div class="mark mask" style="width:16px;height:16px;background-color:#1f1e1a;-webkit-mask-image:url('wordmark-monogram.svg');mask-image:url('wordmark-monogram.svg')"></div><span class="cap">16</span></div><div class="swatch"><div class="mark mask" style="width:32px;height:32px;background-color:#1f1e1a;-webkit-mask-image:url('wordmark-monogram.svg');mask-image:url('wordmark-monogram.svg')"></div><span class="cap">32</span></div><div class="swatch"><div class="mark mask" style="width:180px;height:180px;background-color:#1f1e1a;-webkit-mask-image:url('wordmark-monogram.svg');mask-image:url('wordmark-monogram.svg')"></div><span class="cap">180</span></div><div class="swatch"><div class="mark mask" style="width:512px;height:512px;background-color:#1f1e1a;-webkit-mask-image:url('wordmark-monogram.svg');mask-image:url('wordmark-monogram.svg')"></div><span class="cap">512</span></div></div></div></div><div class="ground dark"><h3>DARK GROUND</h3><div class="row"><span class="rowlabel">accent #d97757 / on dark ground #11100f / same file, dark-mode accent</span><div class="swatches"><div class="swatch"><div class="mark mask" style="width:16px;height:16px;background-color:#d97757;-webkit-mask-image:url('wordmark-monogram.svg');mask-image:url('wordmark-monogram.svg')"></div><span class="cap">16</span></div><div class="swatch"><div class="mark mask" style="width:32px;height:32px;background-color:#d97757;-webkit-mask-image:url('wordmark-monogram.svg');mask-image:url('wordmark-monogram.svg')"></div><span class="cap">32</span></div><div class="swatch"><div class="mark mask" style="width:180px;height:180px;background-color:#d97757;-webkit-mask-image:url('wordmark-monogram.svg');mask-image:url('wordmark-monogram.svg')"></div><span class="cap">180</span></div><div class="swatch"><div class="mark mask" style="width:512px;height:512px;background-color:#d97757;-webkit-mask-image:url('wordmark-monogram.svg');mask-image:url('wordmark-monogram.svg')"></div><span class="cap">512</span></div></div></div><div class="row"><span class="rowlabel">neutral #e5e4e2 / on dark ground / monochrome survival, inverted</span><div class="swatches"><div class="swatch"><div class="mark mask" style="width:16px;height:16px;background-color:#e5e4e2;-webkit-mask-image:url('wordmark-monogram.svg');mask-image:url('wordmark-monogram.svg')"></div><span class="cap">16</span></div><div class="swatch"><div class="mark mask" style="width:32px;height:32px;background-color:#e5e4e2;-webkit-mask-image:url('wordmark-monogram.svg');mask-image:url('wordmark-monogram.svg')"></div><span class="cap">32</span></div><div class="swatch"><div class="mark mask" style="width:180px;height:180px;background-color:#e5e4e2;-webkit-mask-image:url('wordmark-monogram.svg');mask-image:url('wordmark-monogram.svg')"></div><span class="cap">180</span></div><div class="swatch"><div class="mark mask" style="width:512px;height:512px;background-color:#e5e4e2;-webkit-mask-image:url('wordmark-monogram.svg');mask-image:url('wordmark-monogram.svg')"></div><span class="cap">512</span></div></div></div></div></div>
+<div class="maskable"><h3>MASKABLE SAFE ZONE / 512px render with the centred 409px safe circle over it</h3><div class="maskframe"><img src="wordmark-monogram.svg" alt=""><div class="safe square"></div><div class="safe circle"></div></div><p class="meta legend">Dashed circle and solid square are both 409px: 80% of the 512px canvas. Nothing in the mark may cross either. A launcher that applies a circular mask keeps only what is inside the circle.</p></div>
+</section>
+
+</body>
+</html>

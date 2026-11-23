@@ -1,0 +1,177 @@
+import { describe, expect, it } from "bun:test";
+import {
+	agentResourceScope,
+	connectorDetailHrefForScope,
+	connectorDetailLink,
+	LIBRARY_RESOURCE_SCOPE,
+	legacyAgentResourceScope,
+	memoryDetailHrefForScope,
+	memoryDetailLink,
+	projectDetailHrefForScope,
+	projectDetailLink,
+	resourceCatalogReturnTarget,
+	resourceCollectionTarget,
+	validateResourceDetailSearch,
+	vaultDetailHrefForScope,
+	vaultDetailLink,
+} from "./resource-navigation";
+
+describe("resource navigation scopes", () => {
+	it("preserves catalog search without allowing a return link to grant Agent access", () => {
+		const from = "/agents/agent-1/vaults?q=release%26keys&project=workspace-1";
+		expect(
+			resourceCatalogReturnTarget("/agents/agent-1/project-access/workspace-1/vaults?q=keys"),
+		).toEqual({
+			href: "/agents/agent-1/project-access/workspace-1/vaults?q=keys",
+			label: "Agent Vaults",
+		});
+		expect(resourceCatalogReturnTarget(from)).toEqual({ href: from, label: "Agent Vaults" });
+		expect(resourceCatalogReturnTarget("/projects/project-1?tab=vaults&q=release")).toEqual({
+			href: "/projects/project-1?tab=vaults&q=release",
+			label: "Project",
+		});
+		expect(vaultDetailLink(LIBRARY_RESOURCE_SCOPE, "release", "vault-1", from)).toMatchObject({
+			to: "/vaults/$slug",
+			search: { vault: "vault-1", from },
+		});
+		for (const invalid of [
+			undefined,
+			[],
+			"https://example.com",
+			"//example.com",
+			"/agents/../settings",
+			"/agents/agent-1/settings",
+			"/projects\\evil",
+			"/projects\n",
+		]) {
+			expect(resourceCatalogReturnTarget(invalid)).toBeNull();
+		}
+	});
+
+	it("keeps library detail and collection navigation global", () => {
+		expect(resourceCollectionTarget(LIBRARY_RESOURCE_SCOPE, "projects")).toEqual({
+			href: "/projects",
+			label: "Projects",
+		});
+		expect(projectDetailHrefForScope(LIBRARY_RESOURCE_SCOPE, "project 1")).toBe(
+			"/projects/project%201",
+		);
+		expect(vaultDetailHrefForScope(LIBRARY_RESOURCE_SCOPE, "prod keys", "vault/1")).toBe(
+			"/vaults/prod%20keys?vault=vault%2F1",
+		);
+		expect(memoryDetailHrefForScope(LIBRARY_RESOURCE_SCOPE, "memory 1")).toBe(
+			"/memories/memory%201",
+		);
+		expect(connectorDetailHrefForScope(LIBRARY_RESOURCE_SCOPE, "google drive")).toBe(
+			"/connectors/google%20drive",
+		);
+		expect(resourceCollectionTarget(LIBRARY_RESOURCE_SCOPE, "memories")).toEqual({
+			href: "/memories",
+			label: "Memories",
+		});
+		expect(resourceCollectionTarget(LIBRARY_RESOURCE_SCOPE, "connectors")).toEqual({
+			href: "/connectors",
+			label: "Connectors",
+		});
+		expect(projectDetailLink(LIBRARY_RESOURCE_SCOPE, "project 1")).toMatchObject({
+			to: "/projects/$id",
+			params: { id: "project 1" },
+		});
+		expect(memoryDetailLink(LIBRARY_RESOURCE_SCOPE, "memory 1")).toMatchObject({
+			to: "/memories/$id",
+			params: { id: "memory 1" },
+		});
+		expect(connectorDetailLink(LIBRARY_RESOURCE_SCOPE, "google drive")).toMatchObject({
+			to: "/connectors/$name",
+			params: { name: "google drive" },
+		});
+	});
+
+	it("builds clean nested Agent navigation with explicit flat Vault state", () => {
+		const scope = agentResourceScope("agent 1", "project 1");
+
+		expect(resourceCollectionTarget(scope, "projects")).toEqual({
+			href: "/agents/agent%201/project-access",
+			label: "Projects",
+		});
+		expect(projectDetailHrefForScope(scope, "project 1")).toBe(
+			"/agents/agent%201/project-access/project%201",
+		);
+		expect(vaultDetailHrefForScope(scope, "prod keys", "vault/1")).toBe(
+			"/agents/agent%201/vaults/prod%20keys?project=project%201&vault=vault%2F1",
+		);
+		expect(resourceCollectionTarget(scope, "vaults")).toEqual({
+			href: "/agents/agent%201/project-access/project%201/vaults",
+			label: "Vaults",
+		});
+		expect(resourceCollectionTarget(scope, "memories")).toEqual({
+			href: "/agents/agent%201/memories",
+			label: "Memories",
+		});
+		expect(resourceCollectionTarget(scope, "connectors")).toEqual({
+			href: "/agents/agent%201/connectors",
+			label: "Connectors",
+		});
+		expect(memoryDetailHrefForScope(scope, "memory 1")).toBe(
+			"/agents/agent%201/memories/memory%201",
+		);
+		expect(connectorDetailHrefForScope(scope, "google drive")).toBe(
+			"/agents/agent%201/connectors/google%20drive",
+		);
+		expect(projectDetailLink(scope, "project 1")).toMatchObject({
+			to: "/agents/$id/project-access/$projectId",
+			params: { id: "agent 1", projectId: "project 1" },
+		});
+		expect(projectDetailLink(scope, "project 1")).not.toHaveProperty("search");
+		expect(vaultDetailLink(scope, "prod keys", "vault/1")).toMatchObject({
+			to: "/agents/$id/vaults/$slug",
+			params: { id: "agent 1", slug: "prod keys" },
+			search: {
+				project: "project 1",
+				vault: "vault/1",
+			},
+		});
+		expect(memoryDetailLink(scope, "memory 1")).toMatchObject({
+			to: "/agents/$id/memories/$memoryId",
+			params: { id: "agent 1", memoryId: "memory 1" },
+		});
+		expect(memoryDetailLink(scope, "memory 1")).not.toHaveProperty("search");
+		expect(connectorDetailLink(scope, "google drive")).toMatchObject({
+			to: "/agents/$id/connectors/$name",
+			params: { id: "agent 1", name: "google drive" },
+		});
+		expect(connectorDetailLink(scope, "google drive")).not.toHaveProperty("search");
+	});
+
+	it("ignores obsolete Hosted identity fields on legacy resource-return links", () => {
+		expect(
+			legacyAgentResourceScope(
+				{
+					from: "agent-vaults",
+					agent: "agent 1",
+					agentSource: "on-clawdi",
+					agentDeployment: "deployment 1",
+				},
+				"vaults",
+			),
+		).toEqual({
+			kind: "agent",
+			agentId: "agent 1",
+		});
+		expect(
+			legacyAgentResourceScope({ from: "agent-vaults", agent: "agent 1" }, "projects"),
+		).toBeNull();
+		expect(legacyAgentResourceScope({ from: "agent-projects" }, "projects")).toBeNull();
+	});
+
+	it("validates resource query strings at the route boundary", () => {
+		expect(
+			validateResourceDetailSearch({
+				vault: "vault 1",
+				joined: 42,
+				from: ["agent-vaults"],
+				future: "kept",
+			}),
+		).toEqual({ vault: "vault 1", future: "kept" });
+	});
+});

@@ -1,0 +1,298 @@
+name: Client CI
+
+on:
+  pull_request:
+    paths:
+      - "apps/web/**"
+      - "packages/shared/**"
+      - "packages/cli/**"
+      - "packages/whatsapp-baileys-sidecar/**"
+      - "backend/app/routes/channel_routers/whatsapp.py"
+      - "backend/app/services/whatsapp_*.py"
+      - "backend/pyproject.toml"
+      - "backend/uv.lock"
+      - "install.sh"
+      - "scripts/test-managed-whatsapp-native-e2e.sh"
+      - "scripts/filter-deploy-openapi.py"
+      - "scripts/openapi-typescript.sh"
+      - "scripts/generate-deploy-api.sh"
+      - "scripts/check-deploy-generated-api.sh"
+      - "package.json"
+      - "bun.lock"
+      - "patches/libsignal@6.0.0.patch"
+      - "turbo.json"
+      - "tsconfig.base.json"
+      - "biome.json"
+      - ".github/actions/setup-bun-ci/**"
+      - ".github/workflows/client-ci.yml"
+  push:
+    branches: [main]
+    paths:
+      - "apps/web/**"
+      - "packages/shared/**"
+      - "packages/cli/**"
+      - "packages/whatsapp-baileys-sidecar/**"
+      - "backend/app/routes/channel_routers/whatsapp.py"
+      - "backend/app/services/whatsapp_*.py"
+      - "backend/pyproject.toml"
+      - "backend/uv.lock"
+      - "install.sh"
+      - "scripts/test-managed-whatsapp-native-e2e.sh"
+      - "scripts/filter-deploy-openapi.py"
+      - "scripts/openapi-typescript.sh"
+      - "scripts/generate-deploy-api.sh"
+      - "scripts/check-deploy-generated-api.sh"
+      - "package.json"
+      - "bun.lock"
+      - "patches/libsignal@6.0.0.patch"
+      - "turbo.json"
+      - "tsconfig.base.json"
+      - "biome.json"
+      - ".github/actions/setup-bun-ci/**"
+      - ".github/workflows/client-ci.yml"
+  schedule:
+    - cron: "17 6 * * *"
+
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: client-ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  BUN_VERSION: "1.3.14"
+  DOCKER_BUILD_RECORD_UPLOAD: "false"
+  TURBO_TELEMETRY_DISABLED: "1"
+
+jobs:
+  changes:
+    if: github.event_name != 'schedule'
+    runs-on: ${{ vars.CI_RUNNER || 'blacksmith-16vcpu-ubuntu-2404' }}
+    outputs:
+      client: ${{ steps.filter.outputs.client }}
+      deploy_contract: ${{ steps.filter.outputs.deploy_contract }}
+      whatsapp_native_e2e: ${{ steps.filter.outputs.whatsapp_native_e2e }}
+    steps:
+      - uses: actions/checkout@v7
+      - id: filter
+        uses: dorny/paths-filter@v4
+        with:
+          filters: |
+            client:
+              - "apps/web/**"
+              - "packages/shared/**"
+              - "packages/cli/**"
+              - "packages/whatsapp-baileys-sidecar/**"
+              - "install.sh"
+              - "package.json"
+              - "bun.lock"
+              - "patches/libsignal@6.0.0.patch"
+              - "turbo.json"
+              - "tsconfig.base.json"
+              - "biome.json"
+              - ".github/actions/setup-bun-ci/**"
+              - ".github/workflows/client-ci.yml"
+            deploy_contract:
+              - "packages/shared/src/api/deploy.generated.ts"
+              - "scripts/filter-deploy-openapi.py"
+              - "scripts/openapi-typescript.sh"
+              - "scripts/generate-deploy-api.sh"
+              - "scripts/check-deploy-generated-api.sh"
+              - "apps/web/package.json"
+              - ".github/workflows/client-ci.yml"
+            # Account-health and pairing-link behavior stays in Backend CI. This
+            # stock-runtime boundary follows the protocol modules imported by the
+            # harness, CLI runtime behavior, and every dependency input installed
+            # into the filtered CLI workspace.
+            whatsapp_native_e2e:
+              - "backend/app/services/whatsapp_baileys.py"
+              - "backend/app/services/whatsapp_noise.py"
+              - "backend/app/services/whatsapp_runtime_types.py"
+              - "backend/app/services/whatsapp_wabinary_tokens.py"
+              - "packages/cli/egress-addon/**"
+              - "packages/cli/package.json"
+              - "packages/cli/src/runtime/channels.ts"
+              - "packages/cli/src/runtime/egress-*.ts"
+              - "packages/cli/src/runtime/managed-baileys-compat.ts"
+              - "packages/cli/src/runtime/manifest.ts"
+              - "packages/cli/src/runtime/transparent-egress.ts"
+              - "packages/cli/src/runtime/whatsapp-*.ts"
+              - "packages/cli/tests/fixtures/managed-whatsapp-native-e2e/**"
+              - "packages/shared/package.json"
+              - "scripts/test-managed-whatsapp-native-e2e.sh"
+              - ".dockerignore"
+              - "package.json"
+              - "bun.lock"
+              - "patches/libsignal@6.0.0.patch"
+              - ".github/workflows/client-ci.yml"
+
+  # Lint, typecheck, build, and client package tests in one job.
+  #
+  # The consolidated gate intentionally verifies all four client packages.
+  # One change signal therefore describes the work this job actually performs.
+  verify:
+    needs: changes
+    if: >-
+      github.event_name != 'schedule' &&
+      needs.changes.outputs.client == 'true'
+    runs-on: ${{ vars.CI_RUNNER || 'blacksmith-16vcpu-ubuntu-2404' }}
+    timeout-minutes: 20
+    env:
+      # Required for web typecheck/build — CI doesn't need real values
+      VITE_CLERK_PUBLISHABLE_KEY: pk_test_dummy
+      VITE_IFORGE_API_URL: http://localhost:8000
+      CLERK_SECRET_KEY: sk_test_dummy
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup-bun-ci
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+      - name: Biome check
+        run: bun run check
+      - name: Typecheck and build
+        run: >-
+          bunx turbo typecheck build
+          --filter=web --filter=@iforge/cli --filter=@clawdi/shared
+          --filter=@clawdi/whatsapp-baileys-sidecar
+          --output-logs=errors-only
+      # Smoke tests exercise the compiled bin wrapper, built above by Turbo.
+      - name: Build native CLI
+        run: bun run --cwd packages/cli build:native
+      - name: Smoke native CLI
+        run: |
+          sh -n install.sh
+          packages/cli/dist-native/linux-x64/iforge --version
+          bun run --cwd packages/cli test:native-linux-lifecycle:internal
+      - name: Validate CLI publish payload
+        run: bun run --cwd packages/cli check:publish-manifest
+      - name: Test client packages
+        run: |
+          bun run --cwd apps/web test:internal
+          bun run --cwd packages/shared test:internal
+          bun run --cwd packages/whatsapp-baileys-sidecar test:internal
+          bun run --cwd packages/cli test:internal
+
+  deploy-contract-drift:
+    needs: changes
+    if: >-
+      github.event_name != 'schedule' &&
+      needs.changes.outputs.deploy_contract == 'true'
+    runs-on: ${{ vars.CI_RUNNER || 'blacksmith-16vcpu-ubuntu-2404' }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup-bun-ci
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+      - name: Hosted deploy contract matches live spec
+        env:
+          DEPLOY_OPENAPI_SOURCE: https://api.iforge.dev/openapi.json
+          DEPLOY_CONTRACT_FETCH_MODE: warn
+        run: scripts/check-deploy-generated-api.sh
+
+  web-e2e:
+    needs: changes
+    if: >-
+      github.event_name != 'schedule' &&
+      needs.changes.outputs.client == 'true'
+    runs-on: ${{ vars.CI_RUNNER || 'blacksmith-16vcpu-ubuntu-2404' }}
+    timeout-minutes: 25
+    env:
+      VITE_CLERK_PUBLISHABLE_KEY: pk_test_dummy
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup-bun-ci
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+      - name: Install Chromium for Playwright
+        # Run from apps/web so bunx resolves the workspace-pinned playwright.
+        # At the repo root the bin is absent and bunx silently downloads the
+        # latest release, installing browsers the pinned @playwright/test
+        # version then can't find.
+        working-directory: apps/web
+        run: bunx playwright install --with-deps chromium
+      - name: OSS web e2e
+        run: bun run --cwd apps/web e2e
+
+  whatsapp-native-e2e:
+    needs: changes
+    # Keep the required check name stable. A backend-only PR gets a successful
+    # skipped job, while the daily schedule catches pinned upstream/runtime drift.
+    if: >-
+      always() &&
+      (github.event_name == 'schedule' ||
+      needs.changes.outputs.whatsapp_native_e2e == 'true')
+    runs-on: ${{ vars.CI_RUNNER || 'blacksmith-16vcpu-ubuntu-2404' }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - name: Check Docker availability
+        run: docker version
+      - name: Restore pinned upstream artifacts
+        id: upstream-artifacts
+        uses: actions/cache/restore@v5
+        with:
+          path: ${{ runner.temp }}/managed-whatsapp-native-e2e-artifacts
+          key: managed-whatsapp-native-e2e-artifacts-v1-${{ hashFiles('packages/cli/tests/fixtures/managed-whatsapp-native-e2e/versions.env') }}
+      - name: Fetch and verify pinned upstream artifacts
+        env:
+          E2E_ARTIFACT_DIR: ${{ runner.temp }}/managed-whatsapp-native-e2e-artifacts
+          GITHUB_TOKEN: ${{ github.token }}
+        run: scripts/test-managed-whatsapp-native-e2e.sh --fetch-only
+      - name: Save pinned upstream artifacts
+        if: steps.upstream-artifacts.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v5
+        with:
+          path: ${{ runner.temp }}/managed-whatsapp-native-e2e-artifacts
+          key: managed-whatsapp-native-e2e-artifacts-v1-${{ hashFiles('packages/cli/tests/fixtures/managed-whatsapp-native-e2e/versions.env') }}
+      - uses: docker/setup-buildx-action@v4
+      - name: Build stock OpenClaw WhatsApp E2E image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: packages/cli/tests/fixtures/managed-whatsapp-native-e2e/Dockerfile
+          target: openclaw
+          tags: iforge-managed-whatsapp-native-e2e:openclaw-local
+          load: true
+          build-contexts: |
+            e2e_artifacts=${{ runner.temp }}/managed-whatsapp-native-e2e-artifacts
+          cache-from: type=gha,scope=managed-whatsapp-native-e2e-openclaw
+          cache-to: type=gha,mode=max,scope=managed-whatsapp-native-e2e-openclaw
+      - name: Build stock Hermes WhatsApp E2E image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: packages/cli/tests/fixtures/managed-whatsapp-native-e2e/Dockerfile
+          target: hermes
+          tags: iforge-managed-whatsapp-native-e2e:hermes-local
+          load: true
+          build-contexts: |
+            e2e_artifacts=${{ runner.temp }}/managed-whatsapp-native-e2e-artifacts
+          cache-from: type=gha,scope=managed-whatsapp-native-e2e-hermes
+          cache-to: type=gha,mode=max,scope=managed-whatsapp-native-e2e-hermes
+      - name: Test stock OpenClaw and Hermes WhatsApp plugins
+        run: scripts/test-managed-whatsapp-native-e2e.sh --run-only
+      - name: Remove loaded E2E images
+        if: always()
+        run: >-
+          docker image rm
+          iforge-managed-whatsapp-native-e2e:openclaw-local
+          iforge-managed-whatsapp-native-e2e:hermes-local
+          2>/dev/null || true
+
+  deploy-contract-drift-daily:
+    if: github.event_name == 'schedule'
+    runs-on: ${{ vars.CI_RUNNER || 'blacksmith-16vcpu-ubuntu-2404' }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup-bun-ci
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+      - name: Hosted deploy contract matches live spec (strict)
+        env:
+          DEPLOY_OPENAPI_SOURCE: https://api.iforge.dev/openapi.json
+          DEPLOY_CONTRACT_FETCH_MODE: strict
+        run: scripts/check-deploy-generated-api.sh

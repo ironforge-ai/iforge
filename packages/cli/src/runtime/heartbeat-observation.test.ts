@@ -1,0 +1,508 @@
+import { afterEach, describe, expect, test } from "bun:test";
+import { createHash } from "node:crypto";
+import {
+	existsSync,
+	mkdirSync,
+	mkdtempSync,
+	readdirSync,
+	readFileSync,
+	rmSync,
+	statSync,
+	writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { basename, dirname, join } from "node:path";
+import { type RuntimeAppliedStateV2, writeRuntimeAppliedState } from "./applied-state";
+import {
+	HostedRuntimeHeartbeatSession,
+	runtimeHeartbeatObservationStatePath,
+} from "./heartbeat-observation";
+import { readHostedRuntimeObserved } from "./observed";
+import { getRuntimePaths, type RuntimePaths } from "./paths";
+
+const originalEnv = { ...process.env };
+const originalDateNow = Date.now;
+const originalMathRandom = Math.random;
+const roots: string[] = [];
+
+afterEach(() => {
+	process.env = { ...originalEnv };
+	Date.now = originalDateNow;
+	Math.random = originalMathRandom;
+	for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
+});
+
+function tempRuntimePaths(): RuntimePaths {
+	const root = mkdtempSync(join(tmpdir(), "clawdi-runtime-heartbeat-"));
+	roots.push(root);
+	process.env.CLAWDI_SERVICE_STATE_DIR = join(root, "state");
+	process.env.CLAWDI_RUN_DIR = join(root, "run");
+	process.env.CLAWDI_RUNTIME_HOME = join(root, "home");
+	const paths = getRuntimePaths({ mode: "hosted" });
+	mkdirSync(paths.serviceStateRoot);
+	return paths;
+}
+
+function legacyAppliedState(generation: number): RuntimeAppliedStateV2 {
+	const sourceRevision = (generation === 8 ? "d" : "c").repeat(64);
+	return {
+		schemaVersion: "clawdi.runtimeAppliedState.v2",
+		appliedAt: `2026-07-16T00:00:0${generation}.000Z`,
+		instanceId: "hri_heartbeat",
+		etag: `"sha256:${sourceRevision}"`,
+		sourceRevision,
+		generation,
+		contentIdentity: {
+			sourcePath: "https://runtime.test/v1/runtime/manifest",
+			sha256: (generation === 8 ? "b" : "a").repeat(64),
+		},
+		activated: {},
+		providerIds: ["managed"],
+		projectedProviderIds: { openclaw: ["managed"] },
+	};
+}
+
+function companionAppliedState(generation: number): RuntimeAppliedStateV2 {
+	return {
+		...legacyAppliedState(generation),
+		manifestETag: `"frozen-manifest-${generation}"`,
+		applyReceiptId: `apply-receipt-000${generation}`,
+		bootNonce: `boot-nonce-00000${generation}`,
+	};
+}
+
+function idSequence(values: string[]): () => string {
+	let index = 0;
+	return () => {
+		const value = values[index];
+		if (value === undefined) throw new Error("test ID sequence exhausted");
+		index += 1;
+		return value;
+	};
+}
+
+function clockSequence(values: string[]): () => Date {
+	let index = 0;
+	return () => {
+		const value = values[index];
+		if (value === undefined) throw new Error("test clock sequence exhausted");
+		index += 1;
+		return new Date(value);
+	};
+}
+
+function blockAtomicWrite(path: string): () => void {
+	const timestamp = 1_721_177_296_000;
+	const random = 0.5;
+	Date.now = () => timestamp;
+	Math.random = () => random;
+	const temporaryPath = join(
+		dirname(path),
+		`.${basename(path)}.tmp-${process.pid}-${timestamp}-${random.toString(36).slice(2)}`,
+	);
+	mkdirSync(temporaryPath, { recursive: true });
+	return () => {
+		Date.now = originalDateNow;
+		Math.random = originalMathRandom;
+		rmSync(temporaryPath, { recursive: true, force: true });
+	};
+}
+
+describe("hosted runtime heartbeat observation", () => {
+	test("emits the exact apply tuple when checkpoint and apply generations differ", async () => {
+		const paths = tempRuntimePaths();
+		writeRuntimeAppliedState(
+			{
+				...companionAppliedState(1),
+				generation: 2,
+				applyGeneration: 1,
+			},
+			paths,
+		);
+		const session = new HostedRuntimeHeartbeatSession({
+			environmentId: "env_split_generation",
+			paths,
+			now: clockSequence(["2026-07-16T01:00:00.000Z"]),
+			createId: idSequence(["boot-session-split", "event-split-000001"]),
+		});
+
+		const event = (await session.nextEvent())?.event;
+		expect(event).toMatchObject({
+			generation: 1,
+			manifestETag: '"frozen-manifest-1"',
+			applyReceiptId: "apply-receipt-0001",
+			bootNonce: "boot-nonce-000001",
+			bootSessionId: "boot-session-split",
+			sequence: 1,
+			eventId: "event-split-000001",
+			applied: {
+				generation: 1,
+				etag: `"sha256:${"c".repeat(64)}"`,
+				sourceRevision: "c".repeat(64),
+			},
+		});
+	});
+
+	test("does not issue fresh evidence for an apply identity replaced on disk", async () => {
+		const paths = tempRuntimePaths();
+		writeRuntimeAppliedState(companionAppliedState(7), paths);
+		const session = new HostedRuntimeHeartbeatSession({
+			environmentId: "env_heartbeat",
+			paths,
+			now: clockSequence(["2026-07-16T01:00:00.000Z", "2026-07-16T01:01:00.000Z"]),
+			createId: idSequence(["boot-session-0001", "event-0000000001", "event-0000000002"]),
+		});
+		const statePath = runtimeHeartbeatObservationStatePath(paths, "env_heartbeat");
+		const persisted: unknown = JSON.parse(readFileSync(statePath, "utf-8"));
+		expect(persisted).toMatchObject({
+			bootIdentity: {
+				generation: 7,
+				manifestETag: '"frozen-manifest-7"',
+				applyReceiptId: "apply-receipt-0007",
+				bootNonce: "boot-nonce-000007",
+				bootSessionId: "boot-session-0001",
+			},
+		});
+		expect(statSync(statePath).mode & 0o777).toBe(0o600);
+
+		const first = await session.nextEvent();
+		if (!first) throw new Error("expected first companion event");
+		expect(first.event).toMatchObject({
+			generation: 7,
+			manifestETag: '"frozen-manifest-7"',
+			applyReceiptId: "apply-receipt-0007",
+			bootNonce: "boot-nonce-000007",
+			bootSessionId: "boot-session-0001",
+			sequence: 1,
+			eventId: "event-0000000001",
+			capturedAt: "2026-07-16T01:00:00.000Z",
+			reportedAt: "2026-07-16T01:00:00.000Z",
+			applied: {
+				generation: 7,
+				etag: `"sha256:${"c".repeat(64)}"`,
+				sourceRevision: "c".repeat(64),
+			},
+		});
+		expect(first.event.applied.etag).not.toBe(first.event.manifestETag);
+		expect(first.payloadJson).toBe(JSON.stringify(first.event));
+		expect(first.payloadSha256).toBe(createHash("sha256").update(first.payloadJson).digest("hex"));
+		expect(session.acknowledge(first.event.eventId)).toBe(true);
+
+		writeRuntimeAppliedState(companionAppliedState(8), paths);
+		expect(await session.nextEvent()).toBeNull();
+		expect(JSON.parse(readFileSync(statePath, "utf-8"))).toMatchObject({
+			bootIdentity: { generation: 7, bootSessionId: "boot-session-0001" },
+			nextSequence: 2,
+			pending: null,
+		});
+	});
+
+	test("re-reads the durable applied tuple and starts a new boot session after rotation", async () => {
+		const paths = tempRuntimePaths();
+		writeRuntimeAppliedState(companionAppliedState(7), paths);
+		const session = new HostedRuntimeHeartbeatSession({
+			environmentId: "env_rotation",
+			paths,
+			now: clockSequence(["2026-07-16T01:00:00.000Z", "2026-07-16T01:01:00.000Z"]),
+			createId: idSequence([
+				"boot-session-0001",
+				"event-0000000001",
+				"boot-session-0002",
+				"event-0000000002",
+			]),
+		});
+		const first = await session.nextEvent();
+		if (!first) throw new Error("expected first tuple event");
+		expect(session.acknowledge(first.event.eventId)).toBe(true);
+
+		writeRuntimeAppliedState(companionAppliedState(8), paths);
+		expect(session.refreshAppliedState()).toBe(true);
+		const rotated = await session.nextEvent();
+		if (!rotated) throw new Error("expected rotated tuple event");
+		expect(rotated.event).toMatchObject({
+			generation: 8,
+			manifestETag: '"frozen-manifest-8"',
+			applyReceiptId: "apply-receipt-0008",
+			bootNonce: "boot-nonce-000008",
+			bootSessionId: "boot-session-0002",
+			sequence: 1,
+			eventId: "event-0000000002",
+			applied: {
+				generation: 8,
+				etag: `"sha256:${"d".repeat(64)}"`,
+				sourceRevision: "d".repeat(64),
+			},
+		});
+	});
+
+	test("supersedes a pending old-tuple event instead of blocking rotation", async () => {
+		const paths = tempRuntimePaths();
+		writeRuntimeAppliedState(companionAppliedState(7), paths);
+		const session = new HostedRuntimeHeartbeatSession({
+			environmentId: "env_pending_rotation",
+			paths,
+			now: clockSequence(["2026-07-16T01:00:00.000Z", "2026-07-16T01:01:00.000Z"]),
+			createId: idSequence([
+				"boot-session-0001",
+				"old-event-000001",
+				"boot-session-0002",
+				"new-event-000001",
+			]),
+		});
+		const oldPending = await session.nextEvent();
+		if (!oldPending) throw new Error("expected old pending event");
+
+		writeRuntimeAppliedState(companionAppliedState(8), paths);
+		expect(session.refreshAppliedState()).toBe(true);
+		const rotated = await session.nextEvent();
+		if (!rotated) throw new Error("expected rotated event");
+		expect(rotated.event.eventId).toBe("new-event-000001");
+		expect(rotated.event.eventId).not.toBe(oldPending.event.eventId);
+		expect(rotated.event).toMatchObject({
+			bootSessionId: "boot-session-0002",
+			sequence: 1,
+			applied: { generation: 8 },
+		});
+	});
+
+	test.each(["removed", "rotated"] as const)(
+		"discards an in-flight capture when applied authority is %s",
+		async (change) => {
+			const paths = tempRuntimePaths();
+			writeRuntimeAppliedState(companionAppliedState(7), paths);
+			const session = new HostedRuntimeHeartbeatSession({
+				environmentId: "env_capture_rotation",
+				paths,
+			});
+			const pending = session.nextEvent();
+			if (change === "removed") rmSync(paths.appliedState);
+			else writeRuntimeAppliedState(companionAppliedState(8), paths);
+			session.refreshAppliedState();
+			expect(await pending).toBeNull();
+			if (change === "removed") expect(await session.nextEvent()).toBeNull();
+			else expect((await session.nextEvent())?.event.applied.generation).toBe(8);
+		},
+	);
+
+	test("persists one exact event across retries and restart until acknowledgement", async () => {
+		const paths = tempRuntimePaths();
+		writeRuntimeAppliedState(companionAppliedState(7), paths);
+		const firstSession = new HostedRuntimeHeartbeatSession({
+			environmentId: "env_retry",
+			paths,
+			now: clockSequence([
+				"2026-07-16T02:00:00.000Z",
+				"2026-07-16T02:00:00.000Z",
+				"2026-07-16T02:01:00.000Z",
+			]),
+			createId: idSequence(["boot-session-0001", "event-0000000001", "event-0000000002"]),
+			createSuccessorId: () => "boot-session-0002",
+		});
+		const capturingFirst = firstSession.nextEvent();
+		const concurrent = firstSession.nextEvent();
+		const first = await capturingFirst;
+		expect(await concurrent).toBeNull();
+		if (!first) throw new Error("expected first event");
+		expect(firstSession.acknowledge(first.event.eventId)).toBe(true);
+		const second = await firstSession.nextEvent();
+		if (!second) throw new Error("expected second event");
+		expect(second.event.sequence).toBe(2);
+
+		const retry = await firstSession.nextEvent();
+		if (!retry) throw new Error("expected retry event");
+		expect(retry).toEqual(second);
+		expect(retry.event.capturedAt).toBe("2026-07-16T02:01:00.000Z");
+		expect(retry.event.eventId).toBe("event-0000000002");
+
+		const restarted = new HostedRuntimeHeartbeatSession({
+			environmentId: "env_retry",
+			paths,
+			now: clockSequence(["2026-07-16T02:02:00.000Z"]),
+			createId: idSequence(["event-0000000003"]),
+			createSuccessorId: () => "boot-session-0003",
+		});
+		const retryAfterRestart = await restarted.nextEvent();
+		if (!retryAfterRestart) throw new Error("expected retry after restart");
+		expect(retryAfterRestart).toEqual(second);
+		expect(restarted.acknowledge("different-event-id")).toBe(false);
+		expect(await restarted.nextEvent()).toEqual(second);
+		expect(restarted.acknowledge(second.event.eventId)).toBe(true);
+
+		const nextBootEvent = await restarted.nextEvent();
+		if (!nextBootEvent) throw new Error("expected new-boot event");
+		expect(nextBootEvent.event).toMatchObject({
+			bootSessionId: "boot-session-0002",
+			predecessorBootSessionId: "boot-session-0001",
+			successorBootSessionId: "boot-session-0003",
+			sequence: 1,
+			eventId: "event-0000000003",
+			capturedAt: "2026-07-16T02:02:00.000Z",
+		});
+	});
+
+	test("clamps capture time to the durable boot-session high-water", async () => {
+		const paths = tempRuntimePaths();
+		writeRuntimeAppliedState(companionAppliedState(7), paths);
+		const session = new HostedRuntimeHeartbeatSession({
+			environmentId: "env_clock_regression",
+			paths,
+			now: clockSequence(["2026-07-16T05:00:00.000Z", "2026-07-16T04:59:00.000Z"]),
+			createId: idSequence(["boot-session-0001", "event-0000000001", "event-0000000002"]),
+		});
+		const first = await session.nextEvent();
+		if (!first) throw new Error("expected first event");
+		expect(first.event.capturedAt).toBe("2026-07-16T05:00:00.000Z");
+		expect(session.acknowledge(first.event.eventId)).toBe(true);
+
+		const second = await session.nextEvent();
+		if (!second) throw new Error("expected second event");
+		expect(second.event.sequence).toBe(2);
+		expect(second.event.capturedAt).toBe("2026-07-16T05:00:00.000Z");
+		expect(second.event.reportedAt).toBe(second.event.capturedAt);
+		const durable: unknown = JSON.parse(
+			readFileSync(runtimeHeartbeatObservationStatePath(paths, "env_clock_regression"), "utf-8"),
+		);
+		expect(durable).toMatchObject({ lastCapturedAt: "2026-07-16T05:00:00.000Z" });
+	});
+
+	test("retires only the matching rejected buffered event", async () => {
+		const paths = tempRuntimePaths();
+		writeRuntimeAppliedState(companionAppliedState(7), paths);
+		const session = new HostedRuntimeHeartbeatSession({
+			environmentId: "env_terminal_stale",
+			paths,
+			now: clockSequence(["2026-06-01T00:00:00.000Z", "2026-07-16T00:00:00.000Z"]),
+			createId: idSequence(["boot-session-0001", "stale-event-0001", "fresh-event-0002"]),
+		});
+		const stale = await session.nextEvent();
+		if (!stale) throw new Error("expected stale buffered event");
+		expect(session.retireRejected("different-event")).toBe(false);
+		expect(await session.nextEvent()).toEqual(stale);
+		expect(session.retireRejected(stale.event.eventId)).toBe(true);
+		expect(await session.nextEvent()).not.toEqual(stale);
+	});
+
+	test.each([
+		["invalid JSON", "{not-json"],
+		[
+			"unknown schema",
+			JSON.stringify({ schemaVersion: "clawdi.runtimeHeartbeatObservation.v999" }),
+		],
+	] as const)("quarantines %s state and starts fresh", async (_name, corruptedState) => {
+		const paths = tempRuntimePaths();
+		writeRuntimeAppliedState(companionAppliedState(7), paths);
+		const statePath = runtimeHeartbeatObservationStatePath(paths, "env_corrupt_state");
+		mkdirSync(dirname(statePath), { recursive: true });
+		writeFileSync(statePath, corruptedState);
+
+		const session = new HostedRuntimeHeartbeatSession({
+			environmentId: "env_corrupt_state",
+			paths,
+			now: () => new Date("2026-07-16T06:00:00.000Z"),
+			createId: idSequence(["fresh-boot-session", "fresh-event-000001"]),
+		});
+		const event = await session.nextEvent();
+
+		expect(event?.event).toMatchObject({
+			bootSessionId: "fresh-boot-session",
+			sequence: 1,
+			eventId: "fresh-event-000001",
+		});
+		const quarantineNames = readdirSync(dirname(statePath)).filter((name) =>
+			name.startsWith(`${basename(statePath)}.corrupt-`),
+		);
+		expect(quarantineNames).toHaveLength(1);
+		const quarantineName = quarantineNames[0];
+		if (!quarantineName) throw new Error("expected quarantined heartbeat state");
+		expect(readFileSync(join(dirname(statePath), quarantineName), "utf-8")).toBe(corruptedState);
+		expect(JSON.parse(readFileSync(statePath, "utf-8"))).toMatchObject({
+			schemaVersion: "clawdi.runtimeHeartbeatObservation.v2",
+			nextSequence: 2,
+		});
+	});
+
+	test("does not advance in-memory sequence when buffering fails to persist", async () => {
+		const paths = tempRuntimePaths();
+		writeRuntimeAppliedState(companionAppliedState(7), paths);
+		const session = new HostedRuntimeHeartbeatSession({
+			environmentId: "env_buffer_write_failure",
+			paths,
+			now: clockSequence(["2026-07-16T03:00:00.000Z", "2026-07-16T03:01:00.000Z"]),
+			createId: idSequence(["boot-session-0001", "failed-event-0001", "persisted-event-0001"]),
+		});
+		const statePath = runtimeHeartbeatObservationStatePath(paths, "env_buffer_write_failure");
+		const unblock = blockAtomicWrite(statePath);
+		try {
+			await expect(session.nextEvent()).rejects.toThrow();
+		} finally {
+			unblock();
+		}
+
+		const durableAfterFailure: unknown = JSON.parse(readFileSync(statePath, "utf-8"));
+		expect(durableAfterFailure).toMatchObject({ nextSequence: 1, pending: null });
+		const persisted = await session.nextEvent();
+		if (!persisted) throw new Error("expected event after durable state recovered");
+		expect(persisted.event).toMatchObject({
+			sequence: 1,
+			eventId: "persisted-event-0001",
+			capturedAt: "2026-07-16T03:01:00.000Z",
+		});
+	});
+
+	test("does not clear the in-memory pending event when acknowledgement fails to persist", async () => {
+		const paths = tempRuntimePaths();
+		writeRuntimeAppliedState(companionAppliedState(7), paths);
+		const session = new HostedRuntimeHeartbeatSession({
+			environmentId: "env_ack_write_failure",
+			paths,
+			now: clockSequence(["2026-07-16T04:00:00.000Z"]),
+			createId: idSequence(["boot-session-0001", "pending-event-0001"]),
+		});
+		const pending = await session.nextEvent();
+		if (!pending) throw new Error("expected pending event");
+		const statePath = runtimeHeartbeatObservationStatePath(paths, "env_ack_write_failure");
+		const unblock = blockAtomicWrite(statePath);
+		try {
+			expect(() => session.acknowledge(pending.event.eventId)).toThrow();
+			expect(await session.nextEvent()).toEqual(pending);
+		} finally {
+			unblock();
+		}
+
+		expect(session.acknowledge(pending.event.eventId)).toBe(true);
+		const durableAfterAcknowledgement: unknown = JSON.parse(readFileSync(statePath, "utf-8"));
+		expect(durableAfterAcknowledgement).toMatchObject({ nextSequence: 2, pending: null });
+	});
+
+	test("keeps legacy hosted observations when the complete apply tuple is unavailable", async () => {
+		const paths = tempRuntimePaths();
+		writeRuntimeAppliedState(legacyAppliedState(7), paths);
+		const session = new HostedRuntimeHeartbeatSession({
+			environmentId: "env_legacy",
+			paths,
+			createId: () => {
+				throw new Error("legacy heartbeat must not mint companion IDs");
+			},
+		});
+
+		expect(session.hasCompanionIdentity).toBe(false);
+		expect(await session.nextEvent()).toBeNull();
+		expect(existsSync(runtimeHeartbeatObservationStatePath(paths, "env_legacy"))).toBe(false);
+		expect((await readHostedRuntimeObserved(paths))?.applied?.etag).toBe(
+			`"sha256:${"c".repeat(64)}"`,
+		);
+	});
+
+	test("rejects a boot session ID outside the frozen 128-character bound", () => {
+		const paths = tempRuntimePaths();
+		writeRuntimeAppliedState(companionAppliedState(7), paths);
+		expect(
+			() =>
+				new HostedRuntimeHeartbeatSession({
+					environmentId: "env_boot_bound",
+					paths,
+					createId: () => "b".repeat(129),
+				}),
+		).toThrow();
+	});
+});

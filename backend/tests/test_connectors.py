@@ -1,0 +1,2030 @@
+from __future__ import annotations
+
+import asyncio
+from datetime import UTC, datetime, timedelta
+from typing import Any, Literal
+
+import httpx
+import pytest
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from starlette.requests import Request
+
+from app.core.auth import AuthContext
+from app.core.config import settings
+from app.models.user import User
+from app.routes import connectors
+from app.schemas.connector import (
+    ConnectorAvailableAppResponse,
+    ConnectorCredentialsConnectResponse,
+)
+from app.services import composio
+
+
+class _FakeResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+
+class _FakePage[ResponseT: BaseModel](_FakeResponse):
+    items: list[ResponseT]
+    next_cursor: str | None = None
+
+
+class _FakeToolkitMeta(_FakeResponse):
+    logo: str
+    description: str
+
+
+class _FakeAuthField(_FakeResponse):
+    name: str
+    display_name: str
+    description: str = ""
+    type: str = "string"
+    required: bool = True
+    is_secret: bool = False
+    default: str | None = None
+
+
+class _FakeAuthFieldGroup(_FakeResponse):
+    required: list[_FakeAuthField] = Field(default_factory=list)
+    optional: list[_FakeAuthField] = Field(default_factory=list)
+
+
+class _FakeAuthFields(_FakeResponse):
+    connected_account_initiation: _FakeAuthFieldGroup
+
+
+class _FakeAuthConfigDetail(_FakeResponse):
+    mode: str
+    name: str
+    fields: _FakeAuthFields
+
+
+class _FakeToolkit(_FakeResponse):
+    slug: str
+    name: str
+    meta: _FakeToolkitMeta
+    auth_schemes: list[str] | None = None
+    composio_managed_auth_schemes: list[str] | None = None
+    no_auth: bool | None = None
+    auth_config_details: list[_FakeAuthConfigDetail] | None = None
+
+
+class _FakeAuthConfigToolkit(_FakeResponse):
+    slug: str
+
+
+class _FakeAuthConfig(_FakeResponse):
+    id: str
+    auth_scheme: str | None = None
+    is_composio_managed: bool | None = None
+    status: Literal["ENABLED", "DISABLED"] = "ENABLED"
+    toolkit: _FakeAuthConfigToolkit | None = None
+
+
+class _FakeAuthConfigCreateResponse(_FakeResponse):
+    auth_config: _FakeAuthConfig
+
+
+class _FakeAuthConfigRetrieveResponse(_FakeResponse):
+    id: str
+    auth_scheme: str
+    expected_input_fields: list[_FakeAuthField]
+
+
+class _FakeConnectLinkResponse(_FakeResponse):
+    redirect_url: str
+    connected_account_id: str
+
+
+class _FakeConnectedAccountResponse(_FakeResponse):
+    id: str
+    status: str
+
+
+class _FakeDeleteResponse(_FakeResponse):
+    success: bool
+
+
+class _FakeTool(_FakeResponse):
+    slug: str
+    name: str
+    description: str
+    is_deprecated: bool
+
+
+class _MalformedResponse(_FakeResponse):
+    unexpected: str = "malformed"
+
+
+class _MalformedConnectLinkResponse(_FakeResponse):
+    redirect_url: str
+
+
+def _field(
+    name: str,
+    display_name: str,
+    *,
+    required: bool = True,
+    field_type: str = "string",
+    is_secret: bool = False,
+    default: str | None = None,
+) -> _FakeAuthField:
+    return _FakeAuthField(
+        name=name,
+        display_name=display_name,
+        description="",
+        type=field_type,
+        required=required,
+        is_secret=is_secret,
+        default=default,
+    )
+
+
+def _meta(
+    description: str = "PostHog is an open-source product analytics platform.",
+) -> _FakeToolkitMeta:
+    return _FakeToolkitMeta(
+        logo="https://logos.example/posthog",
+        description=description,
+    )
+
+
+def _posthog_list_toolkit() -> _FakeToolkit:
+    return _FakeToolkit(
+        slug="posthog",
+        name="PostHog",
+        meta=_meta(),
+        auth_schemes=[],
+        composio_managed_auth_schemes=[],
+        no_auth=False,
+    )
+
+
+def _posthog_detail_toolkit() -> _FakeToolkit:
+    return _FakeToolkit(
+        slug="posthog",
+        name="PostHog",
+        meta=_meta(),
+        auth_schemes=[],
+        composio_managed_auth_schemes=[],
+        no_auth=False,
+        auth_config_details=[
+            _FakeAuthConfigDetail(
+                mode="API_KEY",
+                name="API Key",
+                fields=_FakeAuthFields(
+                    connected_account_initiation=_FakeAuthFieldGroup(
+                        required=[
+                            _field("generic_api_key", "Generic API Key", is_secret=True),
+                        ],
+                        optional=[],
+                    )
+                ),
+            )
+        ],
+    )
+
+
+def _gmail_detail_toolkit() -> _FakeToolkit:
+    return _FakeToolkit(
+        slug="gmail",
+        name="Gmail",
+        meta=_meta("Gmail is Google's email service."),
+        auth_schemes=["OAUTH2"],
+        composio_managed_auth_schemes=["OAUTH2"],
+        no_auth=False,
+        auth_config_details=[],
+    )
+
+
+def _gmail_detail_toolkit_without_managed_metadata() -> _FakeToolkit:
+    return _FakeToolkit(
+        slug="gmail",
+        name="Gmail",
+        meta=_meta("Gmail is Google's email service."),
+        auth_schemes=["OAUTH2"],
+        no_auth=False,
+        auth_config_details=[],
+    )
+
+
+def _twitter_detail_toolkit() -> _FakeToolkit:
+    return _FakeToolkit(
+        slug="twitter",
+        name="Twitter",
+        meta=_meta("Twitter is a social networking service."),
+        auth_schemes=["OAUTH2"],
+        composio_managed_auth_schemes=[],
+        no_auth=False,
+        auth_config_details=[],
+    )
+
+
+def _hackernews_detail_toolkit() -> _FakeToolkit:
+    return _FakeToolkit(
+        slug="hackernews",
+        name="Hacker News",
+        meta=_meta("Hacker News is a social news website."),
+        auth_schemes=[],
+        composio_managed_auth_schemes=[],
+        no_auth=None,
+        auth_config_details=[
+            _FakeAuthConfigDetail(
+                mode="NO_AUTH",
+                name="No auth",
+                fields=_FakeAuthFields(connected_account_initiation=_FakeAuthFieldGroup()),
+            )
+        ],
+    )
+
+
+def _search_toolkit(slug: str, name: str, description: str) -> _FakeToolkit:
+    return _FakeToolkit(
+        slug=slug,
+        name=name,
+        meta=_meta(description),
+        auth_schemes=[],
+        composio_managed_auth_schemes=[],
+        no_auth=True,
+        auth_config_details=[],
+    )
+
+
+class FakeToolkits:
+    def __init__(
+        self,
+        *,
+        list_toolkits: list[_FakeToolkit],
+        detail_toolkits: dict[str, _FakeToolkit],
+    ) -> None:
+        self.list_toolkits = list_toolkits
+        self.detail_toolkits = detail_toolkits
+
+    async def list(
+        self,
+        *,
+        managed_by: str,
+        sort_by: str,
+        limit: int,
+        cursor: str | None = None,
+    ) -> _FakePage[_FakeToolkit]:
+        assert (managed_by, sort_by, limit, cursor) == ("composio", "usage", 1000, None)
+        return _FakePage[_FakeToolkit](items=self.list_toolkits)
+
+    async def retrieve(self, slug: str) -> _FakeToolkit:
+        return self.detail_toolkits[slug]
+
+
+class FakeAuthConfigs:
+    def __init__(self, existing: list[_FakeAuthConfig] | None = None) -> None:
+        self.existing = existing or []
+        self.created: list[dict[str, Any]] = []
+        self.listed: list[dict[str, Any]] = []
+        self.last_created_id = "ac_created"
+
+    async def list(
+        self,
+        *,
+        is_composio_managed: bool,
+        show_disabled: bool,
+        limit: int,
+        toolkit_slug: str | None = None,
+        cursor: str | None = None,
+    ) -> _FakePage[_FakeAuthConfig]:
+        kwargs: dict[str, object] = {
+            "is_composio_managed": is_composio_managed,
+            "show_disabled": show_disabled,
+            "limit": limit,
+        }
+        if toolkit_slug is not None:
+            kwargs["toolkit_slug"] = toolkit_slug
+        if cursor is not None:
+            kwargs["cursor"] = cursor
+        self.listed.append(kwargs)
+        items = self.existing
+        items = [item for item in items if bool(item.is_composio_managed) is is_composio_managed]
+        return _FakePage[_FakeAuthConfig](items=items)
+
+    async def create(
+        self,
+        *,
+        toolkit: dict[str, str],
+        auth_config: dict[str, object],
+    ) -> _FakeAuthConfigCreateResponse:
+        kwargs = {"toolkit": toolkit, "auth_config": auth_config}
+        self.created.append(kwargs)
+        self.last_created_id = f"ac_{len(self.created)}"
+        return _FakeAuthConfigCreateResponse(
+            auth_config=_FakeAuthConfig(
+                id=self.last_created_id,
+                auth_scheme=str(auth_config.get("auth_scheme", "OAUTH2")),
+                is_composio_managed=auth_config["type"] == "use_composio_managed_auth",
+            )
+        )
+
+    async def retrieve(self, auth_config_id: str) -> _FakeAuthConfigRetrieveResponse:
+        return _FakeAuthConfigRetrieveResponse(
+            id=auth_config_id,
+            auth_scheme="API_KEY",
+            expected_input_fields=[],
+        )
+
+
+class FakeLink:
+    def __init__(self) -> None:
+        self.created: dict[str, Any] | None = None
+
+    async def create(
+        self,
+        *,
+        auth_config_id: str,
+        user_id: str,
+        callback_url: str | None = None,
+        alias: object = None,
+    ) -> _FakeConnectLinkResponse:
+        self.created = {
+            "auth_config_id": auth_config_id,
+            "user_id": user_id,
+        }
+        if isinstance(alias, str):
+            self.created["alias"] = alias
+        if callback_url is not None:
+            self.created["callback_url"] = callback_url
+        return _FakeConnectLinkResponse(
+            redirect_url="https://connect.composio.dev/request_123",
+            connected_account_id="ca_gmail",
+        )
+
+
+class FakeConnectedAccounts:
+    def __init__(
+        self,
+        *,
+        create_status: str = "ACTIVE",
+        retrieve_statuses: list[str] | None = None,
+    ) -> None:
+        self.created: dict[str, Any] | None = None
+        self.create_status = create_status
+        self.retrieve_statuses = list(retrieve_statuses or [])
+        self.retrieve_calls: list[str] = []
+
+    async def create(
+        self,
+        *,
+        auth_config: dict[str, str],
+        connection: dict[str, object],
+    ) -> _FakeConnectedAccountResponse:
+        kwargs = {"auth_config": auth_config, "connection": connection}
+        self.created = kwargs
+        return _FakeConnectedAccountResponse(id="ca_posthog", status=self.create_status)
+
+    async def list(
+        self,
+        *,
+        user_ids: list[str],
+        statuses: list[str],
+        limit: int,
+        cursor: object = None,
+    ) -> _FakePage[_FakeConnectedAccountResponse]:
+        assert user_ids and statuses == ["ACTIVE"] and limit == 100 and not cursor
+        return _FakePage[_FakeConnectedAccountResponse](items=[])
+
+    async def retrieve(self, connected_account_id: str) -> _FakeConnectedAccountResponse:
+        self.retrieve_calls.append(connected_account_id)
+        status = self.retrieve_statuses.pop(0) if self.retrieve_statuses else "ACTIVE"
+        return _FakeConnectedAccountResponse(id=connected_account_id, status=status)
+
+    async def delete(self, connected_account_id: str) -> _FakeDeleteResponse:
+        assert connected_account_id
+        return _FakeDeleteResponse(success=True)
+
+
+class FakeTools:
+    async def list(
+        self,
+        *,
+        toolkit_slug: str,
+        include_deprecated: bool,
+        limit: int,
+        cursor: str | None = None,
+    ) -> _FakePage[_FakeTool]:
+        assert toolkit_slug and include_deprecated is False and limit == 100 and cursor is None
+        return _FakePage[_FakeTool](items=[])
+
+
+class FakeClient:
+    def __init__(
+        self,
+        *,
+        list_toolkits: list[_FakeToolkit] | None = None,
+        detail_toolkits: dict[str, _FakeToolkit] | None = None,
+        auth_configs: FakeAuthConfigs | None = None,
+        connected_accounts: FakeConnectedAccounts | None = None,
+    ) -> None:
+        if detail_toolkits is None:
+            detail_toolkits = {"posthog": _posthog_detail_toolkit()}
+        self.toolkits = FakeToolkits(
+            list_toolkits=list_toolkits or [_posthog_list_toolkit()],
+            detail_toolkits=detail_toolkits,
+        )
+        self.auth_configs = auth_configs or FakeAuthConfigs()
+        self.link = FakeLink()
+        self.connected_accounts = connected_accounts or FakeConnectedAccounts()
+        self.tools = FakeTools()
+
+
+def _composio_client_status_error(
+    cls: type[Exception],
+    status_code: int,
+    body: dict[str, Any],
+) -> Exception:
+    request = httpx.Request("POST", "https://backend.composio.dev/api/v3.1/connected_accounts")
+    response = httpx.Response(status_code, json=body, request=request)
+    return cls(f"Error code: {status_code} - {body}", response=response, body=body)
+
+
+@pytest.fixture(autouse=True)
+def _reset_composio_app_cache(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(composio, "_toolkits_cache_lock", asyncio.Lock())
+    monkeypatch.setattr(composio, "_toolkits_cache", None)
+    monkeypatch.setattr(composio, "_toolkits_cache_at", None)
+    monkeypatch.setattr(composio, "_custom_auth_config_index_task", None)
+    monkeypatch.setattr(composio, "_custom_auth_config_index_scope", frozenset())
+    monkeypatch.setattr(composio, "_custom_auth_config_index_task_scope", frozenset())
+    monkeypatch.setattr(composio, "_custom_auth_config_index", None)
+    monkeypatch.setattr(composio, "_custom_auth_config_index_at", None)
+    monkeypatch.setattr(composio, "_tool_router_session_cache", {})
+
+
+@pytest.mark.asyncio
+async def test_connector_metadata_batch_reads_catalog_once_without_auth_details(
+    client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
+):
+    fake = FakeClient(list_toolkits=[_posthog_list_toolkit(), _gmail_detail_toolkit()])
+    calls = 0
+    list_toolkits = fake.toolkits.list
+
+    async def counted_list(**kwargs):
+        nonlocal calls
+        calls += 1
+        return await list_toolkits(**kwargs)
+
+    async def unexpected_detail(_slug):
+        raise AssertionError("Display metadata must not fetch per-toolkit auth details")
+
+    monkeypatch.setattr(settings, "composio_api_key", "test-key")
+    monkeypatch.setattr(composio, "get_composio_client", lambda: fake)
+    monkeypatch.setattr(fake.toolkits, "list", counted_list)
+    monkeypatch.setattr(fake.toolkits, "retrieve", unexpected_detail)
+    response = await client.post(
+        "/v1/connectors/metadata:batchRead", json={"names": ["gmail", "missing", "posthog"]}
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert [item["name"] for item in body["items"]] == ["gmail", "posthog"]
+    assert body["missing"] == ["missing"]
+    assert set(body["items"][0]) == {"name", "display_name", "logo", "description"}
+    repeated = await client.post("/v1/connectors/metadata:batchRead", json={"names": ["posthog"]})
+    assert repeated.status_code == 200
+    assert calls == 1
+    assert not fake.auth_configs.listed
+    oversized = await client.post(
+        "/v1/connectors/metadata:batchRead", json={"names": ["gmail"] * 101}
+    )
+    assert oversized.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_connector_metadata_batch_requires_authentication():
+    from app.main import app
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        response = await client.post("/v1/connectors/metadata:batchRead", json={"names": ["gmail"]})
+    assert response.status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_connector_detail_uses_toolkit_auth_config_details(monkeypatch: pytest.MonkeyPatch):
+    fake = FakeClient()
+    serialized: list[str] = []
+    serialize = composio._serialize_app
+
+    def record_serialization(toolkit, **kwargs):
+        serialized.append(toolkit.slug)
+        return serialize(toolkit, **kwargs)
+
+    monkeypatch.setattr(composio, "_serialize_app", record_serialization)
+    monkeypatch.setattr(settings, "composio_api_key", "composio_test_key")
+    monkeypatch.setattr(composio, "get_composio_client", lambda: fake)
+
+    app = await composio.get_app_by_name("posthog")
+
+    assert app is not None
+    assert app.name == "posthog"
+    assert app.auth_type == "api_key"
+    assert serialized == ["posthog"]
+
+
+async def test_catalog_refresh_is_shared_and_expires(monkeypatch: pytest.MonkeyPatch):
+    started = asyncio.Event()
+    release = asyncio.Event()
+    calls: list[str | None] = []
+    fake = FakeClient()
+
+    async def list_page(**kwargs):
+        cursor = kwargs.get("cursor")
+        calls.append(cursor)
+        if cursor is None:
+            started.set()
+            await release.wait()
+        return _FakePage[_FakeToolkit](
+            items=[_posthog_list_toolkit()], next_cursor="next" if cursor is None else None
+        )
+
+    monkeypatch.setattr(fake.toolkits, "list", list_page)
+    monkeypatch.setattr(composio, "get_composio_client", lambda: fake)
+    first = asyncio.create_task(composio._get_all_toolkits())
+    second = asyncio.create_task(composio._get_all_toolkits())
+    try:
+        async with asyncio.timeout(3):
+            await started.wait()
+            await asyncio.sleep(0)
+            assert calls == [None]
+            release.set()
+            first_result, second_result = await asyncio.gather(first, second)
+        assert first_result is second_result
+        assert len(first_result) == 2
+        assert calls == [None, "next"]
+        assert await composio._get_all_toolkits() is first_result
+        monkeypatch.setattr(
+            composio, "_toolkits_cache_at", datetime.now(UTC) - timedelta(minutes=6)
+        )
+        assert await composio._get_all_toolkits() == first_result
+        assert calls == [None, "next", None, "next"]
+    finally:
+        release.set()
+        for task in (first, second):
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(first, second, return_exceptions=True)
+
+
+async def test_cancelled_catalog_refresh_releases_lock_without_publishing(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    started = asyncio.Event()
+    fake = FakeClient()
+    list_page = fake.toolkits.list
+
+    async def blocked_page(**kwargs):
+        started.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(fake.toolkits, "list", blocked_page)
+    monkeypatch.setattr(composio, "get_composio_client", lambda: fake)
+    first = asyncio.create_task(composio._get_all_toolkits())
+    try:
+        async with asyncio.timeout(3):
+            await started.wait()
+    finally:
+        first.cancel()
+        await asyncio.gather(first, return_exceptions=True)
+    assert first.cancelled()
+    assert composio._toolkits_cache is None
+    assert composio._toolkits_cache_at is None
+    monkeypatch.setattr(fake.toolkits, "list", list_page)
+    async with asyncio.timeout(3):
+        assert len(await composio._get_all_toolkits()) == 1
+
+
+@pytest.mark.asyncio
+async def test_catalog_without_auth_metadata_is_not_connectable(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    fake = FakeClient(list_toolkits=[_posthog_list_toolkit()])
+    monkeypatch.setattr(settings, "composio_api_key", "composio_test_key")
+    monkeypatch.setattr(composio, "get_composio_client", lambda: fake)
+
+    page = await composio.get_available_apps(search="posthog")
+
+    assert page["items"] == []
+
+
+@pytest.mark.asyncio
+async def test_catalog_search_prioritizes_identity_before_description(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    fake = FakeClient(
+        list_toolkits=[
+            _search_toolkit("postal", "Postal", "Routes Gmail messages"),
+            _search_toolkit("team-mail", "Team Gmail", "Team inbox"),
+            _search_toolkit("gmail-analytics", "Mail insights", "Analytics"),
+            _search_toolkit("gmail", "Gmail", "Google email"),
+        ]
+    )
+    monkeypatch.setattr(settings, "composio_api_key", "composio_test_key")
+    monkeypatch.setattr(composio, "get_composio_client", lambda: fake)
+
+    page = await composio.get_available_apps(search="  GMAIL  ")
+
+    assert [app.name for app in page["items"]] == [
+        "gmail",
+        "gmail-analytics",
+        "team-mail",
+        "postal",
+    ]
+
+    multi_term = await composio.get_available_apps(search="gmail inbox")
+    assert [app.name for app in multi_term["items"]] == ["team-mail"]
+
+    missing_term = await composio.get_available_apps(search="gmail missing")
+    assert missing_term["items"] == []
+
+    projected = []
+    serialize = composio._serialize_app
+
+    def record_projection(toolkit, **kwargs):
+        projected.append(toolkit.slug)
+        return serialize(toolkit, **kwargs)
+
+    monkeypatch.setattr(composio, "_serialize_app", record_projection)
+    second_page = await composio.get_available_apps(search="gmail", page=2, page_size=1)
+    assert second_page["total"] == 4
+    assert [app.name for app in second_page["items"]] == ["gmail-analytics"]
+    assert projected == ["gmail-analytics"]
+
+
+@pytest.mark.asyncio
+async def test_connector_detail_requires_explicit_toolkit_auth_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    fake = FakeClient(detail_toolkits={"posthog": _posthog_list_toolkit()})
+    monkeypatch.setattr(settings, "composio_api_key", "composio_test_key")
+    monkeypatch.setattr(composio, "get_composio_client", lambda: fake)
+
+    with pytest.raises(composio.ConnectorAuthMetadataError):
+        await composio.get_app_by_name("posthog")
+
+
+@pytest.mark.asyncio
+async def test_connector_detail_does_not_fallback_to_catalog_when_retrieve_fails(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    fake = FakeClient(list_toolkits=[_posthog_list_toolkit()], detail_toolkits={})
+    monkeypatch.setattr(settings, "composio_api_key", "composio_test_key")
+    monkeypatch.setattr(composio, "get_composio_client", lambda: fake)
+
+    with pytest.raises(KeyError):
+        await composio.get_app_by_name("posthog")
+
+
+def test_connector_available_app_response_requires_auth_type():
+    with pytest.raises(ValidationError):
+        ConnectorAvailableAppResponse.model_validate(
+            {
+                "name": "posthog",
+                "display_name": "PostHog",
+                "logo": "",
+                "description": "",
+            }
+        )
+
+
+@pytest.mark.asyncio
+async def test_oauth_connect_uses_managed_auth_config_and_link(monkeypatch: pytest.MonkeyPatch):
+    fake = FakeClient(
+        list_toolkits=[_gmail_detail_toolkit()],
+        detail_toolkits={"gmail": _gmail_detail_toolkit()},
+    )
+    monkeypatch.setattr(composio, "get_composio_client", lambda: fake)
+    composio._tool_router_session_cache["clerk_user_123"] = composio.ComposioMcpSession(
+        url="https://app.composio.dev/tool_router/v3/trs_old/mcp",
+        headers={},
+        expires_at=datetime.now(UTC) + timedelta(minutes=30),
+    )
+
+    result = await composio.create_connect_link(
+        "clerk_user_123",
+        "gmail",
+        "https://cloud.example.test/connectors/gmail",
+        alias="Work Gmail",
+    )
+
+    assert result.model_dump() == {
+        "connect_url": "https://connect.composio.dev/request_123",
+        "id": "ca_gmail",
+    }
+    assert fake.auth_configs.created == [
+        {
+            "toolkit": {"slug": "gmail"},
+            "auth_config": {
+                "type": "use_composio_managed_auth",
+                "name": "Clawdi gmail managed",
+            },
+        }
+    ]
+    assert fake.link.created == {
+        "auth_config_id": "ac_1",
+        "user_id": "clerk_user_123",
+        "callback_url": "https://cloud.example.test/connectors/gmail",
+        "alias": "Work Gmail",
+    }
+    assert "clerk_user_123" not in composio._tool_router_session_cache
+
+
+@pytest.mark.asyncio
+async def test_oauth_connect_with_missing_managed_auth_metadata_uses_managed_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    fake = FakeClient(
+        list_toolkits=[_gmail_detail_toolkit_without_managed_metadata()],
+        detail_toolkits={"gmail": _gmail_detail_toolkit_without_managed_metadata()},
+    )
+    monkeypatch.setattr(composio, "get_composio_client", lambda: fake)
+
+    await composio.create_connect_link(
+        "clerk_user_123",
+        "gmail",
+        "https://cloud.example.test/connectors/gmail",
+    )
+
+    assert fake.auth_configs.created == [
+        {
+            "toolkit": {"slug": "gmail"},
+            "auth_config": {
+                "type": "use_composio_managed_auth",
+                "name": "Clawdi gmail managed",
+            },
+        }
+    ]
+    assert fake.link.created == {
+        "auth_config_id": "ac_1",
+        "user_id": "clerk_user_123",
+        "callback_url": "https://cloud.example.test/connectors/gmail",
+    }
+
+
+@pytest.mark.asyncio
+async def test_oauth_without_managed_auth_uses_existing_custom_auth_config(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    fake = FakeClient(
+        list_toolkits=[_twitter_detail_toolkit()],
+        detail_toolkits={"twitter": _twitter_detail_toolkit()},
+        auth_configs=FakeAuthConfigs(
+            existing=[
+                _FakeAuthConfig(
+                    id="ac_twitter_custom",
+                    toolkit=_FakeAuthConfigToolkit(slug="twitter"),
+                    auth_scheme="OAUTH2",
+                    is_composio_managed=False,
+                    status="ENABLED",
+                )
+            ],
+        ),
+    )
+    monkeypatch.setattr(composio, "get_composio_client", lambda: fake)
+
+    result = await composio.create_connect_link(
+        "clerk_user_123",
+        "twitter",
+        "https://cloud.example.test/connectors/twitter",
+    )
+
+    assert result.model_dump() == {
+        "connect_url": "https://connect.composio.dev/request_123",
+        "id": "ca_gmail",
+    }
+    assert fake.auth_configs.created == []
+    assert fake.link.created == {
+        "auth_config_id": "ac_twitter_custom",
+        "user_id": "clerk_user_123",
+        "callback_url": "https://cloud.example.test/connectors/twitter",
+    }
+
+
+@pytest.mark.asyncio
+async def test_connector_detail_enables_oauth_without_managed_auth_when_custom_config_exists(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    fake = FakeClient(
+        list_toolkits=[_twitter_detail_toolkit()],
+        detail_toolkits={"twitter": _twitter_detail_toolkit()},
+        auth_configs=FakeAuthConfigs(
+            existing=[
+                _FakeAuthConfig(
+                    id="ac_twitter_custom",
+                    toolkit=_FakeAuthConfigToolkit(slug="twitter"),
+                    auth_scheme="OAUTH2",
+                    is_composio_managed=False,
+                    status="ENABLED",
+                )
+            ],
+        ),
+    )
+    monkeypatch.setattr(settings, "composio_api_key", "composio_test_key")
+    monkeypatch.setattr(composio, "get_composio_client", lambda: fake)
+
+    app = await composio.get_app_by_name("twitter")
+
+    assert app is not None
+    assert app.auth_type == "oauth2"
+    assert app.connect_disabled is False
+    assert app.connect_disabled_reason is None
+
+
+@pytest.mark.asyncio
+async def test_connector_detail_disables_oauth_without_managed_or_custom_auth(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    fake = FakeClient(
+        list_toolkits=[_twitter_detail_toolkit()],
+        detail_toolkits={"twitter": _twitter_detail_toolkit()},
+    )
+    monkeypatch.setattr(settings, "composio_api_key", "composio_test_key")
+    monkeypatch.setattr(composio, "get_composio_client", lambda: fake)
+
+    app = await composio.get_app_by_name("twitter")
+
+    assert app is not None
+    assert app.auth_type == "oauth2"
+    assert app.connect_disabled is True
+    assert app.connect_disabled_reason == composio.CUSTOM_OAUTH_CONFIG_REQUIRED_MESSAGE
+
+
+@pytest.mark.asyncio
+async def test_connector_catalog_hides_oauth_without_managed_or_custom_auth(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    fake = FakeClient(
+        list_toolkits=[_twitter_detail_toolkit()],
+        detail_toolkits={"twitter": _twitter_detail_toolkit()},
+    )
+    monkeypatch.setattr(settings, "composio_api_key", "composio_test_key")
+    monkeypatch.setattr(composio, "get_composio_client", lambda: fake)
+
+    page = await composio.get_available_apps(search="twitter")
+
+    assert page["items"] == []
+    assert page["total"] == 0
+    assert fake.auth_configs.listed == [
+        {
+            "is_composio_managed": False,
+            "show_disabled": False,
+            "limit": 50,
+            "toolkit_slug": "twitter",
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_connector_catalog_shows_oauth_without_managed_auth_when_custom_config_exists(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    fake = FakeClient(
+        list_toolkits=[_twitter_detail_toolkit()],
+        detail_toolkits={"twitter": _twitter_detail_toolkit()},
+        auth_configs=FakeAuthConfigs(
+            existing=[
+                _FakeAuthConfig(
+                    id="ac_twitter_custom",
+                    toolkit=_FakeAuthConfigToolkit(slug="twitter"),
+                    auth_scheme="OAUTH2",
+                    is_composio_managed=False,
+                    status="ENABLED",
+                )
+            ],
+        ),
+    )
+    monkeypatch.setattr(settings, "composio_api_key", "composio_test_key")
+    monkeypatch.setattr(composio, "get_composio_client", lambda: fake)
+
+    page = await composio.get_available_apps(search="twitter")
+
+    assert page["items"][0].name == "twitter"
+    assert page["items"][0].connect_disabled is False
+    assert page["items"][0].connect_disabled_reason is None
+    assert page["total"] == 1
+    assert fake.auth_configs.listed == [
+        {
+            "is_composio_managed": False,
+            "show_disabled": False,
+            "limit": 50,
+            "toolkit_slug": "twitter",
+        }
+    ]
+
+
+@pytest.mark.parametrize("oversize", [False, True])
+async def test_catalog_reads_complete_custom_auth_index_with_upstream_page_cap(
+    monkeypatch: pytest.MonkeyPatch,
+    oversize: bool,
+) -> None:
+    from composio_client import AsyncComposio
+    from composio_client.types.auth_config_list_response import AuthConfigListResponse
+
+    # The encoded value exceeds the budget even though its character count does not.
+    scope = frozenset({"toolkit_0", "twitter"} | ({"é" * 700} if oversize else set()))
+    configs = [
+        {
+            "id": f"ac_{index}",
+            "uuid": f"config-{index}",
+            "name": f"Config {index}",
+            "no_of_connections": 0,
+            "status": "ENABLED",
+            "tool_access_config": {},
+            "toolkit": {"slug": "toolkit_0", "logo": ""},
+            "type": "custom",
+            "auth_scheme": "OAUTH2",
+            "is_composio_managed": False,
+        }
+        for index in range(248)
+    ]
+    configs[1]["toolkit"] = {"slug": "Toolkit_0", "logo": ""}
+    configs[2]["toolkit"] = {"slug": "toolkit_0", "logo": ""}
+    configs[2]["auth_scheme"] = "API_KEY"
+    # Only the final config can enable Twitter; incomplete pagination must hide it.
+    configs[-1]["toolkit"] = {"slug": "twitter", "logo": ""}
+    page_sizes: list[int] = []
+    cursors: dict[str | None, int] = {None: 1}
+
+    async def handle(request: httpx.Request) -> httpx.Response:
+        await asyncio.sleep(0)
+        assert request.method == "GET"
+        assert request.url.path == "/api/v3.1/auth_configs"
+        params = dict(request.url.params)
+        current_page = cursors[params.pop("cursor", None)]
+        limit = int(params["limit"])
+        assert params == {
+            "is_composio_managed": "false",
+            "show_disabled": "false",
+            "limit": str(limit),
+            **({} if oversize else {"toolkit_slug": "toolkit_0,twitter"}),
+        }
+        # Observed upstream behavior: pages contain at most 50 records, while
+        # total_pages and cursor termination use the requested limit. Larger
+        # limits silently truncate the index even when every cursor is followed.
+        total_pages = (len(configs) + limit - 1) // limit
+        offset = (current_page - 1) * 50
+        items = configs[offset : offset + 50]
+        page_sizes.append(len(items))
+        next_cursor = None
+        if current_page < total_pages:
+            next_cursor = f"upstream-page-{current_page + 1}"
+            cursors[next_cursor] = current_page + 1
+        response = AuthConfigListResponse.model_validate(
+            {
+                "items": items,
+                "current_page": current_page,
+                "total_items": len(configs),
+                "total_pages": total_pages,
+                "next_cursor": next_cursor,
+            }
+        )
+        return httpx.Response(200, json=response.model_dump())
+
+    monkeypatch.setattr(
+        composio,
+        "_toolkits_cache",
+        [
+            composio._normalize_sdk_response(toolkit, composio._Toolkit)
+            for toolkit in [
+                _hackernews_detail_toolkit(),
+                *[
+                    _twitter_detail_toolkit().model_copy(update={"slug": slug})
+                    for slug in sorted(scope)
+                ],
+            ]
+        ],
+    )
+    monkeypatch.setattr(composio, "_toolkits_cache_at", datetime.now(UTC))
+    async with AsyncComposio(
+        api_key="isolated-test",
+        http_client=httpx.AsyncClient(transport=httpx.MockTransport(handle)),
+        max_retries=0,
+    ) as client:
+        monkeypatch.setattr(composio, "_client", client)
+        await composio.get_available_apps(search="hackernews")
+        assert page_sizes == []
+
+        pages = await asyncio.gather(*(composio.get_available_apps() for _ in range(4)))
+        page = pages[0]
+        assert all(other == page for other in pages)
+        assert [app.name for app in page["items"]] == ["hackernews", "toolkit_0", "twitter"]
+        assert page["total"] == 3
+        assert page_sizes == [50, 50, 50, 50, 48]
+        index = await composio._get_custom_auth_config_index(client, scope)
+        assert len(index) == 3
+        assert {("toolkit_0", "OAUTH2"), ("toolkit_0", "API_KEY"), ("twitter", "OAUTH2")} <= index
+        assert await composio.get_available_apps() == page
+        assert page_sizes == [50, 50, 50, 50, 48]
+
+        configs.clear()
+        monkeypatch.setattr(
+            composio, "_custom_auth_config_index_at", datetime.now(UTC) - timedelta(minutes=5)
+        )
+        page = await composio.get_available_apps()
+        assert [app.name for app in page["items"]] == ["hackernews"]
+        assert page["total"] == 1
+        assert page_sizes == [50, 50, 50, 50, 48, 0]
+
+
+@pytest.mark.asyncio
+async def test_oauth_without_managed_auth_requires_existing_custom_auth_config(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    fake = FakeClient(
+        list_toolkits=[_twitter_detail_toolkit()],
+        detail_toolkits={"twitter": _twitter_detail_toolkit()},
+    )
+    monkeypatch.setattr(composio, "get_composio_client", lambda: fake)
+
+    with pytest.raises(composio.ConnectorCustomAuthConfigRequired):
+        await composio.create_connect_link(
+            "clerk_user_123",
+            "twitter",
+            "https://cloud.example.test/connectors/twitter",
+        )
+
+    assert fake.auth_configs.created == []
+    assert fake.link.created is None
+
+
+@pytest.mark.asyncio
+async def test_no_auth_connect_does_not_create_auth_config_or_connected_account(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    fake = FakeClient(
+        list_toolkits=[_hackernews_detail_toolkit()],
+        detail_toolkits={"hackernews": _hackernews_detail_toolkit()},
+    )
+    monkeypatch.setattr(composio, "get_composio_client", lambda: fake)
+
+    result = await composio.create_connect_link(
+        "clerk_user_123",
+        "hackernews",
+        "https://cloud.example.test/connectors/hackernews",
+    )
+
+    assert result.model_dump() == {
+        "connect_url": "https://cloud.example.test/connectors/hackernews",
+        "id": "",
+    }
+    assert fake.auth_configs.created == []
+    assert fake.connected_accounts.created is None
+    assert fake.link.created is None
+
+
+@pytest.mark.asyncio
+async def test_no_auth_fields_are_empty_without_auth_config(monkeypatch: pytest.MonkeyPatch):
+    fake = FakeClient(
+        list_toolkits=[_hackernews_detail_toolkit()],
+        detail_toolkits={"hackernews": _hackernews_detail_toolkit()},
+    )
+    monkeypatch.setattr(composio, "get_composio_client", lambda: fake)
+
+    fields = await composio.get_auth_fields("hackernews")
+
+    assert fields.model_dump() == {"auth_scheme": "NO_AUTH", "expected_input_fields": []}
+    assert fake.auth_configs.created == []
+
+
+@pytest.mark.asyncio
+async def test_auth_fields_use_official_toolkit_initiation_fields(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    fake = FakeClient()
+    monkeypatch.setattr(composio, "get_composio_client", lambda: fake)
+
+    fields = await composio.get_auth_fields("posthog")
+
+    assert fields.model_dump() == {
+        "auth_scheme": "API_KEY",
+        "expected_input_fields": [
+            {
+                "name": "generic_api_key",
+                "display_name": "Generic API Key",
+                "description": "",
+                "type": "string",
+                "required": True,
+                "is_secret": True,
+                "expected_from_customer": True,
+                "default": None,
+            },
+        ],
+    }
+
+
+@pytest.mark.asyncio
+async def test_credentials_connect_uses_custom_auth_config_and_connected_account_create(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    fake = FakeClient()
+    monkeypatch.setattr(composio, "get_composio_client", lambda: fake)
+    composio._tool_router_session_cache["clerk_user_123"] = composio.ComposioMcpSession(
+        url="https://app.composio.dev/tool_router/v3/trs_old/mcp",
+        headers={},
+        expires_at=datetime.now(UTC) + timedelta(minutes=30),
+    )
+
+    result = await composio.connect_with_credentials(
+        "clerk_user_123",
+        "posthog",
+        {"generic_api_key": "phx_123"},
+        alias="Work PostHog",
+    )
+
+    assert result.model_dump() == {"id": "ca_posthog", "status": "active", "ok": True}
+    assert fake.auth_configs.created == [
+        {
+            "toolkit": {"slug": "posthog"},
+            "auth_config": {
+                "type": "use_custom_auth",
+                "auth_scheme": "API_KEY",
+                "credentials": {},
+                "name": "Clawdi posthog api_key",
+            },
+        }
+    ]
+    assert fake.connected_accounts.created == {
+        "auth_config": {"id": "ac_1"},
+        "connection": {
+            "user_id": "clerk_user_123",
+            "alias": "Work PostHog",
+            "state": {
+                "auth_scheme": "API_KEY",
+                "val": {"status": "ACTIVE", "generic_api_key": "phx_123"},
+            },
+        },
+    }
+    assert "clerk_user_123" not in composio._tool_router_session_cache
+
+
+@pytest.mark.asyncio
+async def test_credentials_connect_times_out_when_composio_stays_pending(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    connected_accounts = FakeConnectedAccounts(
+        create_status="INITIALIZING",
+        retrieve_statuses=["INITIALIZING"],
+    )
+    fake = FakeClient(connected_accounts=connected_accounts)
+    monkeypatch.setattr(composio, "get_composio_client", lambda: fake)
+
+    class SteppedClock:
+        def __init__(self) -> None:
+            self.values = iter((0.0, 10.0, 20.0))
+
+        def time(self) -> float:
+            return next(self.values)
+
+    sleep_calls: list[float] = []
+
+    async def advance(seconds: float) -> None:
+        sleep_calls.append(seconds)
+
+    clock = SteppedClock()
+    monkeypatch.setattr(composio.asyncio, "get_running_loop", lambda: clock)
+    monkeypatch.setattr(composio.asyncio, "sleep", advance)
+    composio._tool_router_session_cache["clerk_user_123"] = composio.ComposioMcpSession(
+        url="https://app.composio.dev/tool_router/v3/trs_old/mcp",
+        headers={},
+        expires_at=datetime.now(UTC) + timedelta(minutes=30),
+    )
+
+    with pytest.raises(composio.ComposioActivationTimeoutError):
+        await composio.connect_with_credentials(
+            "clerk_user_123",
+            "posthog",
+            {"generic_api_key": "phx_123"},
+        )
+
+    assert sleep_calls == [1.0]
+    assert connected_accounts.retrieve_calls == ["ca_posthog"]
+    assert "clerk_user_123" not in composio._tool_router_session_cache
+
+
+@pytest.mark.asyncio
+async def test_connect_credentials_route_rejects_non_active_connection(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    async def fake_connect_with_credentials(
+        user_id: str,
+        app_name: str,
+        credentials: dict[str, str],
+        *,
+        alias: str | None = None,
+    ):
+        assert alias is None
+        assert user_id == "clerk_user_123"
+        assert app_name == "posthog"
+        assert credentials == {"generic_api_key": "phx_123"}
+        return ConnectorCredentialsConnectResponse(id="ca_posthog", status="failed", ok=False)
+
+    monkeypatch.setattr(settings, "composio_api_key", "composio_test_key")
+    monkeypatch.setattr(connectors, "connect_with_credentials", fake_connect_with_credentials)
+
+    with pytest.raises(connectors.HTTPException) as exc_info:
+        await connectors.connect_credentials(
+            "posthog",
+            connectors.ConnectorCredentialsConnectRequest(
+                credentials={"generic_api_key": "phx_123"}
+            ),
+            AuthContext(user=User(clerk_id="clerk_user_123")),
+        )
+
+    assert exc_info.value.status_code == 400
+    assert exc_info.value.detail == "Composio returned connection status failed"
+
+
+@pytest.mark.asyncio
+async def test_list_connections_invalidates_tool_router_session(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    async def fake_get_connected_accounts(user_id: str):
+        assert user_id == "clerk_user_123"
+        return []
+
+    monkeypatch.setattr(settings, "composio_api_key", "composio_test_key")
+    monkeypatch.setattr(connectors, "get_all_connected_accounts", fake_get_connected_accounts)
+    composio._tool_router_session_cache["clerk_user_123"] = composio.ComposioMcpSession(
+        url="https://app.composio.dev/tool_router/v3/trs_old/mcp",
+        headers={},
+        expires_at=datetime.now(UTC) + timedelta(minutes=30),
+    )
+
+    result = await connectors.list_connections(
+        Request({"type": "http"}), AuthContext(user=User(clerk_id="clerk_user_123"))
+    )
+
+    assert result == []
+    assert "clerk_user_123" not in composio._tool_router_session_cache
+
+
+@pytest.mark.asyncio
+async def test_disconnect_invalidates_tool_router_session(monkeypatch: pytest.MonkeyPatch):
+    async def fake_get_owned_account(user_id: str, connection_id: str):
+        assert user_id == "clerk_user_123" and connection_id == "ca_posthog"
+
+    async def fake_disconnect_account(connection_id: str):
+        assert connection_id == "ca_posthog"
+        return True
+
+    monkeypatch.setattr(settings, "composio_api_key", "composio_test_key")
+    monkeypatch.setattr(composio, "get_owned_account", fake_get_owned_account)
+    monkeypatch.setattr(composio, "disconnect_account", fake_disconnect_account)
+    composio._tool_router_session_cache["clerk_user_123"] = composio.ComposioMcpSession(
+        url="https://app.composio.dev/tool_router/v3/trs_old/mcp",
+        headers={},
+        expires_at=datetime.now(UTC) + timedelta(minutes=30),
+    )
+
+    result = await connectors.disconnect(
+        "ca_posthog",
+        AuthContext(user=User(clerk_id="clerk_user_123")),
+    )
+
+    assert result.status == "disconnected"
+    assert "clerk_user_123" not in composio._tool_router_session_cache
+
+
+@pytest.mark.asyncio
+async def test_map_composio_client_bad_request_to_safe_credential_error():
+    from composio_client import BadRequestError
+
+    exc = _composio_client_status_error(
+        BadRequestError,
+        400,
+        {
+            "error": {
+                "message": "Metabase rejected API key mb_secret_123",
+                "code": 10400,
+            }
+        },
+    )
+
+    async def fail_request() -> None:
+        raise exc
+
+    with pytest.raises(composio.ComposioProviderError) as exc_info:
+        await composio._call_generated_sdk(
+            fail_request(),
+            credentials={"generic_api_key": "mb_secret_123"},
+        )
+
+    mapped = connectors.map_composio_error(exc_info.value)
+
+    assert mapped.status_code == 400
+    assert mapped.detail == "Metabase rejected API key ***"
+
+
+@pytest.mark.asyncio
+async def test_map_composio_client_not_found_to_connector_not_found():
+    from composio_client import NotFoundError
+
+    exc = _composio_client_status_error(
+        NotFoundError,
+        404,
+        {"error": {"message": "Toolkit metabase not found"}},
+    )
+
+    async def fail_request() -> None:
+        raise exc
+
+    with pytest.raises(composio.ComposioProviderError) as exc_info:
+        await composio._call_generated_sdk(fail_request())
+
+    mapped = connectors.map_composio_error(exc_info.value)
+
+    assert mapped.status_code == 404
+    assert mapped.detail == "Connector not found"
+
+
+def test_map_custom_oauth_config_required_to_actionable_bad_request():
+    mapped = connectors.map_composio_error(
+        composio.ConnectorCustomAuthConfigRequired("twitter", "OAUTH2")
+    )
+
+    assert mapped.status_code == 400
+    assert mapped.detail == composio.CUSTOM_OAUTH_CONFIG_REQUIRED_MESSAGE
+
+
+@pytest.mark.asyncio
+async def test_catalog_rejects_malformed_sdk_page_instead_of_returning_empty(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class MalformedToolkits(FakeToolkits):
+        async def list(
+            self,
+            *,
+            managed_by: str,
+            sort_by: str,
+            limit: int,
+            cursor: str | None = None,
+        ) -> _MalformedResponse:
+            assert (managed_by, sort_by, limit, cursor) == ("composio", "usage", 1000, None)
+            return _MalformedResponse()
+
+    fake = FakeClient()
+    fake.toolkits = MalformedToolkits(
+        list_toolkits=[_posthog_list_toolkit()],
+        detail_toolkits={"posthog": _posthog_detail_toolkit()},
+    )
+    monkeypatch.setattr(composio, "get_composio_client", lambda: fake)
+
+    with pytest.raises(composio.ComposioProtocolError):
+        await composio.get_available_apps()
+
+    mapped = connectors.map_composio_error(
+        composio.ComposioProtocolError("provider detail must stay private")
+    )
+    assert mapped.status_code == 502
+    assert mapped.detail == "Composio request failed"
+
+
+@pytest.mark.asyncio
+async def test_connect_link_rejects_missing_provider_account_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class MalformedLink(FakeLink):
+        async def create(
+            self,
+            *,
+            auth_config_id: str,
+            user_id: str,
+            callback_url: str | None = None,
+            alias: object = None,
+        ) -> _MalformedConnectLinkResponse:
+            assert auth_config_id and user_id and callback_url
+            return _MalformedConnectLinkResponse(
+                redirect_url="https://connect.composio.dev/request_123"
+            )
+
+    fake = FakeClient(
+        list_toolkits=[_gmail_detail_toolkit()],
+        detail_toolkits={"gmail": _gmail_detail_toolkit()},
+    )
+    fake.link = MalformedLink()
+    monkeypatch.setattr(composio, "get_composio_client", lambda: fake)
+
+    with pytest.raises(composio.ComposioProtocolError):
+        await composio.create_connect_link(
+            "clerk_user_123",
+            "gmail",
+            "https://cloud.example.test/connectors/gmail",
+        )
+
+
+@pytest.mark.asyncio
+async def test_connect_route_rejects_disabled_connector_without_oauth_link(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    async def fake_get_app_by_name(app_name: str):
+        assert app_name == "twitter"
+        return ConnectorAvailableAppResponse(
+            name="twitter",
+            display_name="Twitter",
+            logo="",
+            description="",
+            auth_type="oauth2",
+            connect_disabled=True,
+            connect_disabled_reason=composio.CUSTOM_OAUTH_CONFIG_REQUIRED_MESSAGE,
+        )
+
+    async def fail_create_connect_link(*args, **kwargs):
+        raise AssertionError("disabled connectors must not start the OAuth link flow")
+
+    monkeypatch.setattr(settings, "composio_api_key", "composio_test_key")
+    monkeypatch.setattr(connectors, "get_app_by_name", fake_get_app_by_name)
+    monkeypatch.setattr(connectors, "create_connect_link", fail_create_connect_link)
+
+    with pytest.raises(connectors.HTTPException) as exc_info:
+        await connectors.connect_app(
+            "twitter",
+            None,
+            AuthContext(user=User(clerk_id="clerk_user_123")),
+        )
+
+    assert exc_info.value.status_code == 400
+    assert exc_info.value.detail == composio.CUSTOM_OAUTH_CONFIG_REQUIRED_MESSAGE
+
+
+@pytest.mark.asyncio
+async def test_connect_route_rejects_credentials_connector_before_oauth_link(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    async def fake_get_app_by_name(app_name: str):
+        assert app_name == "posthog"
+        return ConnectorAvailableAppResponse(
+            name="posthog",
+            display_name="PostHog",
+            logo="",
+            description="",
+            auth_type="api_key",
+        )
+
+    async def fail_create_connect_link(*args, **kwargs):
+        raise AssertionError("credential connectors must not start the OAuth link flow")
+
+    monkeypatch.setattr(settings, "composio_api_key", "composio_test_key")
+    monkeypatch.setattr(connectors, "get_app_by_name", fake_get_app_by_name)
+    monkeypatch.setattr(connectors, "create_connect_link", fail_create_connect_link)
+
+    with pytest.raises(connectors.HTTPException) as exc_info:
+        await connectors.connect_app(
+            "posthog",
+            None,
+            AuthContext(user=User(clerk_id="clerk_user_123")),
+        )
+
+    assert exc_info.value.status_code == 400
+    assert exc_info.value.detail == "Connector requires credentials"
+
+
+@pytest.mark.asyncio
+async def test_connect_route_maps_protocol_failure_without_oauth_link(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    async def fake_get_app_by_name(app_name: str):
+        assert app_name == "posthog"
+        raise composio.ComposioProtocolError("provider detail must stay private")
+
+    async def fail_create_connect_link(*args, **kwargs):
+        raise AssertionError("missing auth metadata must not start the OAuth link flow")
+
+    monkeypatch.setattr(settings, "composio_api_key", "composio_test_key")
+    monkeypatch.setattr(connectors, "get_app_by_name", fake_get_app_by_name)
+    monkeypatch.setattr(connectors, "create_connect_link", fail_create_connect_link)
+
+    with pytest.raises(connectors.HTTPException) as exc_info:
+        await connectors.connect_app(
+            "posthog",
+            None,
+            AuthContext(user=User(clerk_id="clerk_user_123")),
+        )
+
+    assert exc_info.value.status_code == 502
+    assert exc_info.value.detail == "Composio request failed"
+
+
+@pytest.mark.asyncio
+async def test_connect_route_rejects_unknown_auth_type_without_oauth_link(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    async def fake_get_app_by_name(app_name: str):
+        assert app_name == "posthog"
+        return ConnectorAvailableAppResponse(
+            name="posthog",
+            display_name="PostHog",
+            logo="",
+            description="",
+            auth_type="unknown",
+        )
+
+    async def fail_create_connect_link(*args, **kwargs):
+        raise AssertionError("unknown auth metadata must not start the OAuth link flow")
+
+    monkeypatch.setattr(settings, "composio_api_key", "composio_test_key")
+    monkeypatch.setattr(connectors, "get_app_by_name", fake_get_app_by_name)
+    monkeypatch.setattr(connectors, "create_connect_link", fail_create_connect_link)
+
+    with pytest.raises(connectors.HTTPException) as exc_info:
+        await connectors.connect_app(
+            "posthog",
+            None,
+            AuthContext(user=User(clerk_id="clerk_user_123")),
+        )
+
+    assert exc_info.value.status_code == 502
+    assert exc_info.value.detail == "Connector auth metadata unavailable"
+
+
+@pytest.mark.asyncio
+async def test_tools_route_maps_sanitized_composio_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def invalid_tools(_app_name: str):
+        raise composio.ComposioProtocolError("provider detail must stay private")
+
+    monkeypatch.setattr(settings, "composio_api_key", "composio_test_key")
+    monkeypatch.setattr(connectors, "get_app_tools", invalid_tools)
+
+    with pytest.raises(connectors.HTTPException) as exc_info:
+        await connectors.list_app_tools(
+            "posthog",
+            AuthContext(user=User(clerk_id="clerk_user_123")),
+        )
+
+    assert exc_info.value.status_code == 502
+    assert exc_info.value.detail == "Composio request failed"
+
+
+def test_composio_request_boundary_validates_complete_public_request_types():
+    connected_account_request = composio._connected_account_create_request(
+        auth_config_id="ac_posthog",
+        user_id="user_123",
+        auth_scheme="API_KEY",
+        credentials={"api_key": "test-secret"},
+    )
+    auth_config_request = composio._auth_config_create_request(
+        app_name="posthog", auth_scheme="API_KEY", managed=False
+    )
+
+    assert connected_account_request == {
+        "auth_config": {"id": "ac_posthog"},
+        "connection": {
+            "user_id": "user_123",
+            "state": {
+                "auth_scheme": "API_KEY",
+                "val": {"status": "ACTIVE", "api_key": "test-secret"},
+            },
+        },
+    }
+    assert auth_config_request == {
+        "toolkit": {"slug": "posthog"},
+        "auth_config": {
+            "type": "use_custom_auth",
+            "auth_scheme": "API_KEY",
+            "credentials": {},
+            "name": "Clawdi posthog api_key",
+        },
+    }
+
+
+def test_composio_request_boundary_rejects_unknown_auth_scheme():
+    with pytest.raises(ValidationError):
+        composio._connected_account_create_request(
+            auth_config_id="ac_example",
+            user_id="user_123",
+            auth_scheme="UNKNOWN",
+            credentials={"token": "test-secret"},
+        )
+
+    with pytest.raises(ValidationError):
+        composio._auth_config_create_request(
+            app_name="example", auth_scheme="UNKNOWN", managed=False
+        )
+
+
+@pytest.mark.parametrize(
+    ("data", "state", "expected"),
+    [
+        ({"email": " work@example.test ", "label": "gmail_red-castle"}, {}, "work@example.test"),
+        ({"username": "octocat"}, {"val": {"email": "work@example.test"}}, "work@example.test"),
+        ({}, {"val": {"authed_user": {"username": " octocat "}}}, "octocat"),
+        ({}, {"val": {"authedUser": {"email": "work@example.test"}}}, "work@example.test"),
+        ({"email": " ", "username": 123}, {}, None),
+        (
+            {"connectionLabel": "gmail_red-castle", "connection_label": "Work", "label": "Work"},
+            {},
+            None,
+        ),
+    ],
+)
+def test_connected_account_display_uses_only_account_identity(data, state, expected):
+    account = composio._ConnectedAccount.model_validate(
+        {
+            "id": "ca_gmail",
+            "alias": "Work Gmail",
+            "word_id": "gmail_red-castle",
+            "created_at": "2026-09-03T00:00:00Z",
+            "status": "ACTIVE",
+            "toolkit": {"slug": "gmail"},
+            "data": data,
+            "state": state,
+        }
+    )
+
+    assert composio._account_display_label(account) == expected
+
+
+async def test_close_composio_client_uses_public_sdk_lifecycles(monkeypatch):
+    from composio import Composio
+    from composio_client import AsyncComposio
+
+    session = composio.ComposioMcpSession(
+        url="https://composio.test/mcp",
+        headers={},
+        expires_at=datetime.now(UTC) + timedelta(minutes=30),
+    )
+    started = asyncio.Event()
+    stopped = asyncio.Event()
+
+    async def pending_list(_session):
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            stopped.set()
+
+    monkeypatch.setattr(composio, "_tool_router_session_cache", {"close-user": session})
+    monkeypatch.setattr(composio, "_tool_router_tools_cache", {})
+    monkeypatch.setattr(composio, "_tool_router_tools_inflight", {})
+    monkeypatch.setattr(composio, "list_tool_router_mcp_tools", pending_list)
+    composio._client = AsyncComposio(api_key="test-key")
+    composio._sdk_client = Composio(api_key="test-key")
+
+    waiter = asyncio.create_task(composio.get_tool_router_mcp_tools("close-user"))
+    await started.wait()
+    load = composio._tool_router_tools_inflight["close-user"]
+    await composio.close_composio_client()
+
+    with pytest.raises(asyncio.CancelledError):
+        await waiter
+    assert load.cancelled()
+    assert stopped.is_set()
+    assert composio._tool_router_session_cache == {}
+    assert composio._tool_router_tools_cache == {}
+    assert composio._tool_router_tools_inflight == {}
+    assert composio._client is None
+    assert composio._sdk_client is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("alias,status", [("工作邮箱", "EXPIRED"), ("", "ACTIVE")])
+async def test_alias_patch_uses_owned_account_and_returns_fresh_identity(
+    monkeypatch, alias, status
+):
+    import json
+
+    from composio_client import AsyncComposio
+
+    account = {
+        "id": "ca_gmail",
+        "toolkit": {"slug": "gmail"},
+        "status": status,
+        "created_at": "2026-09-03T00:00:00Z",
+        "alias": "old",
+        "is_disabled": True,
+        "data": {"email": "work@example.test", "access_token": "private-token"},
+        "state": {
+            "authScheme": "OAUTH2",
+            "val": {"status": status, "access_token": "private-token"},
+        },
+    }
+    requests = []
+
+    def handle(request):
+        requests.append(request)
+        if request.url.path.endswith("/connected_accounts"):
+            assert request.url.params["user_ids"] == "clerk_user_123"
+            assert request.url.params["connected_account_ids"] == "ca_gmail"
+            assert "statuses" not in request.url.params
+            return httpx.Response(200, json={"items": [account]})
+        if request.method == "PATCH":
+            assert json.loads(request.content) == {"alias": alias}
+            account["alias"] = alias or None
+            return httpx.Response(200, json={"id": "ca_gmail", "status": status, "success": True})
+        return httpx.Response(200, json=account)
+
+    async with AsyncComposio(
+        api_key="test", http_client=httpx.AsyncClient(transport=httpx.MockTransport(handle))
+    ) as sdk:
+        monkeypatch.setattr(composio, "get_composio_client", lambda: sdk)
+        monkeypatch.setattr(settings, "composio_api_key", "test")
+        composio._tool_router_session_cache["clerk_user_123"] = composio.ComposioMcpSession(
+            url="https://example.test/mcp",
+            headers={},
+            expires_at=datetime.now(UTC) + timedelta(minutes=30),
+        )
+        result = await connectors.update_connection(
+            "ca_gmail",
+            connectors.ConnectorUpdateRequest(alias=alias),
+            AuthContext(user=User(clerk_id="clerk_user_123")),
+        )
+    assert [r.method for r in requests] == ["GET", "PATCH", "GET"]
+    assert result.alias == (alias or None)
+    assert result.account_display == "work@example.test"
+    assert result.status == status
+    assert "private-token" not in result.model_dump_json()
+    assert "clerk_user_123" not in composio._tool_router_session_cache
+
+
+@pytest.mark.parametrize("failure", ["status", "deadline", "cursor"])
+async def test_custom_auth_index_failure_fans_out_then_retries(monkeypatch, failure):
+    from composio_client import AsyncComposio
+
+    calls = 0
+    fail = True
+    joined = 0
+    all_joined = asyncio.Event()
+    page_started = asyncio.Event()
+
+    async def handle(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        cursor = request.url.params.get("cursor")
+        if cursor:
+            page_started.set()
+            if fail:
+                await all_joined.wait()
+                if failure == "deadline":
+                    await asyncio.Event().wait()
+                await asyncio.sleep(0.1)
+                if failure == "status":
+                    return httpx.Response(503, json={"message": "private upstream detail"})
+                return httpx.Response(200, json={"items": [], "next_cursor": "next"})
+        return httpx.Response(200, json={"items": [], "next_cursor": None if cursor else "next"})
+
+    monkeypatch.setattr(composio, "_CUSTOM_AUTH_CONFIG_INDEX_TIMEOUT_SECONDS", 0.5)
+    async with AsyncComposio(
+        api_key="isolated-test",
+        max_retries=0,
+        http_client=httpx.AsyncClient(transport=httpx.MockTransport(handle)),
+    ) as sdk:
+
+        async def read():
+            nonlocal joined
+            joined += 1
+            if joined == 8:
+                all_joined.set()
+            return await composio._get_custom_auth_config_index(sdk, frozenset({"twitter"}))
+
+        readers = [asyncio.create_task(read()) for _ in range(8)]
+        try:
+            await asyncio.wait_for(page_started.wait(), timeout=2)
+            started = asyncio.get_running_loop().time()
+            results = await asyncio.wait_for(
+                asyncio.gather(*readers, return_exceptions=True), timeout=2
+            )
+            elapsed = asyncio.get_running_loop().time() - started
+            assert calls == 2  # One two-page failure, not eight serial retries.
+            assert all(result is results[0] for result in results)
+            error = results[0]
+            if failure == "cursor":
+                assert isinstance(error, composio.ComposioProtocolError)
+            else:
+                assert isinstance(error, composio.ComposioProviderError)
+                assert error.failure.kind == ("timeout" if failure == "deadline" else "status")
+                assert "private upstream detail" not in str(error)
+            assert composio._custom_auth_config_index is None
+            assert composio._custom_auth_config_index_at is None
+            assert composio._custom_auth_config_index_task is None
+            print(f"index failure={failure} n=8 batch_ms={elapsed * 1000:.1f} sdk_calls={calls}")
+            fail = False
+            assert (
+                await composio._get_custom_auth_config_index(sdk, frozenset({"twitter"}))
+                == frozenset()
+            )
+            assert calls == 4  # A later independent request can retry immediately.
+        finally:
+            for reader in readers:
+                reader.cancel()
+            await asyncio.gather(*readers, return_exceptions=True)
+            task = composio._custom_auth_config_index_task
+            if task is not None:
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.parametrize("cancel", ["first", "second", "all", "shutdown"])
+async def test_custom_auth_index_waiter_cancellation_and_shutdown(monkeypatch, cancel):
+    from composio_client import AsyncComposio
+
+    started = asyncio.Event()
+    joined = asyncio.Event()
+    release = asyncio.Event()
+    stopped = asyncio.Event()
+    calls = 0
+
+    async def handle(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        cursor = request.url.params.get("cursor")
+        if cursor:
+            started.set()
+            try:
+                await release.wait()
+            finally:
+                # Shutdown must join provider cleanup before closing its client.
+                await asyncio.sleep(0)
+                assert not sdk.is_closed()
+                stopped.set()
+        return httpx.Response(200, json={"items": [], "next_cursor": None if cursor else "next"})
+
+    async with AsyncComposio(
+        api_key="isolated-test",
+        max_retries=0,
+        http_client=httpx.AsyncClient(transport=httpx.MockTransport(handle)),
+    ) as sdk:
+        monkeypatch.setattr(composio, "_client", sdk)
+        monkeypatch.setattr(composio, "_sdk_client", None)
+
+        async def read_second():
+            joined.set()
+            return await composio._get_custom_auth_config_index(sdk, frozenset({"twitter"}))
+
+        first = asyncio.create_task(
+            composio._get_custom_auth_config_index(sdk, frozenset({"twitter"}))
+        )
+        second = None
+        try:
+            await asyncio.wait_for(started.wait(), timeout=2)
+            second = asyncio.create_task(read_second())
+            await asyncio.wait_for(joined.wait(), timeout=2)
+            task = composio._custom_auth_config_index_task
+            assert task is not None
+            if cancel == "shutdown":
+                await asyncio.wait_for(composio.close_composio_client(), timeout=2)
+                assert stopped.is_set() and sdk.is_closed()
+                assert task.cancelled()
+                assert composio._custom_auth_config_index is None
+                assert composio._custom_auth_config_index_at is None
+                assert composio._custom_auth_config_index_task is None
+                for reader in (first, second):
+                    with pytest.raises(asyncio.CancelledError):
+                        await reader
+            else:
+                cancelled = (
+                    (first, second)
+                    if cancel == "all"
+                    else (first if cancel == "first" else second,)
+                )
+                for reader in cancelled:
+                    reader.cancel()
+                    with pytest.raises(asyncio.CancelledError):
+                        await reader
+                assert not task.done()
+                release.set()
+                assert await asyncio.wait_for(asyncio.shield(task), timeout=2) == frozenset()
+                for reader in (first, second):
+                    if reader not in cancelled:
+                        assert await reader == frozenset()
+                assert calls == 2
+        finally:
+            release.set()
+            readers = [reader for reader in (first, second) if reader is not None]
+            for reader in readers:
+                reader.cancel()
+            await asyncio.gather(*readers, return_exceptions=True)
+            await composio.close_composio_client()
+
+
+@pytest.mark.parametrize("first_fails", [False, True])
+async def test_custom_auth_index_coverage_tracks_full_catalog_not_search(monkeypatch, first_fails):
+    from composio_client import AsyncComposio
+
+    started = asyncio.Event()
+    release = asyncio.Event()
+    calls = []
+
+    def catalog(slugs):
+        return [
+            composio._normalize_sdk_response(
+                _twitter_detail_toolkit().model_copy(update={"slug": slug, "name": slug}),
+                composio._Toolkit,
+            )
+            for slug in slugs
+        ]
+
+    async def handle(request: httpx.Request) -> httpx.Response:
+        scope = request.url.params["toolkit_slug"]
+        calls.append(scope)
+        if scope == "alpha,beta":
+            started.set()
+            await release.wait()
+            if first_fails:
+                return httpx.Response(503, json={"message": "upstream unavailable"})
+        items = [
+            {
+                "id": "synthetic",
+                "toolkit": {"slug": slug},
+                "auth_scheme": "OAUTH2",
+                "status": "ENABLED",
+                "is_composio_managed": False,
+            }
+            for slug in scope.split(",")
+        ]
+        # Even a provider ignoring its filters must not contaminate the index.
+        items.extend(
+            [
+                {**items[0], "toolkit": {"slug": "unrelated"}},
+                {**items[0], "auth_scheme": "API_KEY", "status": "DISABLED"},
+                {**items[0], "auth_scheme": "BASIC", "is_composio_managed": True},
+                {**items[0], "auth_scheme": ""},
+            ]
+        )
+        return httpx.Response(200, json={"items": items, "next_cursor": None})
+
+    monkeypatch.setattr(composio, "_toolkits_cache", catalog(["alpha", "beta"]))
+    monkeypatch.setattr(composio, "_toolkits_cache_at", datetime.now(UTC))
+    async with AsyncComposio(
+        api_key="isolated-test",
+        max_retries=0,
+        http_client=httpx.AsyncClient(transport=httpx.MockTransport(handle)),
+    ) as sdk:
+        monkeypatch.setattr(composio, "_client", sdk)
+        readers = [
+            asyncio.create_task(composio.get_available_apps(search=slug))
+            for slug in ("alpha", "beta")
+        ]
+        try:
+            await asyncio.wait_for(started.wait(), timeout=2)
+            # A catalog refresh while the old scope is in flight must not share
+            # its incomplete coverage or its failure with a new scope.
+            monkeypatch.setattr(composio, "_toolkits_cache", catalog(["alpha", "beta", "gamma"]))
+            readers.append(asyncio.create_task(composio.get_available_apps(search="gamma")))
+            await asyncio.sleep(0)
+            assert calls == ["alpha,beta"]
+            release.set()
+            results = await asyncio.wait_for(
+                asyncio.gather(*readers, return_exceptions=True), timeout=2
+            )
+            if first_fails:
+                assert isinstance(results[0], composio.ComposioProviderError)
+                assert results[0] is results[1]
+            else:
+                assert [[app.name for app in page["items"]] for page in results[:2]] == [
+                    ["alpha"],
+                    ["beta"],
+                ]
+            assert [app.name for app in results[2]["items"]] == ["gamma"]
+            assert calls == ["alpha,beta", "alpha,beta,gamma"]
+            assert composio._custom_auth_config_index_scope == frozenset({"alpha", "beta", "gamma"})
+            assert composio._custom_auth_config_index == frozenset(
+                (slug, "OAUTH2") for slug in ("alpha", "beta", "gamma")
+            )
+            page = await composio.get_available_apps(search="beta")
+            assert [app.name for app in page["items"]] == ["beta"]
+            assert len(calls) == 2
+            # A subsequent changed set invalidates even an unexpired cache.
+            monkeypatch.setattr(composio, "_toolkits_cache", catalog(["delta"]))
+            page = await composio.get_available_apps(search="delta")
+            assert [app.name for app in page["items"]] == ["delta"]
+            assert calls[-1] == "delta"
+        finally:
+            release.set()
+            for reader in readers:
+                reader.cancel()
+            await asyncio.gather(*readers, return_exceptions=True)
+            await composio.close_composio_client()
+
+
+@pytest.mark.parametrize(
+    "scope",
+    [
+        frozenset(),
+        frozenset({""}),
+        frozenset({"a,b"}),
+        frozenset({"a\nb"}),
+        frozenset({"a\ud800b"}),
+    ],
+)
+async def test_custom_auth_index_empty_or_malformed_scope_never_fetches(scope):
+    from composio_client import AsyncComposio
+
+    def handle(request):
+        pytest.fail("Empty or malformed scope must not trigger an unfiltered request")
+
+    async with AsyncComposio(
+        api_key="isolated-test",
+        max_retries=0,
+        http_client=httpx.AsyncClient(transport=httpx.MockTransport(handle)),
+    ) as sdk:
+        if scope:
+            with pytest.raises(composio.ComposioProtocolError):
+                await composio._get_custom_auth_config_index(sdk, scope)
+        else:
+            assert await composio._get_custom_auth_config_index(sdk, scope) == frozenset()

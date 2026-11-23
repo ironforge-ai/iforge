@@ -1,0 +1,491 @@
+from __future__ import annotations
+
+import asyncio
+from uuid import UUID
+
+import pytest
+from sqlalchemy.exc import DBAPIError
+
+import app.services.whatsapp_sidecar_registry as sidecar_registry_module
+from app.services.whatsapp_delivery_transport import resolve_whatsapp_delivery_transport
+from app.services.whatsapp_native_transport import (
+    WhatsAppBaileysSidecarConfig,
+    WhatsAppProviderMessageEvent,
+    WhatsAppRejectedProviderEvent,
+)
+from app.services.whatsapp_provider_bridge import (
+    WhatsAppProviderAccountRetired,
+    get_whatsapp_provider_transport,
+    whatsapp_provider_transport_status,
+)
+from app.services.whatsapp_sidecar_registry import (
+    ConfiguredWhatsAppSidecarClientPool,
+    ConfiguredWhatsAppSidecarRegistry,
+    get_active_whatsapp_sidecar_clients,
+    get_active_whatsapp_sidecar_registry,
+)
+
+
+class _StringDataRightTruncationError(ValueError):
+    sqlstate = "22001"
+
+
+class _FakeSidecarClient:
+    def __init__(self, config: WhatsAppBaileysSidecarConfig) -> None:
+        self.config = config
+        self.connected = False
+        self.closed = False
+
+    async def aclose(self) -> None:
+        self.closed = True
+
+    async def provider_events(self, *, limit: int = 100, wait_ms: int = 0):
+        assert limit == 1
+        assert wait_ms in {0, 8_000}
+        return []
+
+    async def acknowledge_provider_events(self, *, through_sequence: int):
+        raise AssertionError(through_sequence)
+
+    async def relay_message(self, request):
+        raise AssertionError(request)
+
+    async def send_node(self, node):
+        raise AssertionError(node)
+
+    async def query(self, node, timeout_ms):
+        raise AssertionError((node, timeout_ms))
+
+
+@pytest.mark.asyncio
+async def test_client_pool_exposes_sidecar_sessions_without_transport_ownership():
+    session_id = UUID("00000000-0000-4000-8000-000000000887")
+    pool = ConfiguredWhatsAppSidecarClientPool(
+        "secret",
+        client_factory=_FakeSidecarClient,
+    )
+    await pool.start()
+    try:
+        assert get_active_whatsapp_sidecar_clients() is pool
+        assert get_active_whatsapp_sidecar_registry() is None
+        assert pool.session_client(session_id) is not None
+        assert whatsapp_provider_transport_status(session_id).available is False
+    finally:
+        await pool.stop()
+
+
+@pytest.mark.asyncio
+async def test_registry_uses_one_endpoint_for_distinct_opaque_sessions():
+    first_id = UUID("00000000-0000-4000-8000-000000000888")
+    second_id = UUID("00000000-0000-4000-8000-000000000889")
+    clients: list[_FakeSidecarClient] = []
+
+    def factory(config: WhatsAppBaileysSidecarConfig) -> _FakeSidecarClient:
+        client = _FakeSidecarClient(config)
+        clients.append(client)
+        return client
+
+    registry = ConfiguredWhatsAppSidecarRegistry("secret", client_factory=factory)
+    await registry.start()
+    try:
+        first = registry.get_managed_client(first_id)
+        second = registry.get_custom_client(second_id)
+
+        assert first is clients[0]
+        assert second is clients[1]
+        assert clients[0].config.account_id == first_id
+        assert clients[1].config.account_id == second_id
+        assert clients[0].config.endpoint_identity == clients[1].config.endpoint_identity
+        assert clients[0].config.unix_socket_path == "/run/clawdi-whatsapp/sidecar.sock"
+        assert whatsapp_provider_transport_status(first_id).available is False
+        assert whatsapp_provider_transport_status(second_id).available is False
+    finally:
+        await registry.stop()
+
+    assert all(client.closed for client in clients)
+
+
+@pytest.mark.asyncio
+async def test_disabled_registry_is_inert():
+    registry = ConfiguredWhatsAppSidecarRegistry("")
+    await registry.start()
+    try:
+        assert registry.enabled is False
+        assert registry.get_managed_client(UUID(int=1)) is None
+        assert registry.get_custom_client(UUID(int=2)) is None
+    finally:
+        await registry.stop()
+
+
+@pytest.mark.asyncio
+async def test_delivery_transport_resolves_custom_session() -> None:
+    account_id = UUID("00000000-0000-4000-8000-000000000891")
+    session_id = UUID("00000000-0000-4000-8000-000000000892")
+    pool = ConfiguredWhatsAppSidecarClientPool("secret", client_factory=_FakeSidecarClient)
+    account = sidecar_registry_module.ChannelAccount(
+        id=account_id,
+        provider="whatsapp",
+        config={
+            "connection_mode": "baileys_custom",
+            "sidecar_account_id": str(session_id),
+            "sidecar_config_revision": pool.session_revision(session_id),
+        },
+    )
+    await pool.start()
+    try:
+        assert resolve_whatsapp_delivery_transport(account) is not None
+        assert get_whatsapp_provider_transport(account_id) is None
+        client = pool.session_client(session_id)
+        assert client.config.account_id == session_id
+    finally:
+        await pool.stop()
+    assert client.closed
+    assert resolve_whatsapp_delivery_transport(account) is None
+
+
+@pytest.mark.asyncio
+async def test_provider_ingress_ack_waits_until_persistence_returns(monkeypatch):
+    account_id = UUID("00000000-0000-4000-8000-000000000903")
+    event = WhatsAppProviderMessageEvent(
+        sequence=7,
+        message_id="provider-7",
+        remote_jid="15550001111@s.whatsapp.net",
+        remote_jid_alt=None,
+        participant=None,
+        participant_alt=None,
+        push_name=None,
+        message_timestamp=None,
+        message_proto=b"\x0a\x05hello",
+    )
+    persistence_started = asyncio.Event()
+    allow_persistence_return = asyncio.Event()
+    acknowledged = asyncio.Event()
+    order: list[str] = []
+
+    class SessionContext:
+        async def __aenter__(self):
+            return object()
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            return False
+
+    async def persist(_db, *, account_id, event):
+        assert account_id == UUID("00000000-0000-4000-8000-000000000903")
+        assert event.sequence == 7
+        order.append("persistence-started")
+        persistence_started.set()
+        await allow_persistence_return.wait()
+        order.append("persistence-returned-after-commit")
+
+    class PumpClient:
+        def __init__(self) -> None:
+            self._first_poll = True
+
+        async def provider_events(self, *, limit: int = 100, wait_ms: int = 0):
+            assert limit == 1
+            assert wait_ms == 8_000
+            if self._first_poll:
+                self._first_poll = False
+                return [event]
+            await asyncio.Future()
+
+        async def acknowledge_provider_events(self, *, through_sequence: int):
+            assert through_sequence == 7
+            order.append("acknowledged")
+            acknowledged.set()
+
+    monkeypatch.setattr(sidecar_registry_module, "async_session_factory", lambda: SessionContext())
+    monkeypatch.setattr(sidecar_registry_module, "persist_whatsapp_provider_event", persist)
+    registry = ConfiguredWhatsAppSidecarRegistry("")
+    task = asyncio.create_task(registry._pump_provider_ingress(account_id, PumpClient()))
+    try:
+        await asyncio.wait_for(persistence_started.wait(), timeout=1)
+        assert order == ["persistence-started"]
+        allow_persistence_return.set()
+        await asyncio.wait_for(acknowledged.wait(), timeout=1)
+        assert order == [
+            "persistence-started",
+            "persistence-returned-after-commit",
+            "acknowledged",
+        ]
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_provider_ingress_bounds_empty_long_poll_retries():
+    account_id = UUID("00000000-0000-4000-8000-000000000905")
+    second_request = asyncio.Event()
+    calls = 0
+
+    class PumpClient:
+        async def provider_events(self, *, limit: int = 100, wait_ms: int = 0):
+            nonlocal calls
+            calls += 1
+            assert limit == 1
+            assert wait_ms == 8_000
+            if calls == 2:
+                second_request.set()
+                await asyncio.Future()
+            return []
+
+        async def acknowledge_provider_events(self, *, through_sequence: int):
+            raise AssertionError(through_sequence)
+
+    registry = ConfiguredWhatsAppSidecarRegistry("")
+    task = asyncio.create_task(registry._pump_provider_ingress(account_id, PumpClient()))
+    try:
+        await asyncio.wait_for(second_request.wait(), timeout=1)
+        assert calls == 2
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("first_event", "terminal_reason"),
+    [
+        (WhatsAppRejectedProviderEvent(sequence=1, reason="invalid_schema"), "invalid_schema"),
+        (
+            WhatsAppProviderMessageEvent(
+                sequence=1,
+                message_id="provider-invalid-1",
+                remote_jid="15550001111@s.whatsapp.net",
+                remote_jid_alt=None,
+                participant=None,
+                participant_alt=None,
+                push_name=None,
+                message_timestamp=None,
+                message_proto=b"\x0a\x05hello",
+            ),
+            "persistence_data_error",
+        ),
+    ],
+)
+async def test_provider_ingress_terminally_acks_poison_event_then_continues(
+    monkeypatch: pytest.MonkeyPatch,
+    first_event,
+    terminal_reason: str,
+) -> None:
+    account_id = UUID("00000000-0000-4000-8000-000000000906")
+    valid_event = WhatsAppProviderMessageEvent(
+        sequence=2,
+        message_id="provider-valid-2",
+        remote_jid="15550001111@s.whatsapp.net",
+        remote_jid_alt=None,
+        participant=None,
+        participant_alt=None,
+        push_name=None,
+        message_timestamp=None,
+        message_proto=b"\x0a\x05world",
+    )
+    queued = [first_event, valid_event]
+    persisted: list[int] = []
+    acknowledged: list[int] = []
+    terminal: list[tuple[int, str]] = []
+    completed = asyncio.Event()
+
+    class SessionContext:
+        async def __aenter__(self):
+            return object()
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            return False
+
+    async def persist(_db, *, account_id, event):
+        if event.sequence == 1:
+            raise DBAPIError(
+                "insert",
+                {},
+                _StringDataRightTruncationError("invalid persisted value"),
+                False,
+            )
+        persisted.append(event.sequence)
+
+    class PumpClient:
+        async def provider_events(self, *, limit: int = 100, wait_ms: int = 0):
+            assert limit == 1
+            assert wait_ms == 8_000
+            if queued:
+                return queued[:limit]
+            await asyncio.Future()
+
+        async def acknowledge_provider_events(self, *, through_sequence: int):
+            acknowledged.append(through_sequence)
+            queued[:] = [event for event in queued if event.sequence > through_sequence]
+            if through_sequence == 2:
+                completed.set()
+
+    def record_terminal(_account_id, *, sequence: int, reason: str) -> None:
+        terminal.append((sequence, reason))
+
+    monkeypatch.setattr(sidecar_registry_module, "async_session_factory", lambda: SessionContext())
+    monkeypatch.setattr(sidecar_registry_module, "persist_whatsapp_provider_event", persist)
+    monkeypatch.setattr(sidecar_registry_module, "_record_terminal_provider_event", record_terminal)
+    registry = ConfiguredWhatsAppSidecarRegistry("")
+    task = asyncio.create_task(registry._pump_provider_ingress(account_id, PumpClient()))
+    try:
+        await asyncio.wait_for(completed.wait(), timeout=1)
+        assert acknowledged == [1, 2]
+        assert persisted == [2]
+        assert terminal == [(1, terminal_reason)]
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_provider_ingress_retries_transient_database_error_without_ack(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    account_id = UUID("00000000-0000-4000-8000-000000000908")
+    event = WhatsAppProviderMessageEvent(
+        sequence=1,
+        message_id="provider-retry-1",
+        remote_jid="15550001111@s.whatsapp.net",
+        remote_jid_alt=None,
+        participant=None,
+        participant_alt=None,
+        push_name=None,
+        message_timestamp=None,
+        message_proto=b"\x0a\x05hello",
+    )
+    persistence_attempts = 0
+    acknowledged: list[int] = []
+    delays: list[float] = []
+    completed = asyncio.Event()
+
+    class SessionContext:
+        async def __aenter__(self):
+            return object()
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            return False
+
+    async def persist(_db, *, account_id, event):
+        nonlocal persistence_attempts
+        persistence_attempts += 1
+        if persistence_attempts == 1:
+            raise DBAPIError("insert", {}, OSError("database unavailable"), False)
+
+    class PumpClient:
+        async def provider_events(self, *, limit: int = 100, wait_ms: int = 0):
+            assert limit == 1
+            assert wait_ms == 8_000
+            if acknowledged:
+                await asyncio.Future()
+            return [event]
+
+        async def acknowledge_provider_events(self, *, through_sequence: int):
+            acknowledged.append(through_sequence)
+            completed.set()
+
+    async def record_sleep(delay: float) -> None:
+        delays.append(delay)
+
+    monkeypatch.setattr(sidecar_registry_module, "async_session_factory", lambda: SessionContext())
+    monkeypatch.setattr(sidecar_registry_module, "persist_whatsapp_provider_event", persist)
+    monkeypatch.setattr(sidecar_registry_module.asyncio, "sleep", record_sleep)
+    registry = ConfiguredWhatsAppSidecarRegistry("")
+    task = asyncio.create_task(registry._pump_provider_ingress(account_id, PumpClient()))
+    try:
+        await asyncio.wait_for(completed.wait(), timeout=1)
+        assert persistence_attempts == 2
+        assert acknowledged == [1]
+        assert delays == [1.0]
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ownership_kind", ["managed", "custom"])
+async def test_terminal_ingress_releases_local_owner_and_can_reattach(
+    monkeypatch: pytest.MonkeyPatch,
+    ownership_kind: str,
+) -> None:
+    account_id = UUID("00000000-0000-4000-8000-000000000904")
+    session_id = (
+        account_id if ownership_kind == "managed" else UUID("00000000-0000-4000-8000-000000000944")
+    )
+    event = WhatsAppProviderMessageEvent(
+        sequence=8,
+        message_id="provider-8",
+        remote_jid="15550001111@s.whatsapp.net",
+        remote_jid_alt=None,
+        participant=None,
+        participant_alt=None,
+        push_name=None,
+        message_timestamp=None,
+        message_proto=b"\x0a\x05hello",
+    )
+    attempts = 0
+    reattached = asyncio.Event()
+
+    class SessionContext:
+        async def __aenter__(self):
+            return object()
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            return False
+
+    async def retired(_db, *, account_id, event):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise WhatsAppProviderAccountRetired
+        reattached.set()
+        await asyncio.Future()
+
+    class PumpClient:
+        connected = True
+
+        async def provider_events(self, *, limit=100, wait_ms=0):
+            assert wait_ms == 8_000
+            assert limit == 1
+            return [event]
+
+        async def acknowledge_provider_events(self, *, through_sequence):
+            raise AssertionError(through_sequence)
+
+        async def relay_message(self, request):
+            raise AssertionError(request)
+
+        async def send_node(self, node):
+            raise AssertionError(node)
+
+        async def query(self, node, timeout_ms):
+            raise AssertionError((node, timeout_ms))
+
+    monkeypatch.setattr(sidecar_registry_module, "async_session_factory", lambda: SessionContext())
+    monkeypatch.setattr(sidecar_registry_module, "persist_whatsapp_provider_event", retired)
+
+    registry = ConfiguredWhatsAppSidecarRegistry("secret")
+    await registry.start()
+    client = PumpClient()
+
+    def attach() -> asyncio.Task[None]:
+        registry._register_transport(account_id, client)
+        if ownership_kind == "managed":
+            registry._bound_managed_accounts.add(account_id)
+        else:
+            registry._custom_session_to_account[session_id] = account_id
+            registry._custom_account_to_session[account_id] = session_id
+        return registry._ingress_tasks[account_id]
+
+    try:
+        first_task = attach()
+        await asyncio.wait_for(first_task, timeout=1)
+        assert whatsapp_provider_transport_status(account_id).available is False
+        assert account_id not in registry._bound_managed_accounts
+        assert account_id not in registry._custom_account_to_session
+
+        second_task = attach()
+        await asyncio.wait_for(reattached.wait(), timeout=1)
+        assert second_task is registry._ingress_tasks[account_id]
+        assert second_task is not first_task
+        assert attempts == 2
+    finally:
+        await registry.stop()

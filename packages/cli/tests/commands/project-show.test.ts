@@ -1,0 +1,156 @@
+import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { projectShowCommand } from "../../src/commands/project-show";
+import { stateRootFor } from "../../src/lib/state-root";
+import { jsonResponse, mockFetch } from "./helpers";
+
+let tmpHome: string;
+let origHome: string | undefined;
+let origApiUrl: string | undefined;
+
+beforeEach(() => {
+	origHome = process.env.HOME;
+	origApiUrl = process.env.CLAWDI_API_URL;
+	tmpHome = join(tmpdir(), `clawdi-project-show-${Date.now()}-${Math.random().toString(36)}`);
+	mkdirSync(stateRootFor(tmpHome), { recursive: true });
+	writeFileSync(
+		join(stateRootFor(tmpHome), "auth.json"),
+		JSON.stringify({
+			apiKey: "test-key",
+			endpointBinding: { version: 1, cloudApiOrigin: "https://api.test" },
+		}),
+	);
+	process.env.HOME = tmpHome;
+	process.env.CLAWDI_API_URL = "https://api.test";
+});
+
+afterEach(() => {
+	if (origHome) process.env.HOME = origHome;
+	else delete process.env.HOME;
+	if (origApiUrl) process.env.CLAWDI_API_URL = origApiUrl;
+	else delete process.env.CLAWDI_API_URL;
+	rmSync(tmpHome, { recursive: true, force: true });
+});
+
+describe("projectShowCommand", () => {
+	it("prints shared project role, owner, and exact follow-up commands", async () => {
+		const { restore } = mockFetch([
+			{
+				method: "GET",
+				path: "/v1/projects",
+				response: () =>
+					jsonResponse([
+						{
+							id: "project-shared",
+							slug: "shared-toolkit",
+							name: "Shared Toolkit",
+							kind: "workspace",
+							is_owner: false,
+							owner_display: "Alice",
+							owner_handle: "alice-a3b4",
+						},
+					]),
+			},
+			{
+				method: "GET",
+				path: "/v1/skills?page=1&page_size=200",
+				response: () =>
+					jsonResponse({
+						items: [{ project_id: "project-shared", skill_key: "deploy-helper" }],
+						total: 1,
+					}),
+			},
+			{
+				method: "GET",
+				path: "/v1/vault?page_size=200",
+				response: () =>
+					jsonResponse({
+						items: [{ project_ids: ["project-shared"], slug: "prod", name: "Production" }],
+					}),
+			},
+		]);
+		const orig = console.log;
+		const lines: string[] = [];
+		console.log = (...args: unknown[]) => {
+			lines.push(args.map(String).join(" "));
+		};
+		try {
+			await projectShowCommand("@alice-a3b4/shared-toolkit");
+		} finally {
+			console.log = orig;
+			restore();
+		}
+
+		const out = lines.join("\n");
+		expect(out).toContain("Role: viewer");
+		expect(out).toContain("Owner: Alice (@alice-a3b4)");
+		expect(out).toContain("Access: viewer read access");
+		expect(out).toContain("Resources");
+		expect(out).toContain("Link to Agent:");
+		expect(out).toContain(
+			"iforge agent projects link <agent-id> --project @alice-a3b4/shared-toolkit",
+		);
+		expect(out).toContain("Leave: iforge project leave @alice-a3b4/shared-toolkit");
+		expect(out).not.toMatch(/\bbind(ing|s)?\b/i);
+	});
+
+	it("prints a JSON project inventory with local skill/vault counts", async () => {
+		const { restore } = mockFetch([
+			{
+				method: "GET",
+				path: "/v1/projects",
+				response: () =>
+					jsonResponse([
+						{
+							id: "project-parent",
+							slug: "personal",
+							name: "Personal",
+							kind: "personal",
+							is_owner: true,
+						},
+					]),
+			},
+			{
+				method: "GET",
+				path: "/v1/skills?page=1&page_size=200",
+				response: () =>
+					jsonResponse({
+						items: [
+							{ project_id: "project-parent", skill_key: "local-skill" },
+							{ project_id: "project-source", skill_key: "shared-skill" },
+						],
+						total: 2,
+					}),
+			},
+			{
+				method: "GET",
+				path: "/v1/vault?page_size=200",
+				response: () =>
+					jsonResponse({
+						items: [
+							{ project_ids: ["project-parent"], slug: "prod", name: "Production" },
+							{ project_ids: ["project-source"], slug: "shared", name: "Shared" },
+						],
+					}),
+			},
+		]);
+		const orig = console.log;
+		let out = "";
+		console.log = (...args: unknown[]) => {
+			out = args.map(String).join(" ");
+		};
+		try {
+			await projectShowCommand("personal", { json: true });
+		} finally {
+			console.log = orig;
+			restore();
+		}
+
+		const parsed = JSON.parse(out);
+		expect(parsed.project.slug).toBe("personal");
+		expect(parsed.skills.keys).toEqual(["local-skill"]);
+		expect(parsed.vaults).toEqual([{ slug: "prod", name: "Production" }]);
+	});
+});

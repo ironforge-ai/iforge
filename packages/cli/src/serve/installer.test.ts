@@ -1,0 +1,479 @@
+/**
+ * Installer unit tests — assert the generated plist / systemd
+ * unit content is well-formed and references the right binary.
+ *
+ * We intentionally do NOT exercise launchctl / systemctl here.
+ * Those side effects depend on the host's user session, log
+ * out / log in state, etc. — flaky in CI. The integration test
+ * (running `clawdi daemon install` against a real shell) lives
+ * in /tmp manual smoke tests, not in `bun test`.
+ */
+
+import { afterAll, afterEach, beforeEach, describe, expect, it } from "bun:test";
+import {
+	chmodSync,
+	existsSync,
+	mkdirSync,
+	mkdtempSync,
+	readFileSync,
+	rmSync,
+	writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+const tmp = mkdtempSync(join(tmpdir(), "clawdi-installer-test-"));
+const originalHome = process.env.HOME;
+const originalArgv1 = process.argv[1];
+
+afterAll(() => {
+	rmSync(tmp, { recursive: true, force: true });
+});
+
+beforeEach(() => {
+	const dir = mkdtempSync(join(tmp, "case-"));
+	process.env.HOME = dir;
+	// `install()` calls `realpathSync.native(process.argv[1])` to
+	// bake an absolute path into the unit file. Tests need that
+	// path to exist on disk; pinning to `/usr/local/bin/clawdi`
+	// works locally for devs who installed the CLI globally but
+	// blew up CI and dev machines without it. Drop a stub
+	// executable in the per-case tmp dir and point argv[1] at it.
+	const fakeBin = join(dir, "clawdi-bin");
+	mkdirSync(dir, { recursive: true });
+	writeFileSync(fakeBin, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+	chmodSync(fakeBin, 0o755);
+	process.argv[1] = fakeBin;
+});
+
+afterEach(() => {
+	process.env.HOME = originalHome;
+	process.argv[1] = originalArgv1 ?? "";
+});
+
+describe("installer.install (macOS plist)", () => {
+	it("writes a parseable plist with the right Label and ProgramArguments", async () => {
+		// Stub launchctl to a no-op so we don't actually load the
+		// agent during the test. We do this via a wrapper script
+		// on PATH rather than touching the real binary.
+		const stubBin = join(process.env.HOME ?? tmp, "stub-bin");
+		const { mkdirSync, chmodSync } = await import("node:fs");
+		mkdirSync(stubBin, { recursive: true });
+		const stubLaunchctl = join(stubBin, "launchctl");
+		writeFileSync(stubLaunchctl, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+		chmodSync(stubLaunchctl, 0o755);
+		const oldPath = process.env.PATH;
+		process.env.PATH = `${stubBin}:${oldPath}`;
+
+		try {
+			// Force the platform-detect onto the macOS path. We do
+			// this by importing the module fresh and stubbing
+			// `os.platform` — but bun:test doesn't have a clean
+			// module mock surface, so we just skip this test on
+			// non-darwin hosts. The real launchd round-trip
+			// covered by the manual smoke test in install proves
+			// the rest.
+			const os = await import("node:os");
+			if (os.platform() !== "darwin") return;
+
+			const { install } = await import("./installer");
+			const result = install();
+			expect(existsSync(result.unit)).toBe(true);
+			const content = readFileSync(result.unit, "utf-8");
+			expect(content).toContain("<key>Label</key>");
+			// DERIVED from the exported label rather than restated (P33-11). The `Label` inside
+			// the plist is what launchd treats as authoritative -- over the filename -- so this
+			// assertion is about the one string that decides which job is which, and a restated
+			// literal here would go on passing after the label moved.
+			const { LAUNCHD_DAEMON_LABEL } = await import("./installer");
+			expect(content).toContain(`<string>${LAUNCHD_DAEMON_LABEL}</string>`);
+			expect(content).toContain(process.argv[1] ?? "");
+			expect(content).toContain("<string>daemon</string>");
+			expect(content).toContain("<string>run</string>");
+			expect(content).not.toContain("<string>--agent</string>");
+			expect(content).toContain("<key>RunAtLoad</key>");
+			expect(content).toContain("<key>KeepAlive</key>");
+		} finally {
+			process.env.PATH = oldPath;
+		}
+	});
+
+	it("includes EnvironmentVariables with HOME so the daemon can find the state root", async () => {
+		const os = await import("node:os");
+		if (os.platform() !== "darwin") return;
+
+		// Stub launchctl as before.
+		const stubBin = join(process.env.HOME ?? tmp, "stub-bin");
+		const { mkdirSync, chmodSync } = await import("node:fs");
+		mkdirSync(stubBin, { recursive: true });
+		const stubLaunchctl = join(stubBin, "launchctl");
+		writeFileSync(stubLaunchctl, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+		chmodSync(stubLaunchctl, 0o755);
+		const oldPath = process.env.PATH;
+		process.env.PATH = `${stubBin}:${oldPath}`;
+
+		try {
+			const { install } = await import("./installer");
+			const result = install();
+			const content = readFileSync(result.unit, "utf-8");
+			expect(content).toContain("<key>HOME</key>");
+			expect(content).toContain(process.env.HOME ?? "");
+		} finally {
+			process.env.PATH = oldPath;
+		}
+	});
+
+	it("captures daemon credentials, endpoint, and update ownership under their public names", async () => {
+		const os = await import("node:os");
+		if (os.platform() !== "darwin") return;
+
+		// Stub launchctl as before.
+		const stubBin = join(process.env.HOME ?? tmp, "stub-bin");
+		const { mkdirSync, chmodSync } = await import("node:fs");
+		mkdirSync(stubBin, { recursive: true });
+		const stubLaunchctl = join(stubBin, "launchctl");
+		writeFileSync(stubLaunchctl, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+		chmodSync(stubLaunchctl, 0o755);
+		const oldPath = process.env.PATH;
+		process.env.PATH = `${stubBin}:${oldPath}`;
+
+		const oldToken = process.env.CLAWDI_AUTH_TOKEN;
+		const oldApiUrl = process.env.CLAWDI_API_URL;
+		const oldNoAutoUpdate = process.env.CLAWDI_NO_AUTO_UPDATE;
+		process.env.CLAWDI_AUTH_TOKEN = "clawdi_test_capture_token_value";
+		process.env.CLAWDI_API_URL = "https://example.test/api";
+		process.env.CLAWDI_NO_AUTO_UPDATE = "1";
+
+		try {
+			const { install } = await import("./installer");
+			const result = install();
+			const content = readFileSync(result.unit, "utf-8");
+			// Both keys baked into the plist so the daemon spawned by
+			// launchd after reboot still sees them. Without this, env-
+			// only auth (`IFORGE_AUTH_TOKEN=… iforge daemon install`)
+			// silently lost the token after the next login.
+			//
+			// The KEY is the public spelling — the plist environment is inherited by an
+			// `iforge` process whose boundary refuses a bare internal register name. The
+			// VALUE is still read out of the internal register, which is what this test
+			// sets above, so `--auth-token-file` (which writes only the internal name) is
+			// still captured.
+			expect(content).toContain("<key>IFORGE_AUTH_TOKEN</key>");
+			expect(content).toContain("clawdi_test_capture_token_value");
+			expect(content).toContain("<key>IFORGE_API_URL</key>");
+			expect(content).toContain("https://example.test/api");
+			expect(content).toContain("<key>IFORGE_NO_AUTO_UPDATE</key>");
+		} finally {
+			process.env.PATH = oldPath;
+			if (oldToken === undefined) delete process.env.CLAWDI_AUTH_TOKEN;
+			else process.env.CLAWDI_AUTH_TOKEN = oldToken;
+			if (oldApiUrl === undefined) delete process.env.CLAWDI_API_URL;
+			else process.env.CLAWDI_API_URL = oldApiUrl;
+			if (oldNoAutoUpdate === undefined) delete process.env.CLAWDI_NO_AUTO_UPDATE;
+			else process.env.CLAWDI_NO_AUTO_UPDATE = oldNoAutoUpdate;
+		}
+	});
+
+	it("does NOT capture process.env.CLAWDI_ENVIRONMENT_ID into the plist EnvironmentVariables", async () => {
+		// Round 30 P2 regression: a shell-set CLAWDI_ENVIRONMENT_ID
+		// must not leak into the supervisor unit. At runtime the
+		// daemon's `resolveEnvironmentId` prefers env vars over the
+		// per-agent file, so a captured CLAWDI_ENVIRONMENT_ID would
+		// pin every installed agent to that one env id during
+		// singleton daemon — every engine could be routed to the
+		// same project.
+		const os = await import("node:os");
+		if (os.platform() !== "darwin") return;
+
+		const stubBin = join(process.env.HOME ?? tmp, "stub-bin");
+		const { mkdirSync, chmodSync } = await import("node:fs");
+		mkdirSync(stubBin, { recursive: true });
+		const stubLaunchctl = join(stubBin, "launchctl");
+		writeFileSync(stubLaunchctl, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+		chmodSync(stubLaunchctl, 0o755);
+		const oldPath = process.env.PATH;
+		process.env.PATH = `${stubBin}:${oldPath}`;
+		const oldEnv = process.env.CLAWDI_ENVIRONMENT_ID;
+		process.env.CLAWDI_ENVIRONMENT_ID = "00000000-0000-0000-0000-deadbeef0001";
+		try {
+			const { install } = await import("./installer");
+			const result = install();
+			const content = readFileSync(result.unit, "utf-8");
+			// CLAWDI_ENVIRONMENT_ID must NOT appear under
+			// EnvironmentVariables — neither key nor value.
+			expect(content).not.toContain("<key>CLAWDI_ENVIRONMENT_ID</key>");
+			expect(content).not.toContain("<key>IFORGE_ENVIRONMENT_ID</key>");
+			expect(content).not.toContain("00000000-0000-0000-0000-deadbeef0001");
+			// And no `--environment-id` arg either when caller didn't
+			// pass it explicitly.
+			expect(content).not.toContain("<string>--environment-id</string>");
+		} finally {
+			process.env.PATH = oldPath;
+			if (oldEnv === undefined) delete process.env.CLAWDI_ENVIRONMENT_ID;
+			else process.env.CLAWDI_ENVIRONMENT_ID = oldEnv;
+		}
+	});
+
+	it("writes the plist with 0o600 (owner-only) since it inlines the bearer token", async () => {
+		// Round-40 P2 regression: launchd plist contains
+		// `<key>IFORGE_AUTH_TOKEN</key>` under
+		// EnvironmentVariables. Pre-fix the file was 0o644 so any
+		// other local user on a multi-user host could read the
+		// API token. launchd reads the file as the owner, so
+		// 0o600 still loads correctly.
+		const os = await import("node:os");
+		if (os.platform() !== "darwin") return;
+
+		const stubBin = join(process.env.HOME ?? tmp, "stub-bin");
+		const { mkdirSync, chmodSync, statSync } = await import("node:fs");
+		mkdirSync(stubBin, { recursive: true });
+		const stubLaunchctl = join(stubBin, "launchctl");
+		writeFileSync(stubLaunchctl, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+		chmodSync(stubLaunchctl, 0o755);
+		const oldPath = process.env.PATH;
+		process.env.PATH = `${stubBin}:${oldPath}`;
+		try {
+			const { install } = await import("./installer");
+			const result = install();
+			const mode = statSync(result.unit).mode & 0o777;
+			expect(mode).toBe(0o600);
+		} finally {
+			process.env.PATH = oldPath;
+		}
+	});
+
+	it("uninstall removes a previously-installed plist", async () => {
+		const os = await import("node:os");
+		if (os.platform() !== "darwin") return;
+
+		const stubBin = join(process.env.HOME ?? tmp, "stub-bin");
+		const { mkdirSync, chmodSync } = await import("node:fs");
+		mkdirSync(stubBin, { recursive: true });
+		const stubLaunchctl = join(stubBin, "launchctl");
+		writeFileSync(stubLaunchctl, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+		chmodSync(stubLaunchctl, 0o755);
+		const oldPath = process.env.PATH;
+		process.env.PATH = `${stubBin}:${oldPath}`;
+
+		try {
+			const { install, uninstall } = await import("./installer");
+			install();
+			const result = uninstall();
+			expect(result.removed).toBe(true);
+			// Second uninstall is a no-op — no file, no error.
+			const result2 = uninstall();
+			expect(result2.removed).toBe(false);
+		} finally {
+			process.env.PATH = oldPath;
+		}
+	});
+
+	/**
+	 * The ownership marker the launchd half never had.
+	 *
+	 * A plist has never carried a systemd header, so launchd ownership needs a proof of its own. The
+	 * marker gives it one; the predicate still fails closed without one.
+	 *
+	 * `renderLaunchdPlist` rather than `install()` for the emission assertion. `install()`
+	 * dispatches on `platform()` and the launchd branch is unreachable off darwin, so a marker
+	 * only a macOS run could check is a marker this repository's Linux test runner never checks —
+	 * a claim about ownership that no CI here can fail is the shape this plan exists to remove.
+	 */
+	it("stamps the ownership marker into the plist this release writes", async () => {
+		const { renderLaunchdPlist, GENERATED_LAUNCHD_PLIST_OWNER_KEY, isGeneratedLaunchdPlist } =
+			await import("./installer");
+
+		const plist = renderLaunchdPlist();
+
+		expect(plist).toContain(`<key>${GENERATED_LAUNCHD_PLIST_OWNER_KEY}</key>`);
+		// The writer and the reader have to agree, which is the whole claim. Asserting only that
+		// the key appears would pass against a plist whose value the predicate rejects.
+		expect(isGeneratedLaunchdPlist(plist)).toBe(true);
+	});
+
+	it("decides plist ownership from the exact bytes, with no folding and no normalisation", async () => {
+		const { isGeneratedLaunchdPlist, GENERATED_LAUNCHD_PLIST_OWNER_KEY } = await import(
+			"./installer"
+		);
+		const around = (body: string) =>
+			`<?xml version="1.0" encoding="UTF-8"?>\n<plist version="1.0">\n<dict>\n${body}\n  <key>Label</key>\n  <string>ai.clawdi.serve</string>\n</dict>\n</plist>\n`;
+		const marker = (value: string) =>
+			`  <key>${GENERATED_LAUNCHD_PLIST_OWNER_KEY}</key>\n  <string>${value}</string>`;
+
+		expect(isGeneratedLaunchdPlist(around(marker("iforge runtime init")))).toBe(true);
+		// Upstream clawdi's owner stamp is another product's, never this one's (iforge names only,
+		// user directive 2026-09-30).
+		expect(isGeneratedLaunchdPlist(around(marker("clawdi runtime init")))).toBe(false);
+		// Upstream's plist: the same label, and no marker anywhere in it.
+		expect(isGeneratedLaunchdPlist(around("  <key>KeepAlive</key>\n  <true/>"))).toBe(false);
+		// The key with somebody else's value is not a proof of anything.
+		expect(isGeneratedLaunchdPlist(around(marker("some other tool")))).toBe(false);
+		// Case and Unicode form are part of the bytes, not noise to be smoothed over.
+		expect(isGeneratedLaunchdPlist(around(marker("IFORGE RUNTIME INIT")))).toBe(false);
+		// A truncated write is not ownership either, and must not throw.
+		expect(isGeneratedLaunchdPlist("<?xml version=")).toBe(false);
+		expect(isGeneratedLaunchdPlist("")).toBe(false);
+	});
+});
+
+describe("installer.install (Linux systemd)", () => {
+	it("stops without removing the unit and restart cold-starts it", async () => {
+		const os = await import("node:os");
+		if (os.platform() !== "linux") return;
+
+		const stubBin = join(process.env.HOME ?? tmp, "stub-bin");
+		mkdirSync(stubBin, { recursive: true });
+		const calls = join(process.env.HOME ?? tmp, "systemctl-calls");
+		const stubSystemctl = join(stubBin, "systemctl");
+		writeFileSync(stubSystemctl, `#!/bin/sh\nprintf '%s\\n' "$*" >> "${calls}"\nexit 0\n`, {
+			mode: 0o755,
+		});
+		chmodSync(stubSystemctl, 0o755);
+		const oldPath = process.env.PATH;
+		process.env.PATH = `${stubBin}:${oldPath}`;
+
+		try {
+			const { install, restart, stop } = await import("./installer");
+			const installed = install();
+			stop();
+			expect(existsSync(installed.unit)).toBe(true);
+			restart();
+			const commands = readFileSync(calls, "utf8").trim().split("\n");
+			expect(commands).toContain("--user stop iforge-serve.service");
+			expect(commands).toContain("--user restart iforge-serve.service");
+		} finally {
+			process.env.PATH = oldPath;
+		}
+	});
+
+	it("captures RPC host, port, and remote opt-in into the unit Environment", async () => {
+		const os = await import("node:os");
+		if (os.platform() !== "linux") return;
+
+		const stubBin = join(process.env.HOME ?? tmp, "stub-bin");
+		const { mkdirSync, chmodSync } = await import("node:fs");
+		mkdirSync(stubBin, { recursive: true });
+		const stubSystemctl = join(stubBin, "systemctl");
+		writeFileSync(stubSystemctl, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+		chmodSync(stubSystemctl, 0o755);
+		const oldPath = process.env.PATH;
+		process.env.PATH = `${stubBin}:${oldPath}`;
+
+		try {
+			const { install } = await import("./installer");
+			const result = install({
+				rpcHost: "0.0.0.0",
+				rpcPort: 17654,
+				rpcAllowRemote: true,
+			});
+			const content = readFileSync(result.unit, "utf-8");
+			expect(content).toContain('Environment="IFORGE_DAEMON_RPC_HOST=0.0.0.0"');
+			expect(content).toContain('Environment="IFORGE_DAEMON_RPC_PORT=17654"');
+			expect(content).toContain('Environment="IFORGE_DAEMON_RPC_ALLOW_REMOTE=1"');
+			expect(content).toContain("Restart=always");
+			expect(content).toContain("RestartPreventExitStatus=2");
+		} finally {
+			process.env.PATH = oldPath;
+		}
+	});
+
+	it("preserves the unit and throws an actionable error when activation fails", async () => {
+		const os = await import("node:os");
+		if (os.platform() !== "linux") return;
+
+		const stubBin = join(process.env.HOME ?? tmp, "stub-bin");
+		mkdirSync(stubBin, { recursive: true });
+		const stubSystemctl = join(stubBin, "systemctl");
+		writeFileSync(stubSystemctl, "#!/bin/sh\nexit 1\n", { mode: 0o755 });
+		chmodSync(stubSystemctl, 0o755);
+		const oldPath = process.env.PATH;
+		process.env.PATH = `${stubBin}:${oldPath}`;
+
+		try {
+			const { install, unitFileName } = await import("./installer");
+			let error: unknown;
+			try {
+				install();
+			} catch (caught) {
+				error = caught;
+			}
+			const unit = join(process.env.HOME ?? "", ".config", "systemd", "user", unitFileName());
+			expect(existsSync(unit)).toBe(true);
+			if (!(error instanceof Error)) throw new Error("expected activation error");
+			expect(error.message).toContain("systemctl activation failed");
+			expect(error.message).toContain("systemctl --user daemon-reload");
+			expect(error.message).toContain(`enable --now ${unitFileName()}`);
+		} finally {
+			process.env.PATH = oldPath;
+		}
+	});
+});
+
+describe("installer.readHealth", () => {
+	it("returns exists=false when the file is missing", async () => {
+		const { readHealth } = await import("./installer");
+		const dir = mkdtempSync(join(tmp, "noh-"));
+		const result = readHealth(dir);
+		expect(result.exists).toBe(false);
+		expect(result.ageSeconds).toBeNull();
+		expect(result.version).toBeNull();
+	});
+
+	it("parses the legacy bare-ISO timestamp shape (pre-r3 daemons)", async () => {
+		// Pre-r3 daemons wrote `<iso>\n`. After upgrading the CLI
+		// but BEFORE the daemon's auto-restart fires, status/doctor
+		// have to read the legacy file shape and not crash. Reader
+		// returns version=null so drift detection skips quietly.
+		const { readHealth } = await import("./installer");
+		const dir = mkdtempSync(join(tmp, "legacy-"));
+		writeFileSync(join(dir, "health"), `${new Date().toISOString()}\n`);
+		const result = readHealth(dir);
+		expect(result.exists).toBe(true);
+		expect(result.ageSeconds).toBeLessThan(5);
+		expect(result.timestamp).toMatch(/^\d{4}-\d{2}-\d{2}T/);
+		expect(result.version).toBeNull();
+	});
+
+	it("parses the new JSON shape (r3+) and exposes the version", async () => {
+		const { readHealth } = await import("./installer");
+		const dir = mkdtempSync(join(tmp, "json-"));
+		writeFileSync(
+			join(dir, "health"),
+			`${JSON.stringify({ timestamp: new Date().toISOString(), version: "0.5.4" })}\n`,
+		);
+		const result = readHealth(dir);
+		expect(result.exists).toBe(true);
+		expect(result.ageSeconds).toBeLessThan(5);
+		expect(result.timestamp).toMatch(/^\d{4}-\d{2}-\d{2}T/);
+		expect(result.version).toBe("0.5.4");
+	});
+
+	it("falls back gracefully on malformed JSON (mid-write truncation)", async () => {
+		// `touchHealthFile` is non-atomic write — if the daemon
+		// crashes between open() and write() (rare but possible),
+		// readers shouldn't crash. Just treat the file as legacy
+		// and report whatever the parser pulled out.
+		const { readHealth } = await import("./installer");
+		const dir = mkdtempSync(join(tmp, "broken-"));
+		writeFileSync(join(dir, "health"), `{"timestamp":"2026-05-01T08:`); // truncated
+		const result = readHealth(dir);
+		expect(result.exists).toBe(true);
+		// Falls through to legacy parsing — `timestamp` field gets
+		// the raw string; version stays null. Importantly, no
+		// throw.
+		expect(result.version).toBeNull();
+	});
+
+	it("handles JSON with missing version field (forward-compat)", async () => {
+		const { readHealth } = await import("./installer");
+		const dir = mkdtempSync(join(tmp, "noversion-"));
+		writeFileSync(
+			join(dir, "health"),
+			`${JSON.stringify({ timestamp: new Date().toISOString() })}\n`,
+		);
+		const result = readHealth(dir);
+		expect(result.exists).toBe(true);
+		expect(result.timestamp).toMatch(/^\d{4}-\d{2}-\d{2}T/);
+		expect(result.version).toBeNull();
+	});
+});

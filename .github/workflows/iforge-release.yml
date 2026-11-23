@@ -1,0 +1,141 @@
+name: Release iforge
+
+# Creates a GitHub Release for backend/web/shared/root-config changes when an
+# operator explicitly runs it after a production deploy. This is intentionally
+# manual: merging ordinary app/backend/web PRs should not spam dated GitHub
+# releases.
+# This repo is a monorepo: the npm package has its own `iforge-cli-vX.Y.Z`
+# release, while the iforge app/backend/web line uses calendar-versioned
+# `iforge-YYYY-MM-DD` releases, with `-2`, `-3`, ... appended only for
+# additional releases on the same UTC day.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version without the iforge- prefix. Defaults to YYYY-MM-DD, or YYYY-MM-DD-N for additional releases on the same UTC day."
+        required: false
+      target:
+        description: "Commit SHA to release. Defaults to the workflow SHA."
+        required: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: iforge-release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ${{ vars.CI_RUNNER || 'blacksmith-16vcpu-ubuntu-2404' }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Create iforge release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_VERSION: ${{ inputs.version }}
+          INPUT_TARGET: ${{ inputs.target }}
+        run: |
+          TARGET="${INPUT_TARGET:-$GITHUB_SHA}"
+          if [ -n "$INPUT_VERSION" ]; then
+            VERSION="${INPUT_VERSION#iforge-v}"
+            VERSION="${VERSION#iforge-}"
+          else
+            BASE_VERSION="$(date -u +%Y-%m-%d)"
+            LEGACY_BASE_VERSION="$(date -u +%Y.%m.%d)"
+            MAX_SEQUENCE=0
+            while IFS= read -r existing_tag; do
+              case "$existing_tag" in
+                iforge-v*) existing_version="${existing_tag#iforge-v}" ;;
+                iforge-*) existing_version="${existing_tag#iforge-}" ;;
+                *) continue ;;
+              esac
+              if [ "$existing_version" = "$BASE_VERSION" ]; then
+                sequence=1
+              elif [[ "$existing_version" == "$BASE_VERSION"-* ]]; then
+                suffix="${existing_version#"$BASE_VERSION-"}"
+                if [[ "$suffix" =~ ^[0-9]+$ ]]; then
+                  sequence="$suffix"
+                else
+                  continue
+                fi
+              elif [ "$existing_version" = "$LEGACY_BASE_VERSION" ]; then
+                sequence=1
+              elif [[ "$existing_version" == "$LEGACY_BASE_VERSION".* ]]; then
+                suffix="${existing_version#"$LEGACY_BASE_VERSION."}"
+                if [[ "$suffix" =~ ^[0-9]+$ ]]; then
+                  sequence="$suffix"
+                else
+                  continue
+                fi
+              else
+                continue
+              fi
+
+              if (( sequence > MAX_SEQUENCE )); then
+                MAX_SEQUENCE="$sequence"
+              fi
+            done < <(
+              {
+                # Precondition: this fork carries no release tag from before the
+                # rebrand, so enumerating only these patterns still sees the whole
+                # release history. If tags under the old name are ever fetched from
+                # an upstream remote or created here, read the tag-set precondition
+                # in docs/runbooks/release.md and either delete them or widen these
+                # patterns BEFORE running a release.
+                git tag --list "iforge-${BASE_VERSION}*"
+                git tag --list "iforge-v${BASE_VERSION}*"
+                git tag --list "iforge-v${LEGACY_BASE_VERSION}*"
+              } | sort -u
+            )
+
+            if (( MAX_SEQUENCE == 0 )); then
+              VERSION="$BASE_VERSION"
+            else
+              VERSION="${BASE_VERSION}-$((MAX_SEQUENCE + 1))"
+            fi
+          fi
+
+          if [[ ! "$VERSION" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}(-[0-9]+)?$ ]]; then
+            echo "Invalid release version: $VERSION"
+            echo "Expected YYYY-MM-DD or YYYY-MM-DD-N, optionally prefixed with iforge-."
+            exit 1
+          fi
+          TAG="iforge-${VERSION}"
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "GitHub release $TAG already exists; skipping."
+            exit 0
+          fi
+
+          PREVIOUS=$(
+            git tag --list 'iforge-*' --sort=-creatordate \
+              | grep -v '^iforge-cli-v' \
+              | grep -v "^${TAG}$" \
+              | head -n 1 || true
+          )
+
+          NOTES=$(cat <<EOF
+          ## Scope
+          This is the release for iforge app/backend/web changes.
+
+          CLI/npm releases are versioned separately as \`iforge-cli-v...\`.
+          EOF
+          )
+
+          args=(
+            release create "$TAG"
+            --target "$TARGET"
+            --title "iforge ${VERSION}"
+            --notes "$NOTES"
+            --generate-notes
+            --latest
+          )
+          if [ -n "$PREVIOUS" ]; then
+            args+=(--notes-start-tag "$PREVIOUS")
+          fi
+          gh "${args[@]}"

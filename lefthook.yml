@@ -1,0 +1,51 @@
+# Lefthook — git hook manager
+# Runs biome check (fix + format) on staged JS/TS/JSON/CSS files before every commit.
+# Python side is handled by `ruff` in CI; we keep the pre-commit set narrow to avoid
+# slowing commits in the backend subtree.
+
+# PATH note (phase 03.1, WINDOWS #69/#74): git runs hooks with a non-interactive
+# PATH that does not include `~/.bun/bin`, so a bare `bunx` here fails with
+# `sh: 1: bunx: not found` (exit 127) even on a machine where bun is installed and
+# on the developer's interactive PATH. That aborts the commit, which is at least
+# loud — but it made `--no-verify` look like the way past it. Prefixing PATH is the
+# fix: it costs nothing when bunx is already resolvable and rescues the hook when
+# it is not. Applied to every hook command below, not just this one.
+pre-commit:
+  parallel: true
+  commands:
+    biome:
+      glob: "*.{js,jsx,ts,tsx,json,jsonc,css}"
+      run: PATH="$HOME/.bun/bin:$PATH" bunx biome check --no-errors-on-unmatched --files-ignore-unknown=true --write {staged_files}
+      stage_fixed: true
+
+# Pre-push: build the web app before it can leave the machine.
+#
+# Why a local hook and not CI: `.github/workflows/client-ci.yml` (job `verify`)
+# already runs this exact `turbo build --filter=web`, but this repo's origin is a
+# self-hosted Gitea instance where GitHub Actions never execute. That is why the
+# apps/web production build stayed broken across two whole plans (03-05 through
+# 03-10) with every CI signal silent — see gap G-03-4 and
+# `.planning/debug/deploy-route-hangs-browser.md`. A hook that runs on THIS
+# origin is the only gate that actually fires here.
+#
+# The env defaults mirror client-ci.yml's `verify` env block. Each uses a
+# ${VAR:-default} fallback so a developer's real values win; without them a
+# fresh checkout (which has no apps/web/.env) fails for reasons unrelated to the
+# code being pushed — `VITE_CLERK_PUBLISHABLE_KEY` is required by
+# apps/web/src/lib/env.ts outside dev-bypass.
+#
+# The e2e suite is deliberately NOT here: it boots a dev server with a 120s
+# timeout and would make every push unusable.
+#
+# Escape hatch for a deliberate WIP push: `LEFTHOOK=0 git push`.
+pre-push:
+  parallel: false
+  commands:
+    web-build:
+      glob: "{apps/web/**,packages/shared/**,turbo.json,bun.lock}"
+      run: >-
+        VITE_CLERK_PUBLISHABLE_KEY="${VITE_CLERK_PUBLISHABLE_KEY:-pk_test_dummy}"
+        VITE_IFORGE_API_URL="${VITE_IFORGE_API_URL:-http://localhost:8000}"
+        CLERK_SECRET_KEY="${CLERK_SECRET_KEY:-sk_test_dummy}"
+        PATH="$HOME/.bun/bin:$PATH"
+        bunx turbo build --filter=web --output-logs=errors-only

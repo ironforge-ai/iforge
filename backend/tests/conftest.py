@@ -1,0 +1,706 @@
+"""Pytest fixtures shared across the backend test suite.
+
+Strategy:
+- Hit the *real* Postgres (with pgvector + pg_trgm) provisioned by CI. Mocking
+  the DB would diverge from production for vector / trigram queries and cascade
+  semantics.
+- Most tests run inside an outer transaction.  The ORM session joins it with
+  ``create_savepoint``, so application commits remain test-local and teardown
+  is one rollback.  Tests that need committed visibility from independent
+  connections use the ``committed_db`` lane (or ``committed_db_session``
+  directly) explicitly.
+- Each test gets an ``AsyncClient`` with scoped dependency overrides pointing
+  at its deterministic test user and session.
+- The suite ANNOUNCES which database it resolved and from where, via
+  ``pytest_report_header``.  ``DATABASE_URL`` falling back to the
+  application's own configured database used to be silent, and three tests
+  failing on rows accumulated in a shared database read as phase defects
+  rather than as an environment mismatch (see ``deferred-items.md`` items 2
+  and 3, and ``03-VERIFICATION.md`` I-03).  The fallback is deliberately NOT
+  fatal — a hard failure would break every developer's direct ``uv run
+  pytest`` — because the finding is that the condition was invisible.
+"""
+
+from __future__ import annotations
+
+import os
+import secrets
+import socket
+import uuid
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager, contextmanager
+from datetime import UTC, datetime
+from hashlib import sha256
+from urllib.parse import urlsplit
+
+import httpx
+import pytest
+import pytest_asyncio
+from httpx import ASGITransport
+from sqlalchemy import delete, select
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+
+from app.core.auth import (
+    AuthContext,
+    get_auth,
+    get_auth_billing_exempt,
+    get_auth_short_session,
+    optional_web_auth,
+)
+from app.core.config import settings
+from app.core.database import get_control_session, get_session
+from app.main import app
+from app.models.user import User
+
+# The shared `filebrowser` HTTP stub (phase 05) is registered as a plugin rather than imported
+# into each test module. An import would shadow the fixture name in every module that also takes
+# it as a parameter, which ruff reports as F811 and which is genuinely confusing to read; as a
+# plugin it is simply available, which is what "the one double every integration test reuses"
+# should feel like.
+pytest_plugins = ("tests.companion_stub", "tests.postiz_stub")
+
+DATABASE_URL_SOURCE_ENV = "environment"
+DATABASE_URL_SOURCE_APP_DEFAULT = "application-default"
+SHARED_DATABASE_WARNING_MARKER = "SHARED DATABASE WARNING"
+
+_EXPLICIT_DATABASE_URL = os.getenv("DATABASE_URL")
+# Byte-identical to the previous `os.getenv("DATABASE_URL", settings.database_url)`
+# — an empty-but-set DATABASE_URL still wins, it is just no longer silent.
+TEST_DATABASE_URL = (
+    settings.database_url if _EXPLICIT_DATABASE_URL is None else _EXPLICIT_DATABASE_URL
+)
+TEST_DATABASE_URL_SOURCE = (
+    DATABASE_URL_SOURCE_APP_DEFAULT if _EXPLICIT_DATABASE_URL is None else DATABASE_URL_SOURCE_ENV
+)
+
+
+def _redacted_database_display(url: str) -> str:
+    """``host:port/database`` — hostname, port and path ONLY.
+
+    This string lands in CI logs, so userinfo (username, password) and the
+    query string are never rebuilt into it (T-03-69).  Parsing is wrapped
+    because ``urlsplit(...).port`` raises on a non-numeric port and a header
+    hook that raises takes the whole session with it.
+    """
+    try:
+        parts = urlsplit(url)
+        host = parts.hostname
+        port = parts.port
+        database = parts.path.lstrip("/")
+    except Exception:  # pragma: no cover - defensive; see docstring
+        return "<unparseable database url>"
+    if not host and not database:
+        return "<unparseable database url>"
+    shown_port = str(port) if port is not None else "<no port>"
+    return f"{host or '<no host>'}:{shown_port}/{database or '<no database>'}"
+
+
+def database_header_lines(url: str, *, source: str) -> list[str]:
+    """The pytest header lines for one resolved database URL and its source.
+
+    Pure and side-effect free: it never connects, never reads the
+    environment, and is therefore assertable against synthetic inputs. The
+    hook below is a thin wrapper over it, so those assertions gate the
+    SHIPPED header rather than a parallel implementation.
+    """
+    if source == DATABASE_URL_SOURCE_ENV:
+        origin = "explicit DATABASE_URL environment variable"
+    else:
+        origin = "application settings default (settings.database_url)"
+
+    lines = [
+        f"backend test database: {_redacted_database_display(url)}",
+        f"backend test database source: {origin}",
+    ]
+    if source != DATABASE_URL_SOURCE_ENV:
+        lines.append(
+            f"{SHARED_DATABASE_WARNING_MARKER}: DATABASE_URL is unset, so this run "
+            "fell back to the application's own configured database. The suite "
+            "expects a migrated THROWAWAY PostgreSQL; against a shared or "
+            "long-lived database it produces cross-test count-assertion failures "
+            "that look like product defects and are not. Use "
+            "`scripts/test.sh backend`, or export DATABASE_URL yourself."
+        )
+    return lines
+
+
+def pytest_report_header(config: object) -> list[str]:
+    """Say which database is under test, and where that answer came from."""
+    del config
+    return database_header_lines(TEST_DATABASE_URL, source=TEST_DATABASE_URL_SOURCE)
+
+
+_TEST_PUBLIC_DNS_HOSTS = {
+    "api.telegram.org",
+    "discord.com",
+    "gateway.discord.gg",
+    "graph.facebook.com",
+}
+_TEST_PUBLIC_DNS_SUFFIXES = (".example", ".test")
+
+
+def pytest_addoption(parser: pytest.Parser) -> None:
+    parser.addoption(
+        "--whatsapp-native-captures",
+        help="Required capture directory for the CI-wired native WhatsApp outbox E2E",
+    )
+
+
+def worker_test_identity(nodeid: str, worker: str) -> str:
+    digest = sha256(nodeid.encode()).hexdigest()[:16]
+    return f"{worker}-{digest}"
+
+
+@pytest.fixture
+def test_identity(request: pytest.FixtureRequest) -> str:
+    """Stable, worker-qualified identity for rows owned by one test."""
+    return worker_test_identity(request.node.nodeid, os.getenv("PYTEST_XDIST_WORKER", "main"))
+
+
+@pytest.fixture(autouse=True)
+def _restore_dependency_overrides():
+    """Restore the exact pre-test FastAPI override map, including nesting."""
+    previous = dict(app.dependency_overrides)
+    try:
+        yield
+    finally:
+        app.dependency_overrides.clear()
+        app.dependency_overrides.update(previous)
+
+
+@contextmanager
+def _dependency_overrides(overrides):
+    previous = dict(app.dependency_overrides)
+    app.dependency_overrides.update(overrides)
+    try:
+        yield
+    finally:
+        app.dependency_overrides.clear()
+        app.dependency_overrides.update(previous)
+
+
+@pytest.fixture(autouse=True)
+def _test_runtime_settings():
+    """Keep expensive or unsafe runtime defaults out of tests.
+
+    The dev ``.env`` ships with placeholder values (comment-only); leaving
+    them in place makes vault_crypto / MCP bridge tests blow up at decrypt
+    time with cryptic errors. Override with per-run random keys so tests
+    never accidentally use prod keys either.
+
+    The production default memory embedder is a local fastembed model. It is
+    intentionally warmed during ASGI lifespan, but most tests do not exercise
+    semantic memory and should not pay that startup cost.
+
+    Catalog worker behavior is tested directly. Keep its external polling and
+    production connection pool out of unrelated ``TestClient`` lifespans.
+    """
+    prev_vault = settings.vault_encryption_key
+    prev_jwt = settings.encryption_key
+    prev_embedding_mode = settings.memory_embedding_mode
+    prev_channel_long_poll_max = settings.channel_long_poll_max_seconds
+    prev_channel_long_poll_interval = settings.channel_long_poll_interval_seconds
+    prev_discord_gateway_poll_interval = settings.discord_gateway_poll_interval_seconds
+    prev_plugin_catalog_sync_enabled = settings.plugin_catalog_sync_enabled
+    settings.vault_encryption_key = secrets.token_hex(32)
+    settings.encryption_key = secrets.token_hex(32)
+    settings.memory_embedding_mode = "disabled"
+    settings.channel_long_poll_max_seconds = 0.05
+    settings.channel_long_poll_interval_seconds = 0.005
+    settings.discord_gateway_poll_interval_seconds = 0.01
+    settings.plugin_catalog_sync_enabled = False
+    try:
+        yield
+    finally:
+        settings.vault_encryption_key = prev_vault
+        settings.encryption_key = prev_jwt
+        settings.memory_embedding_mode = prev_embedding_mode
+        settings.channel_long_poll_max_seconds = prev_channel_long_poll_max
+        settings.channel_long_poll_interval_seconds = prev_channel_long_poll_interval
+        settings.discord_gateway_poll_interval_seconds = prev_discord_gateway_poll_interval
+        settings.plugin_catalog_sync_enabled = prev_plugin_catalog_sync_enabled
+
+
+@pytest.fixture(autouse=True)
+def _test_reserved_domain_dns(monkeypatch):
+    real_getaddrinfo = socket.getaddrinfo
+
+    def fake_getaddrinfo(host, port, *args, **kwargs):
+        hostname = host.decode() if isinstance(host, bytes) else str(host)
+        normalized = hostname.strip().lower().rstrip(".")
+        if normalized in _TEST_PUBLIC_DNS_HOSTS or normalized.endswith(_TEST_PUBLIC_DNS_SUFFIXES):
+            return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("8.8.8.8", port or 0))]
+        return real_getaddrinfo(host, port, *args, **kwargs)
+
+    monkeypatch.setattr(socket, "getaddrinfo", fake_getaddrinfo)
+
+
+@pytest_asyncio.fixture(scope="session")
+async def engine():
+    """Session engine bound to pytest's session-scoped event loop.
+
+    asyncpg's pool binds futures to the event loop that created them, so this
+    depends on ``asyncio_default_*_loop_scope = "session"`` in pyproject.toml.
+    Individual tests still get isolated sessions and throwaway users.
+    """
+    eng = create_async_engine(TEST_DATABASE_URL, echo=False, future=True)
+    try:
+        yield eng
+    finally:
+        await eng.dispose()
+
+
+@pytest_asyncio.fixture
+async def db_session(engine, request: pytest.FixtureRequest) -> AsyncIterator[AsyncSession]:
+    """Rollback-isolated session whose commits stay inside the outer transaction.
+
+    This is SQLAlchemy's documented test-suite recipe. PostgreSQL/asyncpg have
+    real SAVEPOINT support, unlike SQLite drivers with incomplete SAVEPOINT
+    handling: https://docs.sqlalchemy.org/en/20/orm/session_transaction.html
+    """
+    if request.node.get_closest_marker("committed_db"):
+        sessionmaker = async_sessionmaker(engine, expire_on_commit=False)
+        async with sessionmaker() as session:
+            yield session
+        return
+
+    async with rollback_session(engine) as session:
+        yield session
+
+
+@asynccontextmanager
+async def rollback_session(engine) -> AsyncIterator[AsyncSession]:
+    """Own an outer transaction and always roll it back, including on errors."""
+    async with engine.connect() as connection:
+        transaction = await connection.begin()
+        session = AsyncSession(
+            bind=connection,
+            expire_on_commit=False,
+            join_transaction_mode="create_savepoint",
+        )
+        try:
+            yield session
+        finally:
+            await session.close()
+            if transaction.is_active:
+                await transaction.rollback()
+
+
+@pytest_asyncio.fixture
+async def committed_db_session(engine) -> AsyncIterator[AsyncSession]:
+    """Independent-connection lane for commit visibility and concurrency tests."""
+    sessionmaker = async_sessionmaker(engine, expire_on_commit=False)
+    async with sessionmaker() as session:
+        try:
+            yield session
+        finally:
+            await session.rollback()
+
+
+async def create_env_with_project(
+    db_session,
+    *,
+    user_id,
+    machine_id: str,
+    machine_name: str,
+    agent_type: str = "claude_code",
+    os: str = "darwin",
+):
+    """Test helper: insert an AgentEnvironment together with its
+    env-local project and wire `default_project_id`. Mirrors the
+    `register_environment` route flow so tests don't have to
+    duplicate the inline-project creation pattern. Returns the
+    env (with default_project_id populated).
+    """
+    from app.models.project import PROJECT_KIND_ENVIRONMENT, Project
+    from app.models.session import AgentEnvironment
+    from app.services.agent_environments import local_machine_registration_key
+
+    # Mutual FK: env.default_project_id (NOT NULL) → project.id;
+    # project.origin_environment_id (NULLABLE) → env.id. Insert
+    # project without origin first, then env pointing at project,
+    # then back-fill project.origin_environment_id.
+    pending_slug = f"env-{uuid.uuid4().hex[:12]}"
+    project = Project(
+        user_id=user_id,
+        name=f"{machine_name} ({agent_type})",
+        slug=pending_slug,
+        kind=PROJECT_KIND_ENVIRONMENT,
+    )
+    db_session.add(project)
+    await db_session.flush()
+
+    env = AgentEnvironment(
+        user_id=user_id,
+        machine_id=machine_id,
+        machine_name=machine_name,
+        default_name=None,
+        agent_type=agent_type,
+        os=os,
+        default_project_id=project.id,
+        registration_key=local_machine_registration_key(machine_id, agent_type),
+    )
+    db_session.add(env)
+    await db_session.flush()
+
+    project.origin_environment_id = env.id
+    await db_session.commit()
+    await db_session.refresh(env)
+    return env
+
+
+async def create_test_hosted_runtime_state(db_session, env, *, runtime_name: str):
+    """Give a test Agent the same strict-v2 authority used by Channel links."""
+    from app.models.hosted_runtime import HostedRuntimeConfigObservation, HostedRuntimeState
+    from app.models.runtime_observation import V2RuntimeEnvironmentFence
+
+    deployment_id = f"dep-{uuid.uuid4().hex}"
+    state = HostedRuntimeState(
+        environment_id=env.id,
+        deployment_id=deployment_id,
+        instance_id=f"instance-{uuid.uuid4().hex}",
+        generation=1,
+        cli_package_spec="clawdi@1.2.3-test",
+        locale={"language": "en", "timezone": "UTC"},
+        system={},
+        runtimes={
+            runtime_name: {
+                "enabled": True,
+                "providerMode": "unmanaged",
+                "provider_ids": [],
+                "install": {"source": "official"},
+            }
+        },
+        live_sync={
+            "enabled": True,
+            "agents": [{"agentType": runtime_name, "environmentId": str(env.id)}],
+        },
+        recovery={"cacheManifest": True, "allowOfflineBoot": True},
+        tools={},
+    )
+    fence = V2RuntimeEnvironmentFence(
+        environment_id=env.id,
+        owner_id=env.user_id,
+        deployment_id=deployment_id,
+    )
+    now = datetime.now(UTC)
+    source_revision = "a" * 64
+    etag = '"test-ready"'
+    env.last_sync_at = now
+    db_session.add_all([state, fence])
+    await db_session.flush()
+    db_session.add(
+        HostedRuntimeConfigObservation(
+            environment_id=env.id,
+            observed_at=now,
+            observed_config_generation=state.generation,
+            observed_manifest_etag=etag,
+            observed_source_revision=source_revision,
+            diagnostics={
+                "schemaVersion": "clawdi.hostedRuntimeObserved.v2",
+                "reportedAt": now.isoformat(),
+                "runtimeMode": "hosted",
+                "status": "ok",
+                "activeCliVersion": state.cli_package_spec.removeprefix("clawdi@"),
+                "applied": {
+                    "etag": etag,
+                    "sourceRevision": source_revision,
+                    "generation": state.generation,
+                    "instanceId": state.instance_id,
+                    "appliedProviderIds": [],
+                },
+                "boot": None,
+                "cli": None,
+                "convergeError": None,
+            },
+        )
+    )
+    await db_session.commit()
+    await db_session.refresh(state)
+    return state
+
+
+@pytest_asyncio.fixture
+async def seed_user(
+    db_session: AsyncSession, test_identity: str, request: pytest.FixtureRequest
+) -> User:
+    """A deterministic user row scoped to one rollback-isolated test.
+
+    Mirrors the auto-create flow in `_auth_via_clerk_jwt`: every user
+    must have a Personal project so the default-project resolver has a
+    fallback target. Without this, write paths that resolve project
+    server-side would 500 on a fresh test user.
+    """
+    from app.models.channel import (
+        WHATSAPP_ONBOARDING_OWNERSHIP_PLATFORM,
+        ChannelAccount,
+        ChannelWhatsAppOnboardingSession,
+    )
+    from app.models.project import PROJECT_KIND_PERSONAL, Project
+
+    uses_committed_db = request.node.get_closest_marker("committed_db") is not None
+    platform_account_ids_before: set[uuid.UUID] = set()
+    platform_session_ids_before: set[uuid.UUID] = set()
+    if uses_committed_db:
+        platform_account_ids_before = set(
+            await db_session.scalars(
+                select(ChannelAccount.id).where(ChannelAccount.user_id.is_(None))
+            )
+        )
+        platform_session_ids_before = set(
+            await db_session.scalars(
+                select(ChannelWhatsAppOnboardingSession.id).where(
+                    ChannelWhatsAppOnboardingSession.ownership_kind
+                    == WHATSAPP_ONBOARDING_OWNERSHIP_PLATFORM
+                )
+            )
+        )
+
+    user = User(
+        clerk_id=f"test_{test_identity}",
+        email=f"test-{test_identity}@clawdi.local",
+        name="Test User",
+    )
+    db_session.add(user)
+    await db_session.flush()
+
+    personal = Project(
+        user_id=user.id,
+        name="Personal",
+        slug="personal",
+        kind=PROJECT_KIND_PERSONAL,
+    )
+    db_session.add(personal)
+    await db_session.commit()
+    await db_session.refresh(user)
+    seed_user_id = user.id
+    try:
+        yield user
+    finally:
+        if uses_committed_db:
+            # A failed flush leaves the committed lane unusable until rollback.
+            # Public channel inventory is platform-owned, so deleting the test
+            # tenant no longer cascades through accounts created by the test.
+            await db_session.rollback()
+            platform_account_ids_after = set(
+                await db_session.scalars(
+                    select(ChannelAccount.id).where(ChannelAccount.user_id.is_(None))
+                )
+            )
+            platform_session_ids_after = set(
+                await db_session.scalars(
+                    select(ChannelWhatsAppOnboardingSession.id).where(
+                        ChannelWhatsAppOnboardingSession.ownership_kind
+                        == WHATSAPP_ONBOARDING_OWNERSHIP_PLATFORM
+                    )
+                )
+            )
+            created_platform_session_ids = platform_session_ids_after - platform_session_ids_before
+            created_platform_account_ids = platform_account_ids_after - platform_account_ids_before
+            if created_platform_session_ids:
+                await db_session.execute(
+                    delete(ChannelWhatsAppOnboardingSession).where(
+                        ChannelWhatsAppOnboardingSession.id.in_(created_platform_session_ids)
+                    )
+                )
+            if created_platform_account_ids:
+                await db_session.execute(
+                    delete(ChannelAccount).where(
+                        ChannelAccount.id.in_(created_platform_account_ids)
+                    )
+                )
+            await db_session.execute(delete(User).where(User.id == seed_user_id))
+            await db_session.commit()
+
+
+@pytest_asyncio.fixture
+async def project_id(db_session: AsyncSession, seed_user: User) -> str:
+    """Personal project id for the seed user.
+
+    Most upload/read tests target this — phase-2 routes are
+    project-explicit, and the seed user's Personal project is the
+    natural default for tests that don't care about multi-env
+    isolation.
+    """
+    from sqlalchemy import select
+
+    from app.models.project import PROJECT_KIND_PERSONAL, Project
+
+    result = await db_session.execute(
+        select(Project.id).where(
+            Project.user_id == seed_user.id,
+            Project.kind == PROJECT_KIND_PERSONAL,
+        )
+    )
+    return str(result.scalar_one())
+
+
+@pytest_asyncio.fixture
+async def seed_project(db_session: AsyncSession, seed_user: User):
+    """The Personal project created alongside seed_user."""
+    from sqlalchemy import select
+
+    from app.models.project import PROJECT_KIND_PERSONAL, Project
+
+    result = await db_session.execute(
+        select(Project).where(
+            Project.user_id == seed_user.id,
+            Project.kind == PROJECT_KIND_PERSONAL,
+        )
+    )
+    return result.scalar_one()
+
+
+@pytest_asyncio.fixture
+async def workspace_project(db_session: AsyncSession, seed_user: User):
+    """A user-created Custom Project for sharing tests."""
+    from app.models.project import PROJECT_KIND_WORKSPACE, Project
+
+    nonce = uuid.uuid4().hex[:8]
+    project = Project(
+        user_id=seed_user.id,
+        name=f"Workspace {nonce}",
+        slug=f"workspace-{nonce}",
+        kind=PROJECT_KIND_WORKSPACE,
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    return project
+
+
+@pytest_asyncio.fixture
+async def environment_project(db_session: AsyncSession, seed_user: User):
+    """An Agent Project for non-shareable managed-project tests."""
+    from sqlalchemy import select
+
+    from app.models.project import Project
+
+    env = await create_env_with_project(
+        db_session,
+        user_id=seed_user.id,
+        machine_id=f"test-agent-{uuid.uuid4().hex[:8]}",
+        machine_name="Test Agent",
+    )
+    result = await db_session.execute(select(Project).where(Project.id == env.default_project_id))
+    return result.scalar_one()
+
+
+@pytest_asyncio.fixture
+async def channel_agent(db_session: AsyncSession, seed_user: User):
+    agent = await create_env_with_project(
+        db_session,
+        user_id=seed_user.id,
+        machine_id=f"channel-agent-{uuid.uuid4().hex[:8]}",
+        machine_name="Channel Test Agent",
+        agent_type="openclaw",
+    )
+    await create_test_hosted_runtime_state(db_session, agent, runtime_name="openclaw")
+    return agent
+
+
+@pytest_asyncio.fixture
+async def second_channel_agent(db_session: AsyncSession, seed_user: User):
+    agent = await create_env_with_project(
+        db_session,
+        user_id=seed_user.id,
+        machine_id=f"channel-agent-2-{uuid.uuid4().hex[:8]}",
+        machine_name="Second Channel Test Agent",
+        agent_type="openclaw",
+    )
+    await create_test_hosted_runtime_state(db_session, agent, runtime_name="openclaw")
+    return agent
+
+
+@pytest_asyncio.fixture
+async def client(db_session: AsyncSession, seed_user: User) -> AsyncIterator[httpx.AsyncClient]:
+    async def _override_get_session() -> AsyncIterator[AsyncSession]:
+        yield db_session
+
+    async def _override_get_auth() -> AuthContext:
+        return AuthContext(user=seed_user)
+
+    async def _override_optional_web_auth() -> AuthContext:
+        # The dashboard `client` fixture represents a signed-in browser
+        # session — public routes that take `optional_web_auth` should
+        # see the same identity as `get_auth` would, so owner-detection
+        # in the public route works in tests.
+        return AuthContext(user=seed_user)
+
+    overrides = {
+        get_control_session: _override_get_session,
+        get_session: _override_get_session,
+        get_auth: _override_get_auth,
+        # GET /auth/me depends on the billing-exempt twin (06.3 D-03); the
+        # fixture identity must answer there too.
+        get_auth_billing_exempt: _override_get_auth,
+        get_auth_short_session: _override_get_auth,
+        optional_web_auth: _override_optional_web_auth,
+    }
+    with _dependency_overrides(overrides):
+        transport = ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+            yield ac
+
+
+@pytest_asyncio.fixture
+async def anon_client(
+    db_session: AsyncSession, seed_user: User
+) -> AsyncIterator[httpx.AsyncClient]:
+    """Anonymous client — no Clerk JWT, no API key.
+
+    `seed_user` is still required so the public route's session-by-id
+    lookups have an owner to match against, but no auth dependency
+    overrides install identity for the request. `optional_web_auth`
+    returns None (anonymous); `get_auth` is unset so any owner-only
+    route returns 401, exactly like a browser with no cookies.
+    """
+
+    async def _override_get_session() -> AsyncIterator[AsyncSession]:
+        yield db_session
+
+    async def _override_optional_web_auth() -> None:
+        return None
+
+    with _dependency_overrides(
+        {
+            get_control_session: _override_get_session,
+            get_session: _override_get_session,
+            optional_web_auth: _override_optional_web_auth,
+        }
+    ):
+        transport = ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+            yield ac
+
+
+@pytest_asyncio.fixture
+async def cli_client(db_session: AsyncSession, seed_user: User) -> AsyncIterator[httpx.AsyncClient]:
+    """Like ``client`` but the auth context advertises CLI (ApiKey) auth.
+
+    Used to exercise endpoints guarded by ``require_cli_auth``. We don't
+    persist a real ApiKey row because ``require_cli_auth`` only checks the
+    ``is_cli`` flag — a placeholder ApiKey object is enough.
+    """
+    from app.models.api_key import ApiKey
+
+    async def _override_get_session() -> AsyncIterator[AsyncSession]:
+        yield db_session
+
+    async def _override_get_auth() -> AuthContext:
+        # ApiKey instance is not persisted; only ``is_cli`` branching matters
+        # to the routes we exercise. See app.core.auth.require_cli_auth.
+        return AuthContext(user=seed_user, api_key=ApiKey(user_id=seed_user.id))
+
+    with _dependency_overrides(
+        {
+            get_control_session: _override_get_session,
+            get_session: _override_get_session,
+            get_auth: _override_get_auth,
+            get_auth_billing_exempt: _override_get_auth,
+            get_auth_short_session: _override_get_auth,
+        }
+    ):
+        transport = ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+            yield ac

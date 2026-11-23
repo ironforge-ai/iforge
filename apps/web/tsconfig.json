@@ -1,0 +1,14 @@
+{
+	"extends": "../../tsconfig.base.json",
+	"compilerOptions": {
+		"target": "ES2022",
+		"allowJs": true,
+		"incremental": true,
+		"types": ["bun", "vite/client"],
+		"paths": {
+			"@/*": ["./src/*"]
+		}
+	},
+	"include": ["**/*.ts", "**/*.tsx", "**/*.mts", "src/routeTree.gen.ts"],
+	"exclude": ["node_modules", ".output", "dist"]
+}

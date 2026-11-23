@@ -1,0 +1,120 @@
+import { createFileRoute, useRouter } from "@tanstack/react-router";
+import { lazy, Suspense, useEffect, useMemo } from "react";
+import { ApiErrorPanel } from "@/components/api-error-panel";
+import { useAgentProjectBindings } from "@/components/dashboard/agent-project-bindings-query";
+import { resolveAgentProjectResourceContext } from "@/components/dashboard/agent-project-resource-context";
+import { orderedAgentProjectBindings } from "@/components/dashboard/agent-project-scope";
+import { AgentResourceRouteGate } from "@/components/dashboard/agent-resource-route-gate";
+import { CENTERED_PAGE_WIDTH_CLASS } from "@/components/page-width";
+import { Skeleton } from "@/components/ui/skeleton";
+import {
+	agentProjectResourceHref,
+	agentSectionHref,
+	agentSkillDetailHref,
+} from "@/lib/agent-routes";
+import { routeHeadTitle } from "@/lib/document-title";
+import { decodeResourceRouteParam } from "@/lib/project-resource-model";
+import { shouldBlockQueryError } from "@/lib/query-state";
+import { useCommittedRouteIsLatestTarget } from "@/lib/use-committed-location";
+import { cn } from "@/lib/utils";
+import { SkillDetailContent } from "@/pages/dashboard/skills/[key]/page";
+
+const IS_HOSTED_BUILD = import.meta.env.VITE_IFORGE_HOSTED === "true";
+const HostedWorkspaceSkillDetail = IS_HOSTED_BUILD
+	? lazy(() => import("@/hosted/agents/hosted-workspace-skill-detail"))
+	: null;
+
+export const Route = createFileRoute("/_protected/_dashboard/agents/$id/skills/$")({
+	head: () => routeHeadTitle("Skill"),
+	component: AgentSkillDetailRoute,
+});
+
+function AgentSkillDetailRoute() {
+	const { id, _splat } = Route.useParams();
+	const search = Route.useSearch();
+	const skillKey = (_splat ?? "").split("/").map(decodeResourceRouteParam).join("/");
+	const projectId =
+		typeof search.project === "string" && search.project.trim() ? search.project.trim() : null;
+	const returnHref = projectId
+		? agentProjectResourceHref(id, projectId, "skills")
+		: agentSectionHref(id, "projects");
+
+	if (!projectId) {
+		return (
+			<AgentResourceRouteGate
+				agentId={id}
+				returnHref={returnHref}
+				returnLabel="Projects"
+				requiredAdapterModule="skills"
+			>
+				<LegacyAgentSkillProjectCanonicalizer agentId={id} skillKey={skillKey} />
+			</AgentResourceRouteGate>
+		);
+	}
+
+	return (
+		<AgentResourceRouteGate
+			agentId={id}
+			returnHref={returnHref}
+			returnLabel="Projects"
+			requiredAdapterModule="skills"
+			projectAccess={{ projectId }}
+		>
+			{HostedWorkspaceSkillDetail ? (
+				<Suspense fallback={<Skeleton className="mx-6 h-40 rounded-lg" />}>
+					<HostedWorkspaceSkillDetail agentId={id} projectId={projectId} skillKey={skillKey}>
+						<SkillDetailContent agentId={id} skillKey={skillKey} routeSearch={search} />
+					</HostedWorkspaceSkillDetail>
+				</Suspense>
+			) : (
+				<SkillDetailContent agentId={id} skillKey={skillKey} routeSearch={search} />
+			)}
+		</AgentResourceRouteGate>
+	);
+}
+
+function LegacyAgentSkillProjectCanonicalizer({
+	agentId,
+	skillKey,
+}: {
+	agentId: string;
+	skillKey: string;
+}) {
+	const router = useRouter();
+	const bindings = useAgentProjectBindings(agentId);
+	const orderedBindings = useMemo(
+		() => orderedAgentProjectBindings(bindings.data ?? []),
+		[bindings.data],
+	);
+	const projectId = resolveAgentProjectResourceContext(orderedBindings, null);
+	const blockingError = shouldBlockQueryError(bindings.error, bindings.data)
+		? bindings.error
+		: null;
+	const projectsHref = agentSectionHref(agentId, "projects");
+	const targetHref = projectId ? agentSkillDetailHref(agentId, skillKey, projectId) : projectsHref;
+	const isLatestTarget = useCommittedRouteIsLatestTarget();
+
+	useEffect(() => {
+		if (bindings.data === undefined || blockingError || !isLatestTarget) return;
+		void router.navigate({ href: targetHref, replace: true, resetScroll: false });
+	}, [bindings.data, blockingError, isLatestTarget, router, targetHref]);
+
+	return (
+		<div className={cn(CENTERED_PAGE_WIDTH_CLASS.page, "space-y-4 px-4 lg:px-6")}>
+			{blockingError ? (
+				<ApiErrorPanel
+					error={blockingError}
+					onRetry={() => {
+						void bindings.refetch();
+					}}
+					title="Couldn't load Workspace access"
+				/>
+			) : (
+				<>
+					<Skeleton className="h-8 w-52" />
+					<Skeleton className="h-24 w-full rounded-lg" />
+				</>
+			)}
+		</div>
+	);
+}

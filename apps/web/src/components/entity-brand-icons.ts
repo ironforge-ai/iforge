@@ -1,0 +1,148 @@
+import Anthropic from "@lobehub/icons/es/Anthropic/components/Mono.js";
+import ClaudeCode from "@lobehub/icons/es/ClaudeCode/components/Color.js";
+import Codex from "@lobehub/icons/es/Codex/components/Inner.js";
+import DeepInfra from "@lobehub/icons/es/DeepInfra/components/Mono.js";
+import DeepSeek from "@lobehub/icons/es/DeepSeek/components/Color.js";
+import Fireworks from "@lobehub/icons/es/Fireworks/components/Mono.js";
+import Gemini from "@lobehub/icons/es/Gemini/components/Color.js";
+import Grok from "@lobehub/icons/es/Grok/components/Mono.js";
+import Groq from "@lobehub/icons/es/Groq/components/Mono.js";
+import HermesAgent from "@lobehub/icons/es/HermesAgent/components/Mono.js";
+import HuggingFace from "@lobehub/icons/es/HuggingFace/components/Color.js";
+import Kimi from "@lobehub/icons/es/Kimi/components/Color.js";
+import Minimax from "@lobehub/icons/es/Minimax/components/Color.js";
+import Mistral from "@lobehub/icons/es/Mistral/components/Color.js";
+import Nvidia from "@lobehub/icons/es/Nvidia/components/Color.js";
+import OpenAI from "@lobehub/icons/es/OpenAI/components/Mono.js";
+import OpenClaw from "@lobehub/icons/es/OpenClaw/components/Color.js";
+import OpenCode from "@lobehub/icons/es/OpenCode/components/Mono.js";
+import OpenRouter from "@lobehub/icons/es/OpenRouter/components/Color.js";
+import Pi from "@lobehub/icons/es/Pi/components/Mono.js";
+import Qwen from "@lobehub/icons/es/Qwen/components/Color.js";
+import Stepfun from "@lobehub/icons/es/Stepfun/components/Mono.js";
+import Tencent from "@lobehub/icons/es/Tencent/components/Color.js";
+import Together from "@lobehub/icons/es/Together/components/Color.js";
+import XAI from "@lobehub/icons/es/XAI/components/Mono.js";
+import XiaomiMiMo from "@lobehub/icons/es/XiaomiMiMo/components/Mono.js";
+import ZAI from "@lobehub/icons/es/ZAI/components/Mono.js";
+import { IronHermesMark } from "@/components/brand/ironhermes-mark";
+import type { BrandIconComponent } from "@/components/brand-icon-tile";
+import type { FrameworkBrandIconId, ProviderBrandIconId } from "@/components/entity-brand-icon-ids";
+
+export type BrandIconMetadata = {
+	icon: BrandIconComponent;
+	iconClassName?: string;
+	iconScale?: number;
+	label: string;
+	tileClassName?: string;
+};
+
+const FRAMEWORK_BRAND_ICON_DEFINITIONS = {
+	openclaw: { icon: OpenClaw, iconScale: 0.75, label: "OpenClaw" },
+	hermes: {
+		icon: HermesAgent,
+		// LobeHub's Hermes avatar is intentionally a black mark on white.
+		iconClassName: "text-black",
+		iconScale: 0.75,
+		label: "Hermes Agent",
+		tileClassName: "bg-white",
+	},
+	"claude-code": {
+		icon: ClaudeCode,
+		iconScale: 0.7,
+		label: "Claude Code",
+	},
+	codex: { icon: Codex, iconScale: 0.7, label: "Codex", tileClassName: "bg-white" },
+	pi: {
+		icon: Pi,
+		iconClassName: "text-white",
+		iconScale: 0.65,
+		label: "Pi",
+		tileClassName: "bg-black",
+	},
+	opencode: {
+		icon: OpenCode,
+		iconClassName: "text-white",
+		iconScale: 0.75,
+		label: "OpenCode",
+		tileClassName: "bg-black",
+	},
+	// First-party mark, deliberately left on the default neutral plate: upstream Hermes
+	// above is pinned to a forced-white plate with a black glyph, and a user has to tell
+	// the two runtimes apart at 20px without reading the label. Different glyph AND
+	// different plate is the whole distinction. The 0.85 scale is higher than its peers
+	// because the winged mark runs about twice as wide as it is tall — at 0.7 it would
+	// fill most of the tile's width but only a third of its height.
+	ironhermes: { icon: IronHermesMark, iconScale: 0.85, label: "IronHermes" },
+} satisfies Readonly<Record<FrameworkBrandIconId, BrandIconMetadata>>;
+
+const FRAMEWORK_BRAND_ICONS: Readonly<Record<string, BrandIconMetadata>> = {
+	...FRAMEWORK_BRAND_ICON_DEFINITIONS,
+	claude_code: FRAMEWORK_BRAND_ICON_DEFINITIONS["claude-code"],
+};
+
+const PROVIDER_BRAND_ICON_DEFINITIONS = {
+	anthropic: { icon: Anthropic, label: "Anthropic" },
+	deepinfra: { icon: DeepInfra, label: "DeepInfra" },
+	deepseek: { icon: DeepSeek, label: "DeepSeek" },
+	fireworks: { icon: Fireworks, label: "Fireworks AI" },
+	gemini: { icon: Gemini, label: "Gemini" },
+	grok: { icon: Grok, label: "Grok" },
+	groq: { icon: Groq, label: "Groq" },
+	huggingface: { icon: HuggingFace, label: "Hugging Face" },
+	kimi: { icon: Kimi, label: "Kimi", tileClassName: "bg-black" },
+	minimax: { icon: Minimax, label: "MiniMax" },
+	mistral: { icon: Mistral, label: "Mistral AI" },
+	nvidia: { icon: Nvidia, label: "NVIDIA NIM" },
+	openai: { icon: OpenAI, label: "OpenAI" },
+	opencode: {
+		icon: OpenCode,
+		label: "OpenCode",
+		iconClassName: "text-white",
+		tileClassName: "bg-black",
+	},
+	openrouter: { icon: OpenRouter, label: "OpenRouter" },
+	qwen: { icon: Qwen, label: "Qwen" },
+	stepfun: { icon: Stepfun, label: "StepFun" },
+	tencent: { icon: Tencent, label: "Tencent Cloud" },
+	together: { icon: Together, label: "Together AI" },
+	xai: { icon: XAI, label: "xAI" },
+	xiaomi: { icon: XiaomiMiMo, label: "Xiaomi MiMo" },
+	zai: { icon: ZAI, label: "Z.ai" },
+} satisfies Readonly<Record<ProviderBrandIconId, BrandIconMetadata>>;
+
+const PROVIDER_BRAND_ICONS: Readonly<Record<string, BrandIconMetadata>> =
+	PROVIDER_BRAND_ICON_DEFINITIONS;
+
+const PROVIDER_ICON_ALIASES: Readonly<Record<string, ProviderBrandIconId>> = {
+	alibaba: "qwen",
+	"alibaba-coding-plan": "qwen",
+	"kimi-coding-cn": "kimi",
+	"minimax-cn": "minimax",
+	"openai-api": "openai",
+	"opencode-zen": "opencode",
+	"opencode-go": "opencode",
+	"stepfun-plan": "stepfun",
+	"tencent-tokenhub": "tencent",
+	"tencent-tokenplan": "tencent",
+	togetherai: "together",
+	xiaomimimo: "xiaomi",
+	"google-gemini-openai": "gemini",
+	google: "gemini",
+	"kimi-coding": "kimi",
+	moonshot: "kimi",
+	"openai-codex": "openai",
+	"qwen-dashscope": "qwen",
+	"together-ai": "together",
+	"xai-grok": "grok",
+	"zhipu-glm": "zai",
+};
+
+export function frameworkBrandIcon(id: string | null | undefined): BrandIconMetadata | undefined {
+	return FRAMEWORK_BRAND_ICONS[id?.toLowerCase() ?? ""];
+}
+
+export function providerBrandIcon(id: string | null | undefined): BrandIconMetadata | undefined {
+	const key = id?.toLowerCase() ?? "";
+	return PROVIDER_BRAND_ICONS[PROVIDER_ICON_ALIASES[key] ?? key];
+}

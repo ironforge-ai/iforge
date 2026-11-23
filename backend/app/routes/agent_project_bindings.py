@@ -1,0 +1,389 @@
+"""Agent -> project binding routes."""
+
+from __future__ import annotations
+
+from uuid import UUID
+
+from fastapi import APIRouter, Depends, HTTPException, status
+from pydantic import BaseModel, Field, model_validator
+from sqlalchemy import case, select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.core.auth import AuthContext, require_user_auth_unbound
+from app.core.database import get_session
+from app.core.project import project_ids_visible_to
+from app.models.agent_project_binding import AgentProjectBinding
+from app.schemas.sharing import (
+    AgentProjectBindingResponse,
+    BindingCreate,
+    BindingDeleteResponse,
+    BindingReorderBody,
+    BindingReorderResponse,
+)
+from app.services.agent_bindings import (
+    assert_project_linkable_to_agent,
+    attach_projects_to_owned_agent,
+    ensure_agent_primary_binding,
+    ensure_context_binding,
+    get_owned_agent_or_404,
+    update_owned_agent_project_links,
+)
+from app.services.project_runtime_skills import (
+    assert_project_link_compatible,
+    lock_project_binding_change,
+    lock_project_binding_set_change,
+)
+from app.services.sync_events import queue_environment_runtime_manifest_changed
+
+router = APIRouter(prefix="/agents", tags=["agent-project-bindings"])
+
+
+class AgentProjectLinkBody(BaseModel):
+    project_ids: list[str] = Field(min_length=1, max_length=200)
+
+
+class AgentProjectLinkResponse(BaseModel):
+    agent_id: str
+    bound_project_ids: list[str]
+
+
+class AgentProjectDeltaBody(BaseModel):
+    add_project_ids: list[UUID] = Field(default_factory=list, max_length=200)
+    remove_project_ids: list[UUID] = Field(default_factory=list, max_length=200)
+
+    @model_validator(mode="after")
+    def validate_disjoint_ids(self) -> AgentProjectDeltaBody:
+        if set(self.add_project_ids) & set(self.remove_project_ids):
+            raise ValueError("Project ids to add and remove must be disjoint")
+        return self
+
+
+class AgentProjectDeltaResponse(BaseModel):
+    agent_id: str
+    added_project_ids: list[str]
+    removed_project_ids: list[str]
+
+
+def _to_response(binding: AgentProjectBinding) -> AgentProjectBindingResponse:
+    return AgentProjectBindingResponse(
+        id=str(binding.id),
+        agent_id=str(binding.agent_id),
+        project_id=str(binding.project_id),
+        binding_type=binding.binding_type,
+        priority=binding.priority,
+        default_write_enabled=binding.default_write_enabled,
+        created_at=binding.created_at,
+    )
+
+
+@router.get("/{agent_id}/project-bindings", response_model=list[AgentProjectBindingResponse])
+async def list_project_bindings(
+    agent_id: UUID,
+    auth: AuthContext = Depends(require_user_auth_unbound),
+    db: AsyncSession = Depends(get_session),
+) -> list[AgentProjectBindingResponse]:
+    agent = await get_owned_agent_or_404(db, user_id=auth.user_id, agent_id=agent_id)
+    rows = (
+        (
+            await db.execute(
+                select(AgentProjectBinding)
+                .where(AgentProjectBinding.agent_id == agent_id)
+                .order_by(
+                    case((AgentProjectBinding.binding_type == "primary", 0), else_=1),
+                    AgentProjectBinding.priority.asc(),
+                    AgentProjectBinding.created_at.asc(),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    visible_project_ids = set(await project_ids_visible_to(db, auth))
+    changed = False
+    stale = [row for row in rows if row.project_id not in visible_project_ids]
+    if stale:
+        await lock_project_binding_set_change(
+            db,
+            project_ids=(row.project_id for row in stale),
+            agent_id=agent_id,
+        )
+        # Access may have changed while the cleanup waited for Link/Unlink or a
+        # Project Skill write. Only remove links that are still inaccessible at
+        # the serialized write boundary.
+        visible_project_ids = set(await project_ids_visible_to(db, auth))
+        stale = [row for row in rows if row.project_id not in visible_project_ids]
+        removed_context_binding = any(row.binding_type == "context" for row in stale)
+        for row in stale:
+            await db.delete(row)
+        if removed_context_binding:
+            await queue_environment_runtime_manifest_changed(db, auth.user_id, agent_id)
+        changed = True
+        rows = [row for row in rows if row.project_id in visible_project_ids]
+
+    if agent.default_project_id in visible_project_ids:
+        await ensure_agent_primary_binding(
+            db,
+            agent=agent,
+            created_by_user_id=auth.user_id,
+        )
+        changed = True
+
+    if changed:
+        await db.commit()
+        rows = (
+            (
+                await db.execute(
+                    select(AgentProjectBinding)
+                    .where(AgentProjectBinding.agent_id == agent_id)
+                    .order_by(
+                        case((AgentProjectBinding.binding_type == "primary", 0), else_=1),
+                        AgentProjectBinding.priority.asc(),
+                        AgentProjectBinding.created_at.asc(),
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+    return [_to_response(row) for row in rows]
+
+
+@router.post("/{agent_id}/projects", response_model=AgentProjectLinkResponse)
+async def link_agent_projects(
+    agent_id: UUID,
+    body: AgentProjectLinkBody,
+    auth: AuthContext = Depends(require_user_auth_unbound),
+    db: AsyncSession = Depends(get_session),
+) -> AgentProjectLinkResponse:
+    bound_project_ids = await attach_projects_to_owned_agent(
+        db,
+        user_id=auth.user_id,
+        agent_id=agent_id,
+        raw_project_ids=body.project_ids,
+    )
+    await db.commit()
+    return AgentProjectLinkResponse(
+        agent_id=str(agent_id),
+        bound_project_ids=bound_project_ids,
+    )
+
+
+@router.patch("/{agent_id}/projects", response_model=AgentProjectDeltaResponse)
+async def update_agent_projects(
+    agent_id: UUID,
+    body: AgentProjectDeltaBody,
+    auth: AuthContext = Depends(require_user_auth_unbound),
+    db: AsyncSession = Depends(get_session),
+) -> AgentProjectDeltaResponse:
+    result = await update_owned_agent_project_links(
+        db,
+        user_id=auth.user_id,
+        agent_id=agent_id,
+        add_project_ids=body.add_project_ids,
+        remove_project_ids=body.remove_project_ids,
+    )
+    await db.commit()
+    return AgentProjectDeltaResponse(
+        agent_id=str(agent_id),
+        added_project_ids=[str(project_id) for project_id in result.added_ids],
+        removed_project_ids=[str(project_id) for project_id in result.removed_ids],
+    )
+
+
+@router.post(
+    "/{agent_id}/project-bindings/context",
+    response_model=AgentProjectBindingResponse,
+)
+async def add_context_project_binding(
+    agent_id: UUID,
+    body: BindingCreate,
+    auth: AuthContext = Depends(require_user_auth_unbound),
+    db: AsyncSession = Depends(get_session),
+) -> AgentProjectBindingResponse:
+    agent = await get_owned_agent_or_404(db, user_id=auth.user_id, agent_id=agent_id)
+    await ensure_agent_primary_binding(
+        db,
+        agent=agent,
+        created_by_user_id=auth.user_id,
+    )
+    try:
+        project_id = UUID(body.project_id)
+    except ValueError as err:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "invalid project_id") from err
+
+    await assert_project_linkable_to_agent(
+        db,
+        user_id=auth.user_id,
+        agent=agent,
+        project_id=project_id,
+    )
+    await lock_project_binding_change(db, project_id=project_id, agent_id=agent_id)
+    # Archive/unshare can race the initial picker read. Access and Project kind
+    # must still be valid at the serialized Link boundary.
+    await assert_project_linkable_to_agent(
+        db,
+        user_id=auth.user_id,
+        agent=agent,
+        project_id=project_id,
+    )
+    await assert_project_link_compatible(
+        db,
+        agent_id=agent_id,
+        project_id=project_id,
+    )
+    if body.priority is not None:
+        priority_conflict = (
+            await db.execute(
+                select(AgentProjectBinding.id).where(
+                    AgentProjectBinding.agent_id == agent_id,
+                    AgentProjectBinding.binding_type == "context",
+                    AgentProjectBinding.priority == body.priority,
+                    AgentProjectBinding.project_id != project_id,
+                )
+            )
+        ).scalar_one_or_none()
+        if priority_conflict is not None:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                "Vault resolution priority is already in use",
+            )
+    binding = await ensure_context_binding(
+        db,
+        agent_id=agent_id,
+        project_id=project_id,
+        created_by_user_id=auth.user_id,
+        priority=body.priority,
+    )
+    await queue_environment_runtime_manifest_changed(db, auth.user_id, agent_id)
+    await db.commit()
+    await db.refresh(binding)
+    return _to_response(binding)
+
+
+@router.patch(
+    "/{agent_id}/project-bindings/context/reorder",
+    response_model=BindingReorderResponse,
+)
+async def reorder_context_project_bindings(
+    agent_id: UUID,
+    body: BindingReorderBody,
+    auth: AuthContext = Depends(require_user_auth_unbound),
+    db: AsyncSession = Depends(get_session),
+) -> BindingReorderResponse:
+    agent = await get_owned_agent_or_404(db, user_id=auth.user_id, agent_id=agent_id)
+    await ensure_agent_primary_binding(
+        db,
+        agent=agent,
+        created_by_user_id=auth.user_id,
+    )
+    if len({item.binding_id for item in body.items}) != len(body.items):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "duplicate binding_id")
+    if len({item.priority for item in body.items}) != len(body.items):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "duplicate Vault resolution priority")
+
+    current_context_rows = (
+        (
+            await db.execute(
+                select(AgentProjectBinding).where(
+                    AgentProjectBinding.agent_id == agent_id,
+                    AgentProjectBinding.binding_type == "context",
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    current_by_id = {binding.id: binding for binding in current_context_rows}
+
+    requested: list[tuple[AgentProjectBinding, int]] = []
+    for item in body.items:
+        try:
+            binding_id = UUID(item.binding_id)
+        except ValueError as err:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, "invalid binding_id") from err
+        binding = current_by_id.get(binding_id)
+        if binding is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "Linked Project not found")
+        if item.priority < 1:
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST,
+                "Vault resolution priority must be >= 1",
+            )
+        requested.append((binding, item.priority))
+
+    requested_ids = {binding.id for binding, _priority in requested}
+    requested_priorities = {priority for _binding, priority in requested}
+    for binding in current_context_rows:
+        if binding.id not in requested_ids and binding.priority in requested_priorities:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                "Vault resolution priority is already in use",
+            )
+
+    changed = any(binding.priority != priority for binding, priority in requested)
+    if changed:
+        max_priority = max([binding.priority for binding in current_context_rows] + [0])
+        temp_base = max_priority + len(requested) + 1000
+        for offset, (binding, _priority) in enumerate(requested, start=1):
+            binding.priority = temp_base + offset
+        await db.flush()
+
+        for binding, priority in requested:
+            binding.priority = priority
+        await queue_environment_runtime_manifest_changed(db, auth.user_id, agent_id)
+
+    await db.commit()
+    return BindingReorderResponse(status="reordered")
+
+
+@router.delete(
+    "/{agent_id}/project-bindings/{binding_id}",
+    response_model=BindingDeleteResponse,
+)
+async def delete_project_binding(
+    agent_id: UUID,
+    binding_id: UUID,
+    auth: AuthContext = Depends(require_user_auth_unbound),
+    db: AsyncSession = Depends(get_session),
+) -> BindingDeleteResponse:
+    agent = await get_owned_agent_or_404(db, user_id=auth.user_id, agent_id=agent_id)
+    await ensure_agent_primary_binding(
+        db,
+        agent=agent,
+        created_by_user_id=auth.user_id,
+    )
+    binding = (
+        await db.execute(
+            select(AgentProjectBinding).where(
+                AgentProjectBinding.id == binding_id,
+                AgentProjectBinding.agent_id == agent_id,
+            )
+        )
+    ).scalar_one_or_none()
+    if binding is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Linked Project not found")
+    if binding.binding_type == "primary":
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            "Workspace cannot be unlinked",
+        )
+
+    await lock_project_binding_change(
+        db,
+        project_id=binding.project_id,
+        agent_id=agent_id,
+    )
+    binding = (
+        await db.execute(
+            select(AgentProjectBinding).where(
+                AgentProjectBinding.id == binding_id,
+                AgentProjectBinding.agent_id == agent_id,
+            )
+        )
+    ).scalar_one_or_none()
+    if binding is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Linked Project not found")
+    await db.delete(binding)
+    await queue_environment_runtime_manifest_changed(db, auth.user_id, agent_id)
+    await db.commit()
+    return BindingDeleteResponse(status="deleted")

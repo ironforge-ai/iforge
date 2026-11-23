@@ -1,0 +1,1877 @@
+from __future__ import annotations
+
+import asyncio
+import json
+import uuid
+from collections.abc import AsyncIterator
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
+from typing import Any
+
+import httpx
+import jwt
+import pytest
+import pytest_asyncio
+from cryptography.hazmat.primitives.asymmetric import rsa
+from httpx import ASGITransport
+from sqlalchemy import delete, func, select
+from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.ext.asyncio import async_sessionmaker
+
+from app.core import database
+from app.core.auth import AuthContext, get_auth_short_session
+from app.core.config import settings
+from app.core.database import get_control_session, get_runtime_observation_session, get_session
+from app.main import app
+from app.models.ai_provider import AiProviderAuthPayload
+from app.models.api_key import RUNTIME_DEPLOYMENT_KEY_SCOPES, ApiKey
+from app.models.audit import ControlPlaneAuditEvent
+from app.models.hosted_runtime import HostedRuntimeState
+from app.models.platform_workload_auth import (
+    PLATFORM_WORKLOAD_CLIENT_ACTIVE,
+    PLATFORM_WORKLOAD_CLIENT_DISABLED,
+    PlatformWorkloadAssertionReplay,
+    PlatformWorkloadClient,
+    PlatformWorkloadSigningKey,
+)
+from app.models.runtime_observation import V2RuntimeEnvironmentFence
+from app.models.session import AgentEnvironment
+from app.models.user import User
+from app.routes import admin as admin_route
+from app.routes import sync as sync_route
+from app.routes.channel_routers.discord import _discord_gateway_consumer_lease
+from app.services import platform_workload_auth, runtime_source_authority
+from app.services.discord_advisory_session import DiscordAdvisorySession
+from app.services.platform_workload_auth import (
+    PLATFORM_WORKLOAD_ACCESS_TOKEN_AUDIENCE,
+    PLATFORM_WORKLOAD_ACCESS_TOKEN_TTL_SECONDS,
+    PLATFORM_WORKLOAD_CLIENT_ASSERTION_TYPE,
+    PLATFORM_WORKLOAD_SCOPES,
+    InMemoryPlatformWorkloadKeyResolver,
+    PlatformWorkloadAccessError,
+    PlatformWorkloadKeyUnavailable,
+    authenticate_platform_workload_access_token,
+    canonical_platform_workload_token_endpoint,
+    get_platform_workload_key_resolver,
+)
+from app.services.runtime_observation import retire_runtime_environment
+from app.services.vault_crypto import encrypt
+from tests.conftest import create_test_hosted_runtime_state
+from tests.hosted_runtime_fixtures import (
+    CANONICAL_CODEX_TOOLS,
+    ensure_canonical_codex_tool_provider,
+)
+
+_ADMIN_KEY = "test-platform-admin-secret"
+_CLERK_ISSUER = "https://platform-workload.clerk.example.test"
+_TEST_CLI_PACKAGE_SPEC = "clawdi@1.2.3-test"
+_TEST_TOOLS = {
+    "codex": {
+        "enabled": True,
+        "provider_id": "clawdi-managed-v2",
+        "primary_model": {
+            "provider_id": "clawdi-managed-v2",
+            "model": "gpt-5.5",
+        },
+    }
+}
+
+
+@dataclass
+class WorkloadHarness:
+    client: httpx.AsyncClient
+    credential: PlatformWorkloadClient
+    client_id: str
+    client_kid: str
+    client_private_key: Any
+    signing_private_key: Any
+    signing_key: PlatformWorkloadSigningKey
+    resolver: InMemoryPlatformWorkloadKeyResolver
+
+
+def _public_jwk(private_key: Any, *, kid: str) -> dict[str, Any]:
+    jwk = json.loads(jwt.algorithms.RSAAlgorithm.to_jwk(private_key.public_key()))
+    jwk.update({"kid": kid, "alg": "RS256", "use": "sig", "key_ops": ["verify"]})
+    return jwk
+
+
+@pytest_asyncio.fixture
+async def workload_harness(db_session, seed_user) -> AsyncIterator[WorkloadHarness]:
+    client_private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    signing_private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    client_id = f"hosted-workload-{uuid.uuid4().hex}"
+    client_kid = f"client-{uuid.uuid4().hex}"
+    signing_kid = f"issuer-{uuid.uuid4().hex}"
+    private_key_ref = f"memory://{signing_kid}"
+    now = datetime.now(UTC)
+    credential = PlatformWorkloadClient(
+        client_id=client_id,
+        assertion_kid=client_kid,
+        assertion_algorithm="RS256",
+        public_jwk=_public_jwk(client_private_key, kid=client_kid),
+        status=PLATFORM_WORKLOAD_CLIENT_ACTIVE,
+        allowed_scopes=list(PLATFORM_WORKLOAD_SCOPES),
+        token_version=1,
+    )
+    signing_key = PlatformWorkloadSigningKey(
+        kid=signing_kid,
+        algorithm="RS256",
+        private_key_ref=private_key_ref,
+        status="active",
+        not_before=now - timedelta(minutes=1),
+        expires_at=now + timedelta(hours=1),
+    )
+    db_session.add_all([credential, signing_key])
+    await db_session.commit()
+    await db_session.refresh(credential)
+    await db_session.refresh(signing_key)
+
+    resolver = InMemoryPlatformWorkloadKeyResolver({private_key_ref: signing_private_key})
+
+    async def _override_get_session():
+        yield db_session
+
+    def _override_resolver():
+        return resolver
+
+    original_admin_key = settings.admin_api_key
+    original_clerk_issuer = settings.clerk_jwt_issuer
+    original_legacy_flag = settings.platform_legacy_admin_auth_enabled
+    original_public_api_url = settings.public_api_url
+    original_token_endpoint = settings.platform_workload_token_endpoint
+    original_issuer = settings.platform_workload_issuer
+    settings.admin_api_key = _ADMIN_KEY
+    settings.clerk_jwt_issuer = _CLERK_ISSUER
+    settings.platform_legacy_admin_auth_enabled = True
+    settings.public_api_url = "http://test"
+    settings.platform_workload_token_endpoint = ""
+    settings.platform_workload_issuer = "clawdi-cloud-platform-test"
+    app.dependency_overrides[get_control_session] = _override_get_session
+    app.dependency_overrides[get_session] = _override_get_session
+    app.dependency_overrides[get_runtime_observation_session] = _override_get_session
+    app.dependency_overrides[get_platform_workload_key_resolver] = _override_resolver
+    try:
+        async with httpx.AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://test",
+        ) as client:
+            yield WorkloadHarness(
+                client=client,
+                credential=credential,
+                client_id=client_id,
+                client_kid=client_kid,
+                client_private_key=client_private_key,
+                signing_private_key=signing_private_key,
+                signing_key=signing_key,
+                resolver=resolver,
+            )
+    finally:
+        app.dependency_overrides.clear()
+        settings.admin_api_key = original_admin_key
+        settings.clerk_jwt_issuer = original_clerk_issuer
+        settings.platform_legacy_admin_auth_enabled = original_legacy_flag
+        settings.public_api_url = original_public_api_url
+        settings.platform_workload_token_endpoint = original_token_endpoint
+        settings.platform_workload_issuer = original_issuer
+        await db_session.execute(
+            delete(PlatformWorkloadAssertionReplay).where(
+                PlatformWorkloadAssertionReplay.client_id == client_id
+            )
+        )
+        await db_session.execute(
+            delete(PlatformWorkloadClient).where(PlatformWorkloadClient.client_id == client_id)
+        )
+        await db_session.execute(
+            delete(PlatformWorkloadSigningKey).where(PlatformWorkloadSigningKey.kid == signing_kid)
+        )
+        await db_session.commit()
+
+
+def _assertion(
+    harness: WorkloadHarness,
+    *,
+    payload_updates: dict[str, Any] | None = None,
+    remove_claims: tuple[str, ...] = (),
+    kid: str | None = None,
+    algorithm: str = "RS256",
+    signing_key: Any | None = None,
+    jti: str | None = None,
+) -> str:
+    now = int(datetime.now(UTC).timestamp())
+    payload: dict[str, Any] = {
+        "iss": harness.client_id,
+        "sub": harness.client_id,
+        "aud": canonical_platform_workload_token_endpoint(),
+        "iat": now,
+        "exp": now + 120,
+        "jti": jti or str(uuid.uuid4()),
+    }
+    payload.update(payload_updates or {})
+    for claim in remove_claims:
+        payload.pop(claim, None)
+    key = signing_key or harness.client_private_key
+    return jwt.encode(
+        payload,
+        key,
+        algorithm=algorithm,
+        headers={"kid": kid or harness.client_kid, "typ": "JWT"},
+    )
+
+
+async def _token_response(
+    harness: WorkloadHarness,
+    *,
+    scope: str,
+    assertion: str | None = None,
+    client_id: str | None = None,
+    grant_type: str = "client_credentials",
+    assertion_type: str = PLATFORM_WORKLOAD_CLIENT_ASSERTION_TYPE,
+) -> httpx.Response:
+    return await harness.client.post(
+        "/v1/platform/oauth/token",
+        data={
+            "grant_type": grant_type,
+            "client_id": client_id or harness.client_id,
+            "scope": scope,
+            "client_assertion_type": assertion_type,
+            "client_assertion": assertion or _assertion(harness),
+        },
+    )
+
+
+async def _access_token(harness: WorkloadHarness, scope: str) -> str:
+    response = await _token_response(harness, scope=scope)
+    assert response.status_code == 200, response.text
+    return response.json()["access_token"]
+
+
+def _workload_headers(token: str, idempotency_key: str) -> dict[str, str]:
+    return {
+        "Authorization": f"Bearer {token}",
+        "Idempotency-Key": idempotency_key,
+    }
+
+
+def _owner(user: User) -> dict[str, str]:
+    assert user.clerk_id is not None
+    return {"kind": "clerk", "ref": user.clerk_id}
+
+
+def _agent_body(owner: dict[str, str], agent_id: uuid.UUID) -> dict[str, Any]:
+    return {
+        "owner": owner,
+        "agent_id": str(agent_id),
+        "machine_id": f"machine-{agent_id.hex[:8]}",
+        "machine_name": "workload-platform-agent",
+        "agent_type": "openclaw",
+        "agent_version": "1.0.0",
+        "os_name": "linux",
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.committed_db
+async def test_deployment_control_survives_slow_admin_and_gateway_pressure(
+    workload_harness, seed_user, db_session, monkeypatch
+):
+    """Real pool contention must not strand token issuance or deployment recovery."""
+    monkeypatch.setattr(settings, "db_pool_timeout", 1.0)
+    ordinary = database._create_engine(pool_size=2, max_overflow=0)
+    gateway_locks = DiscordAdvisorySession(ordinary)
+    control = database._create_engine(pool_size=database.CONTROL_POOL_SIZE, max_overflow=0)
+    snapshot = database._create_engine(pool_size=1, max_overflow=0)
+    ordinary_sessions = async_sessionmaker(
+        ordinary, class_=database.async_session_factory.class_, expire_on_commit=False
+    )
+    control_sessions = async_sessionmaker(
+        control, class_=database.control_session_factory.class_, expire_on_commit=False
+    )
+    monkeypatch.setattr(database, "async_session_factory", ordinary_sessions)
+    monkeypatch.setattr(database, "control_session_factory", control_sessions)
+    monkeypatch.setattr(sync_route, "async_session_factory", ordinary_sessions)
+    monkeypatch.setattr(
+        runtime_source_authority,
+        "control_snapshot_session_factory",
+        async_sessionmaker(
+            snapshot,
+            class_=database.control_snapshot_session_factory.class_,
+            expire_on_commit=False,
+        ),
+    )
+    for dependency in (get_session, get_control_session, get_runtime_observation_session):
+        monkeypatch.delitem(app.dependency_overrides, dependency)
+
+    async def sync_auth():
+        return AuthContext(user=seed_user)
+
+    monkeypatch.setitem(app.dependency_overrides, get_auth_short_session, sync_auth)
+    provider_started = asyncio.Event()
+
+    async def slow_provider_webhook(**kwargs):
+        provider_started.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(admin_route, "configure_telegram_provider_webhook", slow_provider_webhook)
+    owner = _owner(seed_user)
+    agent_id = uuid.uuid4()
+    await db_session.commit()
+    client = workload_harness.client
+    try:
+        # A gateway lease and a channel transaction awaiting provider I/O consume
+        # both ordinary slots. Only the external provider call is stubbed.
+        async with _discord_gateway_consumer_lease(
+            account_id=uuid.uuid4(), bot_agent_link_id=uuid.uuid4(), lock_session=gateway_locks
+        ) as acquired:
+            assert acquired
+            pressure = asyncio.create_task(
+                client.post(
+                    "/v1/admin/channels",
+                    headers={"X-Admin-Key": _ADMIN_KEY},
+                    json={
+                        "provider": "telegram",
+                        "name": f"slow-provider-{agent_id}",
+                        "visibility": "public",
+                        "provider_token": "test-provider-token",
+                    },
+                )
+            )
+            try:
+                await asyncio.wait_for(provider_started.wait(), timeout=2)
+                async with asyncio.timeout(10):
+                    saturated = await client.get("/v1/sync/events")
+                    assert saturated.status_code == 503, saturated.text
+                    assert saturated.headers["Retry-After"] == "1"
+                    token = await _access_token(
+                        workload_harness, "platform:agents:create platform:agents:delete"
+                    )
+                    created = await client.post(
+                        "/v1/platform/agents",
+                        headers=_workload_headers(token, f"capacity-create-{agent_id}"),
+                        json=_agent_body(owner, agent_id),
+                    )
+                    assert created.status_code == 200, created.text
+                    agent = await db_session.get(AgentEnvironment, agent_id)
+                    state = await create_test_hosted_runtime_state(
+                        db_session, agent, runtime_name="openclaw"
+                    )
+                    await ensure_canonical_codex_tool_provider(db_session, seed_user)
+                    state.tools = CANONICAL_CODEX_TOOLS
+                    await db_session.commit()
+                    # Each read retains the outer control transaction while
+                    # loading a nested snapshot, without ordinary-pool fallback
+                    # or self-deadlock. Cover both aliases sequentially: callers
+                    # must serialize through the single control slot.
+                    for prefix in ("/v1", "/api"):
+                        result = await client.get(
+                            f"{prefix}/admin/agents/{agent_id}/runtime-state",
+                            params=owner,
+                            headers={"X-Admin-Key": _ADMIN_KEY},
+                        )
+                        assert result.status_code == 200, result.text
+                    recovered = await client.request(
+                        "DELETE",
+                        f"/v1/platform/agents/{agent_id}",
+                        headers=_workload_headers(token, f"capacity-delete-{agent_id}"),
+                        json={"owner": owner},
+                    )
+                    assert recovered.status_code == 204, recovered.text
+
+                    assert not pressure.done()
+            finally:
+                pressure.cancel()
+                await asyncio.gather(pressure, return_exceptions=True)
+        assert (await client.get("/ready")).status_code == 200
+    finally:
+        await gateway_locks.close()
+        await ordinary.dispose()
+        await control.dispose()
+        await snapshot.dispose()
+
+
+def _runtime_body(owner: dict[str, str], agent_id: uuid.UUID) -> dict[str, Any]:
+    return {
+        "owner": owner,
+        "deployment_id": "deployment-workload",
+        "instance_id": "instance-workload",
+        "generation": 1,
+        "cli_package_spec": _TEST_CLI_PACKAGE_SPEC,
+        "locale": {"language": "en", "timezone": "UTC"},
+        "system": {},
+        "runtimes": {
+            "openclaw": {
+                "enabled": True,
+                "providerMode": "configured",
+                "provider_ids": ["clawdi-managed-v2"],
+                "primary_model": {
+                    "provider_id": "clawdi-managed-v2",
+                    "model": "gpt-5.5",
+                },
+                "install": {"source": "official"},
+                "run": {"args": ["gateway", "run"]},
+                "services": {},
+            }
+        },
+        "live_sync": {
+            "enabled": True,
+            "agents": [
+                {
+                    "agentType": "openclaw",
+                    "environmentId": str(agent_id),
+                }
+            ],
+        },
+        "recovery": {"cacheManifest": True, "allowOfflineBoot": True},
+        "tools": _TEST_TOOLS,
+        "secretValues": {},
+    }
+
+
+@pytest.mark.asyncio
+async def test_oauth_issues_at_jwt_with_fixed_contract_and_short_ttl(
+    workload_harness,
+    db_session,
+):
+    assertion_jti = str(uuid.uuid4())
+    response = await _token_response(
+        workload_harness,
+        scope="platform:agents:create platform:keys:mint",
+        assertion=_assertion(workload_harness, jti=assertion_jti),
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.headers["cache-control"] == "no-store"
+    assert response.headers["pragma"] == "no-cache"
+    body = response.json()
+    assert body["token_type"] == "Bearer"
+    assert body["expires_in"] == PLATFORM_WORKLOAD_ACCESS_TOKEN_TTL_SECONDS
+    assert body["scope"] == "platform:agents:create platform:keys:mint"
+
+    header = jwt.get_unverified_header(body["access_token"])
+    assert header == {
+        "alg": "RS256",
+        "kid": workload_harness.signing_key.kid,
+        "typ": "at+jwt",
+    }
+    claims = jwt.decode(
+        body["access_token"],
+        workload_harness.signing_private_key.public_key(),
+        algorithms=["RS256"],
+        audience=PLATFORM_WORKLOAD_ACCESS_TOKEN_AUDIENCE,
+        issuer=settings.platform_workload_issuer,
+    )
+    assert claims["sub"] == workload_harness.credential.client_id
+    assert claims["client_id"] == workload_harness.credential.client_id
+    assert claims["credential_id"] == str(workload_harness.credential.id)
+    assert claims["token_version"] == 1
+    assert claims["scope"] == body["scope"]
+    assert claims["exp"] - claims["iat"] == PLATFORM_WORKLOAD_ACCESS_TOKEN_TTL_SECONDS
+    assert claims["nbf"] == claims["iat"]
+    replay_count = await db_session.scalar(
+        select(func.count())
+        .select_from(PlatformWorkloadAssertionReplay)
+        .where(
+            PlatformWorkloadAssertionReplay.client_id == workload_harness.credential.client_id,
+            PlatformWorkloadAssertionReplay.jti == assertion_jti,
+        )
+    )
+    assert replay_count == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("case", "expected_error"),
+    [
+        ("grant_type", "unsupported_grant_type"),
+        ("assertion_type", "invalid_request"),
+        ("client_id", "invalid_client"),
+        ("kid", "invalid_client"),
+        ("algorithm", "invalid_client"),
+        ("signature", "invalid_client"),
+        ("issuer", "invalid_client"),
+        ("subject", "invalid_client"),
+        ("audience", "invalid_client"),
+        ("missing_issuer", "invalid_client"),
+        ("missing_subject", "invalid_client"),
+        ("missing_audience", "invalid_client"),
+        ("missing_iat", "invalid_client"),
+        ("missing_exp", "invalid_client"),
+        ("future_iat", "invalid_client"),
+        ("future_nbf", "invalid_client"),
+        ("expired", "invalid_client"),
+        ("long_lived", "invalid_client"),
+        ("empty_jti", "invalid_client"),
+        ("missing_jti", "invalid_client"),
+    ],
+)
+async def test_oauth_rejects_invalid_protocol_and_assertion_branches(
+    workload_harness,
+    case,
+    expected_error,
+):
+    now = int(datetime.now(UTC).timestamp())
+    kwargs: dict[str, Any] = {"scope": "platform:agents:create"}
+    if case == "grant_type":
+        kwargs["grant_type"] = "authorization_code"
+    elif case == "assertion_type":
+        kwargs["assertion_type"] = "urn:example:wrong"
+    elif case == "client_id":
+        kwargs["client_id"] = f"wrong-{uuid.uuid4().hex}"
+    elif case == "kid":
+        kwargs["assertion"] = _assertion(workload_harness, kid="wrong-kid")
+    elif case == "algorithm":
+        kwargs["assertion"] = _assertion(
+            workload_harness,
+            algorithm="HS256",
+            signing_key="not-a-public-key-not-a-public-key",
+        )
+    elif case == "signature":
+        kwargs["assertion"] = _assertion(
+            workload_harness,
+            signing_key=rsa.generate_private_key(public_exponent=65537, key_size=2048),
+        )
+    elif case == "issuer":
+        kwargs["assertion"] = _assertion(workload_harness, payload_updates={"iss": "wrong"})
+    elif case == "subject":
+        kwargs["assertion"] = _assertion(workload_harness, payload_updates={"sub": "wrong"})
+    elif case == "audience":
+        kwargs["assertion"] = _assertion(
+            workload_harness,
+            payload_updates={"aud": "https://wrong.example/token"},
+        )
+    elif case == "missing_issuer":
+        kwargs["assertion"] = _assertion(workload_harness, remove_claims=("iss",))
+    elif case == "missing_subject":
+        kwargs["assertion"] = _assertion(workload_harness, remove_claims=("sub",))
+    elif case == "missing_audience":
+        kwargs["assertion"] = _assertion(workload_harness, remove_claims=("aud",))
+    elif case == "missing_iat":
+        kwargs["assertion"] = _assertion(workload_harness, remove_claims=("iat",))
+    elif case == "missing_exp":
+        kwargs["assertion"] = _assertion(workload_harness, remove_claims=("exp",))
+    elif case == "future_iat":
+        kwargs["assertion"] = _assertion(
+            workload_harness,
+            payload_updates={"iat": now + 120, "exp": now + 240},
+        )
+    elif case == "future_nbf":
+        kwargs["assertion"] = _assertion(
+            workload_harness,
+            payload_updates={"nbf": now + 120},
+        )
+    elif case == "expired":
+        kwargs["assertion"] = _assertion(
+            workload_harness,
+            payload_updates={"iat": now - 240, "exp": now - 120},
+        )
+    elif case == "long_lived":
+        kwargs["assertion"] = _assertion(
+            workload_harness,
+            payload_updates={"iat": now, "exp": now + 301},
+        )
+    elif case == "empty_jti":
+        kwargs["assertion"] = _assertion(workload_harness, payload_updates={"jti": ""})
+    elif case == "missing_jti":
+        kwargs["assertion"] = _assertion(workload_harness, remove_claims=("jti",))
+
+    response = await _token_response(workload_harness, **kwargs)
+
+    assert response.status_code in {400, 401}, response.text
+    assert response.json()["error"] == expected_error
+    assert response.headers["cache-control"] == "no-store"
+
+
+@pytest.mark.asyncio
+async def test_oauth_rejects_replay_and_scope_escalation(workload_harness):
+    workload_harness.credential.allowed_scopes = ["platform:agents:create"]
+    assertion = _assertion(workload_harness)
+    first = await _token_response(
+        workload_harness,
+        scope="platform:agents:create",
+        assertion=assertion,
+    )
+    replay = await _token_response(
+        workload_harness,
+        scope="platform:agents:create",
+        assertion=assertion,
+    )
+    escalated = await _token_response(
+        workload_harness,
+        scope="platform:agents:create platform:agents:delete",
+    )
+    unapproved = await _token_response(workload_harness, scope="platform:root")
+
+    assert first.status_code == 200, first.text
+    assert replay.status_code == 401, replay.text
+    assert replay.json()["error"] == "invalid_client"
+    assert escalated.status_code == 400, escalated.text
+    assert escalated.json()["error"] == "invalid_scope"
+    assert unapproved.status_code == 400, unapproved.text
+    assert unapproved.json()["error"] == "invalid_scope"
+
+
+@pytest.mark.asyncio
+async def test_oauth_enforces_client_status_and_revoked_before(
+    workload_harness,
+    db_session,
+):
+    workload_harness.credential.status = PLATFORM_WORKLOAD_CLIENT_DISABLED
+    await db_session.commit()
+    disabled = await _token_response(workload_harness, scope="platform:agents:create")
+    assert disabled.status_code == 401, disabled.text
+
+    workload_harness.credential.status = PLATFORM_WORKLOAD_CLIENT_ACTIVE
+    workload_harness.credential.revoked_before = datetime.now(UTC)
+    await db_session.commit()
+    now = int(datetime.now(UTC).timestamp())
+    revoked = await _token_response(
+        workload_harness,
+        scope="platform:agents:create",
+        assertion=_assertion(
+            workload_harness,
+            payload_updates={"iat": now - 1, "exp": now + 60},
+        ),
+    )
+    assert revoked.status_code == 401, revoked.text
+    assert revoked.json()["error"] == "invalid_client"
+
+
+@pytest.mark.asyncio
+async def test_oauth_storage_failures_are_503(
+    workload_harness,
+    monkeypatch,
+):
+    async def unavailable_client(*args, **kwargs):
+        raise SQLAlchemyError("client storage unavailable")
+
+    with monkeypatch.context() as scoped:
+        scoped.setattr(
+            platform_workload_auth,
+            "load_platform_workload_client",
+            unavailable_client,
+        )
+        client_failure = await _token_response(
+            workload_harness,
+            scope="platform:agents:create",
+        )
+        assert client_failure.status_code == 503, client_failure.text
+        assert client_failure.json()["error"] == "temporarily_unavailable"
+
+    async def unavailable_replay(*args, **kwargs):
+        raise SQLAlchemyError("replay storage unavailable")
+
+    with monkeypatch.context() as scoped:
+        scoped.setattr(
+            platform_workload_auth,
+            "store_platform_workload_assertion_replay",
+            unavailable_replay,
+        )
+        replay_failure = await _token_response(
+            workload_harness,
+            scope="platform:agents:create",
+        )
+        assert replay_failure.status_code == 503, replay_failure.text
+        assert replay_failure.json()["error"] == "temporarily_unavailable"
+
+    async def unavailable_signing_key(*args, **kwargs):
+        raise SQLAlchemyError("issuer key storage unavailable")
+
+    with monkeypatch.context() as scoped:
+        scoped.setattr(
+            platform_workload_auth,
+            "load_platform_workload_signing_key_for_issue",
+            unavailable_signing_key,
+        )
+        signing_key_failure = await _token_response(
+            workload_harness,
+            scope="platform:agents:create",
+        )
+        assert signing_key_failure.status_code == 503, signing_key_failure.text
+        assert signing_key_failure.json()["error"] == "temporarily_unavailable"
+
+    async def unavailable_signer(**kwargs):
+        raise PlatformWorkloadKeyUnavailable("signer unavailable")
+
+    with monkeypatch.context() as scoped:
+        scoped.setattr(workload_harness.resolver, "sign_jwt", unavailable_signer)
+        signer_failure = await _token_response(
+            workload_harness,
+            scope="platform:agents:create",
+        )
+        assert signer_failure.status_code == 503, signer_failure.text
+        assert signer_failure.json()["error"] == "temporarily_unavailable"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["provision", "retire", "register", "read", "ack", "reset"])
+async def test_companion_routes_require_and_accept_admin_key(
+    workload_harness,
+    seed_user,
+    db_session,
+    operation,
+):
+    from app.services.runtime_observation import provision_runtime_environment_fence
+    from tests.conftest import create_env_with_project
+
+    environment = await create_env_with_project(
+        db_session,
+        user_id=seed_user.id,
+        machine_id=f"admin-fallback-{uuid.uuid4().hex}",
+        machine_name="admin-key-companion",
+    )
+    deployment_id = f"deployment-admin-key-{uuid.uuid4().hex}"
+    if operation != "provision":
+        await provision_runtime_environment_fence(
+            db_session,
+            environment_id=environment.id,
+            owner_id=seed_user.id,
+            deployment_id=deployment_id,
+        )
+        await db_session.commit()
+
+    path = "/v2/runtime/auth/keys"
+    payload: dict[str, Any] = {
+        "label": "admin-key-runtime",
+        "environmentId": str(environment.id),
+        "deploymentId": deployment_id,
+    }
+    if operation == "retire":
+        path = f"/v2/runtime/environments/{environment.id}/retire"
+        payload = {
+            "expectedDeploymentBinding": deployment_id,
+            "retirementId": f"retirement-admin-key-{environment.id}",
+        }
+    elif operation == "register":
+        path = f"/v2/runtime/environments/{environment.id}/observation-consumers/register"
+        payload = {}
+    elif operation == "read":
+        path = f"/v2/runtime/environments/{environment.id}/observations/read"
+        payload = {
+            "expectedApplyIdentity": {
+                "generation": 1,
+                "manifestETag": '"manifest-etag-0001"',
+                "applyReceiptId": "apply-receipt-00000001",
+                "bootNonce": "boot-nonce-0000000001",
+            },
+            "afterCursor": "clawdi-ro-v1.invalid",
+        }
+    elif operation == "ack":
+        path = f"/v2/runtime/environments/{environment.id}/observation-consumers/ack"
+        payload = {"cursor": "clawdi-ro-v1.invalid"}
+    elif operation == "reset":
+        path = f"/v2/runtime/environments/{environment.id}/observation-consumers/reset"
+        payload = {}
+
+    request_body = {"owner": _owner(seed_user), **payload} if operation == "provision" else payload
+    idempotency_key = f"admin-auth-{uuid.uuid4()}"
+    missing = await workload_harness.client.post(
+        path,
+        headers={"Idempotency-Key": idempotency_key},
+        json=request_body,
+    )
+    invalid = await workload_harness.client.post(
+        path,
+        headers={"X-Admin-Key": "invalid", "Idempotency-Key": idempotency_key},
+        json=request_body,
+    )
+    workload_token = await _access_token(workload_harness, "platform:keys:mint")
+    oauth_only = await workload_harness.client.post(
+        path,
+        headers={
+            "Authorization": f"Bearer {workload_token}",
+            "Idempotency-Key": idempotency_key,
+        },
+        json=request_body,
+    )
+
+    assert missing.status_code == invalid.status_code == oauth_only.status_code == 401
+    assert missing.json() == invalid.json() == oauth_only.json() == {"detail": "invalid admin auth"}
+
+    settings.platform_legacy_admin_auth_enabled = False
+    admin_headers = {
+        "X-Admin-Key": _ADMIN_KEY,
+        "Idempotency-Key": idempotency_key,
+    }
+    valid_body = request_body
+    if operation in {"read", "ack", "reset"}:
+        registered = await workload_harness.client.post(
+            f"/v2/runtime/environments/{environment.id}/observation-consumers/register",
+            headers={"X-Admin-Key": _ADMIN_KEY},
+            json={},
+        )
+        assert registered.status_code == 200, registered.text
+        if operation == "read":
+            path = f"/v2/runtime/environments/{environment.id}/observations/read"
+            payload = {
+                "expectedApplyIdentity": {
+                    "generation": 1,
+                    "manifestETag": '"manifest-etag-0001"',
+                    "applyReceiptId": "apply-receipt-00000001",
+                    "bootNonce": "boot-nonce-0000000001",
+                },
+                "afterCursor": registered.json()["cursor"],
+            }
+        elif operation == "ack":
+            path = f"/v2/runtime/environments/{environment.id}/observation-consumers/ack"
+            payload = {"cursor": registered.json()["cursor"]}
+        else:
+            expired = await workload_harness.client.post(
+                f"/v2/runtime/environments/{environment.id}/observations/read",
+                headers={"X-Admin-Key": _ADMIN_KEY},
+                json={
+                    "expectedApplyIdentity": {
+                        "generation": 1,
+                        "manifestETag": '"manifest-etag-0001"',
+                        "applyReceiptId": "apply-receipt-00000001",
+                        "bootNonce": "boot-nonce-0000000001",
+                    },
+                    "afterCursor": "clawdi-ro-v1.invalid",
+                },
+            )
+            assert expired.status_code == 410, expired.text
+            path = f"/v2/runtime/environments/{environment.id}/observation-consumers/reset"
+            payload = {}
+        valid_body = payload
+    response = await workload_harness.client.post(path, headers=admin_headers, json=valid_body)
+
+    assert response.status_code == 200, response.text
+
+
+@pytest.mark.asyncio
+async def test_v2_provision_precedes_scoped_deploy_key_and_retirement_replays_exact_receipt(
+    workload_harness,
+    seed_user,
+    db_session,
+    monkeypatch,
+):
+    from app.routes import runtime_observation_v2 as v2_routes
+    from tests.conftest import create_env_with_project
+
+    environment = await create_env_with_project(
+        db_session,
+        user_id=seed_user.id,
+        machine_id=f"v2-provision-{uuid.uuid4().hex}",
+        machine_name="v2-provision",
+    )
+    environment_id = environment.id
+    owner_id = seed_user.id
+    deployment_id = f"deployment-{uuid.uuid4().hex}"
+    original_mint = v2_routes.mint_api_key
+
+    async def assert_fence_precedes_key(db, **kwargs):
+        fence = await db.get(V2RuntimeEnvironmentFence, environment_id)
+        assert fence is not None
+        assert fence.owner_id == owner_id
+        assert fence.deployment_id == deployment_id
+        assert fence.state == "active"
+        return await original_mint(db, **kwargs)
+
+    monkeypatch.setattr(v2_routes, "mint_api_key", assert_fence_precedes_key)
+    caller_scoped = await workload_harness.client.post(
+        "/v2/runtime/auth/keys",
+        headers={
+            "X-Admin-Key": _ADMIN_KEY,
+            "Idempotency-Key": f"mint-caller-scopes-{environment_id}",
+        },
+        json={
+            "owner": _owner(seed_user),
+            "label": "strict-v2-runtime",
+            "environmentId": str(environment_id),
+            "deploymentId": deployment_id,
+            "scopes": ["runtime-observations:write"],
+        },
+    )
+    assert caller_scoped.status_code == 422, caller_scoped.text
+
+    minted = await workload_harness.client.post(
+        "/v2/runtime/auth/keys",
+        headers={
+            "X-Admin-Key": _ADMIN_KEY,
+            "Idempotency-Key": f"mint-{environment_id}",
+        },
+        json={
+            "owner": _owner(seed_user),
+            "label": "strict-v2-runtime",
+            "environmentId": str(environment_id),
+            "deploymentId": deployment_id,
+        },
+    )
+    assert minted.status_code == 200, minted.text
+    key = await db_session.get(ApiKey, uuid.UUID(minted.json()["id"]))
+    assert key is not None
+    assert key.runtime_deployment_id == deployment_id
+    assert key.scopes == list(RUNTIME_DEPLOYMENT_KEY_SCOPES)
+    assert set(key.scopes) == {
+        "companions:read",
+        "companions:invoke",
+        "connectors:read",
+        "connectors:invoke",
+        "memories:read",
+        "memories:write",
+        "projects:read",
+        "runtime-observations:write",
+        "sessions:read",
+        "sessions:write",
+        "skills:read",
+        "skills:write",
+        "vault:read",
+        "vault:write",
+    }
+    provision_audit = (
+        await db_session.execute(
+            select(ControlPlaneAuditEvent).where(
+                ControlPlaneAuditEvent.source == "api.v2.runtime",
+                ControlPlaneAuditEvent.action == "runtime_environment.provision",
+                ControlPlaneAuditEvent.resource_id == str(environment_id),
+            )
+        )
+    ).scalar_one()
+    assert provision_audit.actor_type == "admin"
+    assert provision_audit.details["auth_method"] == "x_admin_key"
+    assert "workload_client_id" not in provision_audit.details
+
+    path = f"/v2/runtime/environments/{environment_id}/retire"
+    body = {
+        "expectedDeploymentBinding": deployment_id,
+        "retirementId": f"retirement-{environment_id}",
+    }
+    first_headers = {
+        "X-Admin-Key": _ADMIN_KEY,
+        "Idempotency-Key": f"retire-first-{environment_id}",
+    }
+    original_record_audit = v2_routes.record_control_plane_audit
+
+    def fail_transition_audit(db, **kwargs):
+        if kwargs.get("action") == "runtime_environment.retire":
+            raise RuntimeError("injected transition audit failure")
+        return original_record_audit(db, **kwargs)
+
+    monkeypatch.setattr(v2_routes, "record_control_plane_audit", fail_transition_audit)
+    with pytest.raises(RuntimeError, match="injected transition audit failure"):
+        await workload_harness.client.post(path, headers=first_headers, json=body)
+    await db_session.rollback()
+    fence_after_rollback = await db_session.get(V2RuntimeEnvironmentFence, environment_id)
+    assert fence_after_rollback is not None
+    assert fence_after_rollback.state == "active"
+    assert fence_after_rollback.retirement_receipt is None
+    assert fence_after_rollback.retirement_receipt_id is None
+    key_after_rollback = await db_session.get(ApiKey, uuid.UUID(minted.json()["id"]))
+    assert key_after_rollback is not None
+    await db_session.refresh(key_after_rollback)
+    assert key_after_rollback.revoked_at is None
+
+    monkeypatch.setattr(v2_routes, "record_control_plane_audit", original_record_audit)
+    first = await workload_harness.client.post(path, headers=first_headers, json=body)
+    same_http_replay = await workload_harness.client.post(
+        path,
+        headers=first_headers,
+        json=body,
+    )
+    domain_replay = await workload_harness.client.post(
+        path,
+        headers={
+            "X-Admin-Key": _ADMIN_KEY,
+            "Idempotency-Key": f"retire-domain-replay-{environment_id}",
+        },
+        json=body,
+    )
+
+    assert first.status_code == same_http_replay.status_code == domain_replay.status_code == 200
+    assert first.content == same_http_replay.content == domain_replay.content
+    assert set(first.json()) == {
+        "environmentReference",
+        "expectedDeploymentBinding",
+        "retirementId",
+        "retiredAt",
+        "finalCursor",
+        "finalSessionHighWaterMarks",
+    }
+    assert first.json()["environmentReference"] == str(environment_id)
+    assert first.json()["expectedDeploymentBinding"] == deployment_id
+    assert first.json()["finalSessionHighWaterMarks"] == []
+
+    fence = await db_session.get(V2RuntimeEnvironmentFence, environment_id)
+    assert fence is not None
+    await db_session.refresh(fence)
+    assert fence.state == "retired"
+    assert fence.retirement_receipt == first.json()
+    assert fence.retirement_receipt_id is not None
+    transition_audits = list(
+        (
+            await db_session.execute(
+                select(ControlPlaneAuditEvent).where(
+                    ControlPlaneAuditEvent.source == "api.v2.runtime",
+                    ControlPlaneAuditEvent.action == "runtime_environment.retire",
+                    ControlPlaneAuditEvent.resource_id == str(environment_id),
+                    ControlPlaneAuditEvent.details["outcome"].astext == "transitioned",
+                )
+            )
+        ).scalars()
+    )
+    replay_audits = list(
+        (
+            await db_session.execute(
+                select(ControlPlaneAuditEvent).where(
+                    ControlPlaneAuditEvent.source == "api.v2.runtime",
+                    ControlPlaneAuditEvent.action == "runtime_environment.retire_replay",
+                    ControlPlaneAuditEvent.resource_id == str(environment_id),
+                )
+            )
+        ).scalars()
+    )
+    assert len(transition_audits) == 1
+    assert len(replay_audits) == 1
+    transition = transition_audits[0]
+    assert transition.actor_type == "admin"
+    assert transition.details["auth_method"] == "x_admin_key"
+    assert "workload_client_id" not in transition.details
+    assert "workload_principal_id" not in transition.details
+    assert transition.details["retirement_receipt_id"] == str(fence.retirement_receipt_id)
+    assert transition.details["previous_state"] == "active"
+    assert transition.details["new_state"] == "retired"
+
+    adopted_request_id = f"other-{environment_id}"
+    adopted = await workload_harness.client.post(
+        path,
+        headers={
+            "X-Admin-Key": _ADMIN_KEY,
+            "Idempotency-Key": f"retire-adopt-{environment_id}",
+        },
+        json={**body, "retirementId": adopted_request_id},
+    )
+    assert adopted.status_code == 200, adopted.text
+    assert adopted.content == first.content
+    adoption_audit = (
+        await db_session.execute(
+            select(ControlPlaneAuditEvent).where(
+                ControlPlaneAuditEvent.source == "api.v2.runtime",
+                ControlPlaneAuditEvent.action == "runtime_environment.retire_adopted",
+                ControlPlaneAuditEvent.resource_id == str(environment_id),
+            )
+        )
+    ).scalar_one()
+    assert adoption_audit.actor_type == "admin"
+    assert adoption_audit.details["auth_method"] == "x_admin_key"
+    assert adoption_audit.details["requested_retirement_id"] == adopted_request_id
+    assert adoption_audit.details["authoritative_retirement_id"] == body["retirementId"]
+    await db_session.refresh(fence)
+    assert fence.retirement_id == body["retirementId"]
+    assert fence.retirement_receipt == first.json()
+
+    mismatched_binding = await workload_harness.client.post(
+        path,
+        headers={
+            "X-Admin-Key": _ADMIN_KEY,
+            "Idempotency-Key": f"retire-binding-conflict-{environment_id}",
+        },
+        json={
+            "expectedDeploymentBinding": f"other-{deployment_id}",
+            "retirementId": f"binding-conflict-{environment_id}",
+        },
+    )
+    assert mismatched_binding.status_code == 409, mismatched_binding.text
+    assert mismatched_binding.json()["detail"]["code"] == ("runtime_environment_binding_conflict")
+
+
+@pytest.mark.asyncio
+async def test_v2_retirement_revokes_the_environment_deployment_key(
+    workload_harness,
+    seed_user,
+    db_session,
+):
+    from tests.conftest import create_env_with_project
+
+    environment = await create_env_with_project(
+        db_session,
+        user_id=seed_user.id,
+        machine_id=f"v2-retire-revoke-{uuid.uuid4().hex}",
+        machine_name="v2-retire-revoke",
+    )
+    environment_id = environment.id
+    deployment_id = f"deployment-{uuid.uuid4().hex}"
+    minted = await workload_harness.client.post(
+        "/v2/runtime/auth/keys",
+        headers={
+            "X-Admin-Key": _ADMIN_KEY,
+            "Idempotency-Key": f"mint-revoke-{environment_id}",
+        },
+        json={
+            "owner": _owner(seed_user),
+            "label": "strict-v2-runtime",
+            "environmentId": str(environment_id),
+            "deploymentId": deployment_id,
+        },
+    )
+    assert minted.status_code == 200, minted.text
+    key_id = uuid.UUID(minted.json()["id"])
+    key_headers = {"Authorization": f"Bearer {minted.json()['raw_key']}"}
+    vaults_params = {"agent_id": str(environment_id)}
+
+    before = await workload_harness.client.get(
+        "/v1/runtime/vaults", headers=key_headers, params=vaults_params
+    )
+    assert before.status_code != 401, before.text
+
+    path = f"/v2/runtime/environments/{environment_id}/retire"
+    body = {
+        "expectedDeploymentBinding": deployment_id,
+        "retirementId": f"retirement-revoke-{environment_id}",
+    }
+    retired = await workload_harness.client.post(
+        path,
+        headers={
+            "X-Admin-Key": _ADMIN_KEY,
+            "Idempotency-Key": f"retire-revoke-{environment_id}",
+        },
+        json=body,
+    )
+    assert retired.status_code == 200, retired.text
+
+    after = await workload_harness.client.get(
+        "/v1/runtime/vaults", headers=key_headers, params=vaults_params
+    )
+    assert after.status_code == 401, after.text
+    assert after.json()["detail"] == "API key has been revoked"
+
+    fence = await db_session.get(V2RuntimeEnvironmentFence, environment_id)
+    key = await db_session.get(ApiKey, key_id)
+    assert fence is not None
+    assert key is not None
+    await db_session.refresh(fence)
+    await db_session.refresh(key)
+    assert fence.retired_at is not None
+    assert key.revoked_at == fence.retired_at
+    revoked_at = key.revoked_at
+
+    replay = await workload_harness.client.post(
+        path,
+        headers={
+            "X-Admin-Key": _ADMIN_KEY,
+            "Idempotency-Key": f"retire-revoke-replay-{environment_id}",
+        },
+        json=body,
+    )
+    assert replay.status_code == 200, replay.text
+    assert replay.content == retired.content
+    await db_session.refresh(key)
+    assert key.revoked_at == revoked_at
+
+
+@pytest.mark.asyncio
+async def test_v2_retirement_replay_revokes_a_key_left_live_by_an_earlier_retirement(
+    workload_harness,
+    seed_user,
+    db_session,
+):
+    from tests.conftest import create_env_with_project
+
+    environment = await create_env_with_project(
+        db_session,
+        user_id=seed_user.id,
+        machine_id=f"v2-retire-replay-revoke-{uuid.uuid4().hex}",
+        machine_name="v2-retire-replay-revoke",
+    )
+    environment_id = environment.id
+    deployment_id = f"deployment-{uuid.uuid4().hex}"
+    minted = await workload_harness.client.post(
+        "/v2/runtime/auth/keys",
+        headers={
+            "X-Admin-Key": _ADMIN_KEY,
+            "Idempotency-Key": f"mint-replay-revoke-{environment_id}",
+        },
+        json={
+            "owner": _owner(seed_user),
+            "label": "strict-v2-runtime",
+            "environmentId": str(environment_id),
+            "deploymentId": deployment_id,
+        },
+    )
+    assert minted.status_code == 200, minted.text
+    key_id = uuid.UUID(minted.json()["id"])
+    path = f"/v2/runtime/environments/{environment_id}/retire"
+    body = {
+        "expectedDeploymentBinding": deployment_id,
+        "retirementId": f"retirement-replay-revoke-{environment_id}",
+    }
+    retired = await workload_harness.client.post(
+        path,
+        headers={
+            "X-Admin-Key": _ADMIN_KEY,
+            "Idempotency-Key": f"retire-replay-revoke-{environment_id}",
+        },
+        json=body,
+    )
+    assert retired.status_code == 200, retired.text
+
+    # Model a retirement that ran before keys were revoked on retire.
+    key = await db_session.get(ApiKey, key_id)
+    assert key is not None
+    key.revoked_at = None
+    await db_session.commit()
+
+    replay = await workload_harness.client.post(
+        path,
+        headers={
+            "X-Admin-Key": _ADMIN_KEY,
+            "Idempotency-Key": f"retire-replay-revoke-again-{environment_id}",
+        },
+        json=body,
+    )
+    assert replay.status_code == 200, replay.text
+    fence = await db_session.get(V2RuntimeEnvironmentFence, environment_id)
+    assert fence is not None
+    await db_session.refresh(fence)
+    await db_session.refresh(key)
+    assert key.revoked_at == fence.retired_at
+
+
+@pytest.mark.asyncio
+async def test_observation_consumer_identity_is_bound_to_admin_actor(
+    workload_harness,
+    seed_user,
+    db_session,
+):
+    from app.models.runtime_observation import V2RuntimeObservationConsumerCursor
+    from app.services.runtime_observation import (
+        provision_runtime_environment_fence,
+        register_runtime_observation_consumer,
+    )
+    from tests.conftest import create_env_with_project
+
+    environment = await create_env_with_project(
+        db_session,
+        user_id=seed_user.id,
+        machine_id=f"consumer-scope-{uuid.uuid4().hex}",
+        machine_name="consumer-scope",
+    )
+    deployment_id = f"deployment-{uuid.uuid4().hex}"
+    await provision_runtime_environment_fence(
+        db_session,
+        environment_id=environment.id,
+        owner_id=seed_user.id,
+        deployment_id=deployment_id,
+    )
+    await db_session.commit()
+
+    foreign = await register_runtime_observation_consumer(
+        db_session,
+        environment_id=environment.id,
+        owner_id=seed_user.id,
+        deployment_id=deployment_id,
+        consumer_id="foreign-controller",
+    )
+    await db_session.commit()
+    path = f"/v2/runtime/environments/{environment.id}"
+    admin_headers = {"X-Admin-Key": _ADMIN_KEY}
+    common: dict[str, str] = {}
+
+    caller_supplied_binding = await workload_harness.client.post(
+        f"{path}/observation-consumers/register",
+        headers=admin_headers,
+        json={"owner": _owner(seed_user), "deploymentId": deployment_id},
+    )
+    assert caller_supplied_binding.status_code == 422, caller_supplied_binding.text
+    assert {error["loc"][-1] for error in caller_supplied_binding.json()["detail"]} == {
+        "owner",
+        "deploymentId",
+    }
+
+    registered = await workload_harness.client.post(
+        f"{path}/observation-consumers/register",
+        headers=admin_headers,
+        json=common,
+    )
+    assert registered.status_code == 200, registered.text
+    assert registered.json()["consumerId"] == "hosted-controller"
+
+    apply_identity = {
+        "generation": 1,
+        "manifestETag": '"manifest-etag-0001"',
+        "applyReceiptId": "apply-receipt-00000001",
+        "bootNonce": "boot-nonce-0000000001",
+    }
+    cross_read = await workload_harness.client.post(
+        f"{path}/observations/read",
+        headers=admin_headers,
+        json={
+            **common,
+            "expectedApplyIdentity": apply_identity,
+            "afterCursor": foreign["cursor"],
+        },
+    )
+    assert cross_read.status_code == 410, cross_read.text
+    assert cross_read.json()["detail"]["code"] == "observation_cursor_expired"
+
+    cross_ack = await workload_harness.client.post(
+        f"{path}/observation-consumers/ack",
+        headers=admin_headers,
+        json={**common, "cursor": foreign["cursor"]},
+    )
+    assert cross_ack.status_code == 410, cross_ack.text
+    assert cross_ack.json()["detail"]["code"] == "observation_cursor_expired"
+    expired_a = await db_session.get(
+        V2RuntimeObservationConsumerCursor,
+        {"environment_id": environment.id, "consumer_id": "hosted-controller"},
+    )
+    assert expired_a is not None
+    await db_session.refresh(expired_a)
+    assert expired_a.state == "expired"
+    expiry_audits = list(
+        (
+            await db_session.execute(
+                select(ControlPlaneAuditEvent).where(
+                    ControlPlaneAuditEvent.source == "api.v2.runtime",
+                    ControlPlaneAuditEvent.action == "runtime_observation.cursor_expired",
+                    ControlPlaneAuditEvent.resource_id == str(environment.id),
+                )
+            )
+        ).scalars()
+    )
+    assert len(expiry_audits) == 2
+    assert {event.details["operation"] for event in expiry_audits} == {"read", "ack"}
+    assert all(event.actor_type == "admin" for event in expiry_audits)
+    assert all(event.details["auth_method"] == "x_admin_key" for event in expiry_audits)
+    assert all(event.details["consumer_id"] == "hosted-controller" for event in expiry_audits)
+    assert all("workload_client_id" not in event.details for event in expiry_audits)
+    assert foreign["cursor"] not in json.dumps(
+        [event.details for event in expiry_audits],
+        sort_keys=True,
+    )
+
+    caller_controlled_reset = await workload_harness.client.post(
+        f"{path}/observation-consumers/reset",
+        headers=admin_headers,
+        json={**common, "consumer_id": "foreign-controller"},
+    )
+    assert caller_controlled_reset.status_code == 422, caller_controlled_reset.text
+    assert any(
+        error["loc"][-1] == "consumer_id" for error in caller_controlled_reset.json()["detail"]
+    )
+
+    reset = await workload_harness.client.post(
+        f"{path}/observation-consumers/reset",
+        headers=admin_headers,
+        json=common,
+    )
+    assert reset.status_code == 200, reset.text
+    assert reset.json()["consumerId"] == "hosted-controller"
+
+    own_read = await workload_harness.client.post(
+        f"{path}/observations/read",
+        headers=admin_headers,
+        json={
+            **common,
+            "expectedApplyIdentity": apply_identity,
+            "afterCursor": reset.json()["cursor"],
+        },
+    )
+    assert own_read.status_code == 200, own_read.text
+    cursor = await db_session.get(
+        V2RuntimeObservationConsumerCursor,
+        {"environment_id": environment.id, "consumer_id": "hosted-controller"},
+    )
+    assert cursor is not None
+    assert cursor.state == "active"
+    assert cursor.acked_stream_position == 0
+    assert cursor.reset_at is not None
+
+
+@pytest.mark.asyncio
+async def test_workload_owner_is_still_mandatory_and_mismatch_is_forbidden(
+    workload_harness,
+    seed_user,
+    db_session,
+):
+    token = await _access_token(workload_harness, "platform:agents:create")
+    missing_owner = await workload_harness.client.post(
+        "/v1/platform/agents",
+        headers=_workload_headers(token, "workload-missing-owner"),
+        json={
+            "agent_id": str(uuid.uuid4()),
+            "machine_id": "missing-owner",
+            "machine_name": "missing-owner",
+            "agent_type": "openclaw",
+        },
+    )
+    assert missing_owner.status_code == 422, missing_owner.text
+    assert any(error["loc"][-1] == "owner" for error in missing_owner.json()["detail"])
+
+    agent_id = uuid.uuid4()
+    admin_created = await workload_harness.client.post(
+        "/v1/platform/agents",
+        headers={"X-Admin-Key": _ADMIN_KEY, "Idempotency-Key": "admin-owner-create"},
+        json=_agent_body(_owner(seed_user), agent_id),
+    )
+    assert admin_created.status_code == 200, admin_created.text
+    other_user = User(
+        clerk_id=f"other_{uuid.uuid4().hex}",
+        email="other-workload@example.test",
+        name="Other Workload Owner",
+    )
+    db_session.add(other_user)
+    await db_session.commit()
+
+    delete_token = await _access_token(workload_harness, "platform:agents:delete")
+    mismatch = await workload_harness.client.request(
+        "DELETE",
+        f"/v1/platform/agents/{agent_id}",
+        headers=_workload_headers(delete_token, "workload-owner-mismatch"),
+        json={"owner": _owner(other_user)},
+    )
+    assert mismatch.status_code == 403, mismatch.text
+    assert await db_session.get(AgentEnvironment, agent_id) is not None
+
+    await db_session.execute(delete(AgentEnvironment).where(AgentEnvironment.id == agent_id))
+    await db_session.delete(other_user)
+    await db_session.commit()
+
+
+@pytest.mark.asyncio
+async def test_platform_agent_archive_preserves_runtime_oauth_claim(
+    workload_harness,
+    seed_user,
+    db_session,
+):
+    owner = _owner(seed_user)
+    agent_id = uuid.uuid4()
+    create_token = await _access_token(workload_harness, "platform:agents:create")
+    created = await workload_harness.client.post(
+        "/v1/platform/agents",
+        headers=_workload_headers(create_token, "oauth-claim-agent-create"),
+        json=_agent_body(owner, agent_id),
+    )
+    assert created.status_code == 200, created.text
+
+    encrypted, nonce = encrypt('{"kind":"oauth-test"}')
+    payload = AiProviderAuthPayload(
+        owner_user_id=seed_user.id,
+        provider_id=f"delete-platform-{uuid.uuid4().hex}",
+        auth_profile="default",
+        kind="agent_profile",
+        source="test",
+        encrypted_payload=encrypted,
+        nonce=nonce,
+        consumer_environment_id=agent_id,
+        consumer_runtime="openclaw",
+    )
+    db_session.add(payload)
+    await db_session.commit()
+
+    delete_token = await _access_token(workload_harness, "platform:agents:delete")
+    deleted = await workload_harness.client.request(
+        "DELETE",
+        f"/v1/platform/agents/{agent_id}",
+        headers=_workload_headers(delete_token, "oauth-claim-agent-delete"),
+        json={"owner": owner},
+    )
+
+    assert deleted.status_code == 204, deleted.text
+    agent = await db_session.get(AgentEnvironment, agent_id)
+    assert agent is not None and agent.archived_at is not None
+    await db_session.refresh(payload)
+    assert payload.consumer_environment_id == agent_id
+    assert payload.consumer_runtime == "openclaw"
+
+
+@pytest.mark.asyncio
+async def test_retired_runtime_state_cleanup_works_for_archived_agent(
+    workload_harness,
+    db_session,
+    seed_user,
+):
+    from tests.conftest import create_env_with_project, create_test_hosted_runtime_state
+
+    environment = await create_env_with_project(
+        db_session,
+        user_id=seed_user.id,
+        machine_id=f"cleanup-{uuid.uuid4().hex}",
+        machine_name="cleanup-archived-agent",
+        agent_type="openclaw",
+        os="linux",
+    )
+    state = await create_test_hosted_runtime_state(
+        db_session,
+        environment,
+        runtime_name="openclaw",
+    )
+    encrypted, nonce = encrypt('{"kind":"cleanup-test"}')
+    payload = AiProviderAuthPayload(
+        owner_user_id=seed_user.id,
+        provider_id=f"cleanup-{uuid.uuid4().hex}",
+        auth_profile="default",
+        kind="agent_profile",
+        source="test",
+        encrypted_payload=encrypted,
+        nonce=nonce,
+        consumer_environment_id=environment.id,
+        consumer_runtime="openclaw",
+    )
+    db_session.add(payload)
+    retirement_id = f"retirement-{environment.id}"
+    await retire_runtime_environment(
+        db_session,
+        environment_id=environment.id,
+        expected_deployment_id=state.deployment_id,
+        retirement_id=retirement_id,
+        owner_id=seed_user.id,
+    )
+    environment.archived_at = datetime.now(UTC)
+    await db_session.commit()
+
+    token = await _access_token(
+        workload_harness,
+        "platform:runtime-environments:retire",
+    )
+    cleanup_id = f"cleanup-{environment.id}"
+    response = await workload_harness.client.post(
+        f"/v2/runtime/environments/{environment.id}/runtime-state/cleanup",
+        headers=_workload_headers(token, cleanup_id),
+        json={
+            "environmentReference": str(environment.id),
+            "expectedDeploymentBinding": state.deployment_id,
+            "retirementId": retirement_id,
+            "cleanupId": cleanup_id,
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json() == {
+        "schemaVersion": "clawdi.runtimeStateCleanupReceipt.v1",
+        "environmentReference": str(environment.id),
+        "expectedDeploymentBinding": state.deployment_id,
+        "retirementId": retirement_id,
+        "cleanupId": cleanup_id,
+        "runtimeStateStatus": "absent",
+        "cleanedAt": response.json()["cleanedAt"],
+    }
+    assert await db_session.get(HostedRuntimeState, environment.id) is None
+    await db_session.refresh(payload)
+    assert payload.consumer_environment_id is None
+    assert payload.consumer_runtime is None
+
+
+@pytest.mark.asyncio
+async def test_retired_runtime_state_cleanup_replays_absence_and_rejects_conflicts(
+    workload_harness,
+    db_session,
+    seed_user,
+):
+    from app.services.runtime_observation import provision_runtime_environment_fence
+    from tests.conftest import create_env_with_project
+
+    environment = await create_env_with_project(
+        db_session,
+        user_id=seed_user.id,
+        machine_id=f"cleanup-absent-{uuid.uuid4().hex}",
+        machine_name="cleanup-absent-agent",
+        agent_type="openclaw",
+        os="linux",
+    )
+    deployment_id = f"deployment-{environment.id}"
+    retirement_id = f"retirement-{environment.id}"
+    await provision_runtime_environment_fence(
+        db_session,
+        environment_id=environment.id,
+        owner_id=seed_user.id,
+        deployment_id=deployment_id,
+    )
+    await retire_runtime_environment(
+        db_session,
+        environment_id=environment.id,
+        expected_deployment_id=deployment_id,
+        retirement_id=retirement_id,
+        owner_id=seed_user.id,
+    )
+    await db_session.commit()
+
+    token = await _access_token(
+        workload_harness,
+        "platform:runtime-environments:retire",
+    )
+    path = f"/v2/runtime/environments/{environment.id}/runtime-state/cleanup"
+    body = {
+        "environmentReference": str(environment.id),
+        "expectedDeploymentBinding": deployment_id,
+        "retirementId": retirement_id,
+        "cleanupId": f"cleanup-{environment.id}",
+    }
+    first = await workload_harness.client.post(
+        path,
+        headers=_workload_headers(token, str(body["cleanupId"])),
+        json=body,
+    )
+    replay = await workload_harness.client.post(
+        path,
+        headers=_workload_headers(token, str(body["cleanupId"])),
+        json=body,
+    )
+    conflict = await workload_harness.client.post(
+        path,
+        headers=_workload_headers(token, f"different-{body['environmentReference']}"),
+        json={**body, "cleanupId": f"different-{body['environmentReference']}"},
+    )
+    path_conflict = await workload_harness.client.post(
+        path,
+        headers=_workload_headers(token, str(body["cleanupId"])),
+        json={**body, "environmentReference": str(uuid.uuid4())},
+    )
+    header_conflict = await workload_harness.client.post(
+        path,
+        headers=_workload_headers(token, f"different-{body['environmentReference']}"),
+        json=body,
+    )
+
+    assert first.status_code == replay.status_code == 200
+    assert first.content == replay.content
+    assert first.json()["runtimeStateStatus"] == "absent"
+    assert conflict.status_code == 409
+    assert conflict.json()["detail"]["code"] == "runtime_state_cleanup_conflict"
+    assert path_conflict.status_code == 409
+    assert path_conflict.json()["detail"]["code"] == "runtime_state_cleanup_environment_conflict"
+    assert header_conflict.status_code == 409
+    assert header_conflict.json()["detail"]["code"] == (
+        "runtime_state_cleanup_idempotency_conflict"
+    )
+
+
+@pytest.mark.asyncio
+async def test_workload_resource_auth_enforces_scope_status_version_and_revocation(
+    workload_harness,
+    seed_user,
+    db_session,
+):
+    owner = _owner(seed_user)
+    token = await _access_token(workload_harness, "platform:agents:create")
+    runtime_source_id = uuid.uuid4()
+    runtime_source_token = await _access_token(
+        workload_harness,
+        "platform:runtime-state:write",
+    )
+    authorized_read = await workload_harness.client.get(
+        f"/v1/platform/agents/{runtime_source_id}/runtime-state",
+        headers={"Authorization": f"Bearer {runtime_source_token}"},
+        params=owner,
+    )
+    assert authorized_read.status_code == 404, authorized_read.text
+
+    wrong_scope_read = await workload_harness.client.get(
+        f"/v1/platform/agents/{runtime_source_id}/runtime-state",
+        headers={"Authorization": f"Bearer {token}"},
+        params=owner,
+    )
+    assert wrong_scope_read.status_code == 403, wrong_scope_read.text
+
+    wrong_scope = await workload_harness.client.request(
+        "DELETE",
+        f"/v1/platform/agents/{uuid.uuid4()}",
+        headers=_workload_headers(token, "workload-wrong-scope"),
+        json={"owner": owner},
+    )
+    assert wrong_scope.status_code == 403, wrong_scope.text
+
+    workload_harness.credential.status = PLATFORM_WORKLOAD_CLIENT_DISABLED
+    await db_session.commit()
+    disabled = await workload_harness.client.post(
+        "/v1/platform/agents",
+        headers=_workload_headers(token, "workload-disabled"),
+        json=_agent_body(owner, uuid.uuid4()),
+    )
+    assert disabled.status_code == 401, disabled.text
+
+    workload_harness.credential.status = PLATFORM_WORKLOAD_CLIENT_ACTIVE
+    workload_harness.credential.token_version += 1
+    await db_session.commit()
+    old_version = await workload_harness.client.post(
+        "/v1/platform/agents",
+        headers=_workload_headers(token, "workload-old-version"),
+        json=_agent_body(owner, uuid.uuid4()),
+    )
+    assert old_version.status_code == 401, old_version.text
+
+    workload_harness.credential.token_version -= 1
+    workload_harness.credential.revoked_before = datetime.now(UTC)
+    await db_session.commit()
+    revoked_before = await workload_harness.client.post(
+        "/v1/platform/agents",
+        headers=_workload_headers(token, "workload-revoked-before"),
+        json=_agent_body(owner, uuid.uuid4()),
+    )
+    assert revoked_before.status_code == 401, revoked_before.text
+
+    workload_harness.credential.revoked_before = None
+    workload_harness.signing_key.status = "revoked"
+    await db_session.commit()
+    revoked_signing_key = await workload_harness.client.post(
+        "/v1/platform/agents",
+        headers=_workload_headers(token, "workload-revoked-signing-key"),
+        json=_agent_body(owner, uuid.uuid4()),
+    )
+    assert revoked_signing_key.status_code == 401, revoked_signing_key.text
+
+
+@pytest.mark.asyncio
+async def test_workload_access_token_expires_at_exactly_five_minutes(
+    workload_harness,
+    db_session,
+):
+    token = await _access_token(workload_harness, "platform:agents:create")
+    claims = jwt.decode(token, options={"verify_signature": False, "verify_aud": False})
+
+    with pytest.raises(PlatformWorkloadAccessError) as exc_info:
+        await authenticate_platform_workload_access_token(
+            db_session,
+            workload_harness.resolver,
+            token,
+            required_scope="platform:agents:create",
+            now=datetime.fromtimestamp(claims["exp"], tz=UTC),
+        )
+
+    assert exc_info.value.status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_workload_resource_storage_failure_is_503_without_admin_fallback(
+    workload_harness,
+    seed_user,
+    monkeypatch,
+):
+    token = await _access_token(workload_harness, "platform:agents:create")
+    owner = _owner(seed_user)
+
+    async def unavailable_client(*args, **kwargs):
+        raise SQLAlchemyError("status storage unavailable")
+
+    with monkeypatch.context() as scoped:
+        scoped.setattr(
+            platform_workload_auth,
+            "load_platform_workload_client",
+            unavailable_client,
+        )
+        response = await workload_harness.client.post(
+            "/v1/platform/agents",
+            headers=_workload_headers(token, "workload-status-unavailable"),
+            json=_agent_body(owner, uuid.uuid4()),
+        )
+        assert response.status_code == 503, response.text
+
+    async def unavailable_signing_key(*args, **kwargs):
+        raise SQLAlchemyError("issuer key status storage unavailable")
+
+    with monkeypatch.context() as scoped:
+        scoped.setattr(
+            platform_workload_auth,
+            "load_platform_workload_signing_key",
+            unavailable_signing_key,
+        )
+        signing_key_failure = await workload_harness.client.post(
+            "/v1/platform/agents",
+            headers=_workload_headers(token, "workload-signing-key-unavailable"),
+            json=_agent_body(owner, uuid.uuid4()),
+        )
+        assert signing_key_failure.status_code == 503, signing_key_failure.text
+
+    async def unavailable_verifier(**kwargs):
+        raise PlatformWorkloadKeyUnavailable("verification key unavailable")
+
+    with monkeypatch.context() as scoped:
+        scoped.setattr(
+            workload_harness.resolver,
+            "resolve_verification_key",
+            unavailable_verifier,
+        )
+        verifier_failure = await workload_harness.client.post(
+            "/v1/platform/agents",
+            headers=_workload_headers(token, "workload-verifier-unavailable"),
+            json=_agent_body(owner, uuid.uuid4()),
+        )
+        assert verifier_failure.status_code == 503, verifier_failure.text
+
+
+@pytest.mark.asyncio
+async def test_platform_credential_selection_legacy_flag_ambiguity_and_no_fallback(
+    workload_harness,
+    seed_user,
+):
+    owner = _owner(seed_user)
+    admin_success = await workload_harness.client.post(
+        "/v1/platform/agents",
+        headers={"X-Admin-Key": _ADMIN_KEY, "Idempotency-Key": "legacy-admin-enabled"},
+        json=_agent_body(owner, uuid.uuid4()),
+    )
+    assert admin_success.status_code == 200, admin_success.text
+
+    settings.platform_legacy_admin_auth_enabled = False
+    disabled = await workload_harness.client.post(
+        "/v1/platform/agents",
+        headers={"X-Admin-Key": _ADMIN_KEY, "Idempotency-Key": "legacy-admin-disabled"},
+        json=_agent_body(owner, uuid.uuid4()),
+    )
+    assert disabled.status_code == 401, disabled.text
+    settings.platform_legacy_admin_auth_enabled = True
+
+    token = await _access_token(workload_harness, "platform:agents:create")
+    ambiguous = await workload_harness.client.post(
+        "/v1/platform/agents",
+        headers={
+            "Authorization": f"Bearer {token}",
+            "X-Admin-Key": _ADMIN_KEY,
+            "Idempotency-Key": "ambiguous-credentials",
+        },
+        json=_agent_body(owner, uuid.uuid4()),
+    )
+    assert ambiguous.status_code == 400, ambiguous.text
+
+    invalid_bearer = await workload_harness.client.post(
+        "/v1/platform/agents",
+        headers={
+            "Authorization": f"Bearer {_ADMIN_KEY}",
+            "Idempotency-Key": "bearer-no-root-fallback",
+        },
+        json=_agent_body(owner, uuid.uuid4()),
+    )
+    assert invalid_bearer.status_code == 401, invalid_bearer.text
+
+    workload_in_admin_header = await workload_harness.client.post(
+        "/v1/platform/agents",
+        headers={
+            "X-Admin-Key": token,
+            "Idempotency-Key": "admin-no-workload-fallback",
+        },
+        json=_agent_body(owner, uuid.uuid4()),
+    )
+    assert workload_in_admin_header.status_code == 401, workload_in_admin_header.text
+
+    repeated = await workload_harness.client.post(
+        "/v1/platform/agents",
+        headers=[
+            ("Authorization", f"Bearer {token}"),
+            ("Authorization", f"Bearer {token}"),
+            ("Idempotency-Key", "repeated-credentials"),
+        ],
+        json=_agent_body(owner, uuid.uuid4()),
+    )
+    assert repeated.status_code == 400, repeated.text
+
+
+@pytest.mark.asyncio
+async def test_oauth_rejects_admin_or_authorization_header_auth(workload_harness):
+    form = {
+        "grant_type": "client_credentials",
+        "client_id": workload_harness.credential.client_id,
+        "scope": "platform:agents:create",
+        "client_assertion_type": PLATFORM_WORKLOAD_CLIENT_ASSERTION_TYPE,
+        "client_assertion": _assertion(workload_harness),
+    }
+    with_admin = await workload_harness.client.post(
+        "/v1/platform/oauth/token",
+        headers={"X-Admin-Key": _ADMIN_KEY},
+        data=form,
+    )
+    with_bearer = await workload_harness.client.post(
+        "/v1/platform/oauth/token",
+        headers={"Authorization": "Bearer unrelated"},
+        data=form,
+    )
+    assert with_admin.status_code == 400, with_admin.text
+    assert with_bearer.status_code == 400, with_bearer.text
+    assert with_admin.json()["error"] == "invalid_request"
+    assert with_bearer.json()["error"] == "invalid_request"

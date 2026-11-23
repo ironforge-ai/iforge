@@ -1,0 +1,2199 @@
+import base64
+import hashlib
+import re
+import secrets
+from collections.abc import Mapping
+from datetime import UTC, datetime, timedelta
+from typing import Annotated
+from urllib.parse import urlencode, urlparse
+from uuid import UUID
+
+import httpx
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, status
+from fastapi.responses import JSONResponse
+from pydantic import JsonValue, TypeAdapter, ValidationError
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.core.auth import (
+    AuthContext,
+    get_auth_short_session,
+    require_user_auth,
+    require_user_auth_unbound,
+    require_user_cli,
+)
+from app.core.database import async_session_factory, get_session
+from app.models.ai_provider import (
+    AiProvider,
+    AiProviderAuthPayload,
+)
+from app.schemas.ai_provider import (
+    AiProviderAcceptRequest,
+    AiProviderAcceptResponse,
+    AiProviderApiKeyAcceptCredential,
+    AiProviderAuth,
+    AiProviderAuthImportRequest,
+    AiProviderAuthResolveRequest,
+    AiProviderAuthResolveResponse,
+    AiProviderConnectionError,
+    AiProviderConnectionTestRequest,
+    AiProviderConnectionTestResponse,
+    AiProviderConsumer,
+    AiProviderDeleteResponse,
+    AiProviderListResponse,
+    AiProviderManagedApiKeyRequest,
+    AiProviderModel,
+    AiProviderOAuthAcceptCredential,
+    AiProviderOAuthCompleteRequest,
+    AiProviderOAuthDevicePendingResponse,
+    AiProviderOAuthDevicePollRequest,
+    AiProviderOAuthDevicePollResponse,
+    AiProviderOAuthDeviceReadyResponse,
+    AiProviderOAuthDeviceStartRequest,
+    AiProviderOAuthDeviceStartResponse,
+    AiProviderOAuthPendingAcceptResponse,
+    AiProviderOAuthStartRequest,
+    AiProviderOAuthStartResponse,
+    AiProviderPatch,
+    AiProviderReadiness,
+    AiProviderReadyAcceptResponse,
+    AiProviderResponse,
+    AiProviderSavedConnectionTestRequest,
+    AiProviderUpsert,
+    AiProviderValidationResponse,
+    ApiMode,
+    ConnectionErrorCategory,
+    CredentialMaterialState,
+    ai_provider_auth_from_persistence,
+)
+from app.schemas.native_provider import native_provider as native_provider_routing
+from app.services.ai_provider_auth_transition import (
+    AuthCredentialWrite,
+    transition_ai_provider_auth,
+)
+from app.services.ai_provider_capabilities import (
+    AiProviderCapabilityInput,
+    effective_provider_api_mode,
+    provider_readiness,
+)
+from app.services.ai_provider_connection import test_ai_provider_connection
+from app.services.ai_provider_connection_ownership import require_connection_ownership_migration
+from app.services.ai_provider_credentials import (
+    OAuthCredentialClaimConflict,
+    OAuthCredentialConsumer,
+    claim_oauth_payload,
+    environment_binds_provider,
+    environment_matches_runtime,
+    lock_ai_provider_owner,
+    provider_has_hosted_runtime_consumer,
+    validate_prospective_bound_runtime_auth,
+)
+from app.services.ai_provider_oauth_attempt import (
+    CODEX_OAUTH_PROVIDER,
+    AiProviderOAuthAttemptService,
+    OAuthDevicePollPending,
+)
+from app.services.ai_provider_oauth_attempt import (
+    oauth_config_for as _oauth_config_for,
+)
+from app.services.ai_provider_oauth_attempt import (
+    required_oauth_config as _required_oauth_config,
+)
+from app.services.ai_provider_oauth_attempt import (
+    validate_codex_oauth_provider_shape as _validate_codex_oauth_provider_shape,
+)
+from app.services.ai_provider_oauth_attempt import (
+    validate_oauth_url as _validate_oauth_url,
+)
+from app.services.ai_provider_oauth_attempt import (
+    validate_redirect_uri as _validate_redirect_uri,
+)
+from app.services.app_setting_registry import SUPPORTED_CUSTOM_PROVIDER_CLI_VERSIONS_SPEC
+from app.services.codex_oauth import (
+    CODEX_DEVICE_VERIFICATION_URL,
+    CODEX_OAUTH_CLIENT_ID,
+    CodexOAuthUpstreamError,
+    start_device_authorization,
+)
+from app.services.managed_ai_provider import (
+    MANAGED_AI_PROVIDER_IDS,
+    V2_MANAGED_AI_PROVIDER_ID,
+    V2_MANAGED_AI_PROVIDER_IDS,
+    is_v2_deployment_managed_provider_id,
+    managed_provider_accepted_api_modes,
+    managed_provider_api_mode,
+    managed_provider_runtime_env_name,
+    runtime_managed_provider_id,
+)
+from app.services.platform_contract import (
+    PlatformReplay,
+    lock_platform_idempotency,
+    platform_request_hash,
+    read_platform_replay,
+    store_platform_response,
+)
+from app.services.private_ip import is_private_hostname
+from app.services.sync_events import (
+    queue_environment_runtime_manifest_changed,
+    queue_provider_runtime_manifest_changed,
+    runtime_manifest_provider_non_auth_signature,
+)
+from app.services.url_security import is_public_https_url
+from app.services.vault_crypto import decrypt
+
+router = APIRouter(prefix="/ai-providers", tags=["ai-providers"])
+AI_PROVIDER_SCOPE = "account_global"
+
+ALLOWED_API_MODES: dict[str, set[str]] = {
+    "openai": {"openai_chat", "openai_responses"},
+    "anthropic": {"anthropic_messages"},
+    "openrouter": {"openai_chat"},
+    "gemini": {"google_generate_content"},
+    "mistral": {"openai_chat"},
+    "custom_openai_compatible": {
+        "openai_chat",
+        "openai_responses",
+    },
+}
+OAUTH_STATE_TTL_SECONDS = 10 * 60
+OAUTH_DEVICE_STATE_TTL_SECONDS = 15 * 60
+SUPPORTED_AGENT_PROFILE_TOOLS = {CODEX_OAUTH_PROVIDER}
+SUPPORTED_OAUTH_PROVIDERS = {CODEX_OAUTH_PROVIDER}
+RESERVED_OAUTH_AUTHORIZE_PARAMS = {
+    "audience",
+    "client_id",
+    "code_challenge",
+    "code_challenge_method",
+    "redirect_uri",
+    "response_type",
+    "scope",
+    "state",
+}
+
+IdempotencyKey = Annotated[
+    str,
+    Header(alias="Idempotency-Key", min_length=1, max_length=200),
+]
+
+_AI_PROVIDER_ACCEPT_OPERATION = "ai_provider.accept"
+
+
+def _oauth_attempt_service(auth: AuthContext) -> AiProviderOAuthAttemptService:
+    async def build_response(db: AsyncSession, provider: AiProvider) -> AiProviderResponse:
+        return await _to_response(db, auth, provider)
+
+    return AiProviderOAuthAttemptService(
+        response_builder=build_response,
+        session_factory=async_session_factory,
+    )
+
+
+async def _require_ai_provider_accept_auth(
+    auth: AuthContext = Depends(get_auth_short_session),
+) -> AuthContext:
+    if auth.is_cli and auth.api_key is not None:
+        if auth.api_key.scopes is not None:
+            raise HTTPException(
+                status.HTTP_403_FORBIDDEN,
+                "This endpoint is not available to scoped api keys",
+            )
+        if auth.api_key.environment_id is not None:
+            raise HTTPException(
+                status.HTTP_403_FORBIDDEN,
+                "user-level auth is required (Agent API keys cannot manage account resources)",
+            )
+    return auth
+
+
+@router.get("", response_model=AiProviderListResponse, response_model_exclude_none=True)
+async def list_ai_providers(
+    auth: AuthContext = Depends(require_user_auth),
+    db: AsyncSession = Depends(get_session),
+) -> AiProviderListResponse:
+    rows = (
+        (
+            await db.execute(
+                select(AiProvider)
+                .where(AiProvider.owner_user_id == auth.user_id, AiProvider.archived_at.is_(None))
+                .order_by(AiProvider.provider_id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    visible_rows = [
+        row for row in rows if not is_v2_deployment_managed_provider_id(row.provider_id)
+    ]
+    responses = await _to_responses(db, auth, visible_rows)
+    providers_by_public_id: dict[str, AiProviderResponse] = {}
+    for response in responses:
+        providers_by_public_id.setdefault(response.provider_id, response)
+    return AiProviderListResponse(providers=list(providers_by_public_id.values()))
+
+
+@router.post("", response_model=AiProviderResponse, response_model_exclude_none=True)
+async def upsert_ai_provider(
+    body: AiProviderUpsert,
+    replace: bool = Query(default=False),
+    auth: AuthContext = Depends(require_user_auth_unbound),
+    db: AsyncSession = Depends(get_session),
+) -> AiProviderResponse:
+    _raise_if_deployment_managed_provider_id(body.provider_id)
+    if body.provider_id in V2_MANAGED_AI_PROVIDER_IDS:
+        body = body.model_copy(update={"provider_id": V2_MANAGED_AI_PROVIDER_ID})
+    errors = _validate_provider(body)
+    if errors:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, {"errors": errors})
+    await lock_ai_provider_owner(db, auth.user_id)
+    await _validate_hosted_consumer_endpoint(
+        db,
+        owner_user_id=auth.user_id,
+        provider_id=body.provider_id,
+        base_url=body.base_url,
+    )
+    await _validate_runtime_env_unique(db, auth, body)
+    existing = await _find_provider(db, auth, body.provider_id, include_archived=True)
+    if existing is not None and existing.archived_at is None and not replace:
+        raise HTTPException(status.HTTP_409_CONFLICT, "AI Provider already exists")
+    previous_non_auth_signature = runtime_manifest_provider_non_auth_signature(existing)
+    auth_event_queued = False
+    provider = existing or AiProvider(owner_user_id=auth.user_id, provider_id=body.provider_id)
+    _apply_provider_body(provider, body, apply_auth=False)
+    auth_ref, auth_metadata = body.auth.persistence_fields()
+    if existing is None:
+        try:
+            await validate_prospective_bound_runtime_auth(
+                db,
+                owner_user_id=auth.user_id,
+                provider_id=provider.provider_id,
+                prospective_auth_type=body.auth.type,
+            )
+        except OAuthCredentialClaimConflict as exc:
+            raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
+        provider.auth_type = body.auth.type
+        provider.auth_ref = auth_ref
+        provider.auth_metadata = auth_metadata
+    else:
+        try:
+            transition = await transition_ai_provider_auth(
+                db,
+                owner_user_id=auth.user_id,
+                provider=provider,
+                auth_type=body.auth.type,
+                auth_ref=auth_ref,
+                auth_metadata=auth_metadata,
+            )
+        except OAuthCredentialClaimConflict as exc:
+            raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
+        auth_event_queued = transition.manifest_event_queued
+    provider.activate()
+    db.add(provider)
+    if (
+        previous_non_auth_signature != runtime_manifest_provider_non_auth_signature(provider)
+        and not auth_event_queued
+    ):
+        await queue_provider_runtime_manifest_changed(db, auth.user_id, provider.provider_id)
+    await db.commit()
+    await db.refresh(provider)
+    return await _to_response(db, auth, provider)
+
+
+@router.post(
+    "/{provider_id}/auth/oauth/device/poll",
+    response_model=AiProviderOAuthDevicePollResponse,
+    response_model_exclude_none=True,
+)
+async def poll_ai_provider_oauth_device(
+    provider_id: str,
+    body: AiProviderOAuthDevicePollRequest,
+    auth: AuthContext = Depends(require_user_auth_unbound),
+    request_db: AsyncSession = Depends(get_session),
+) -> AiProviderOAuthDevicePollResponse:
+    await _get_provider_or_404(request_db, auth, provider_id)
+    result = await _oauth_attempt_service(auth).poll_device_attempt(
+        owner_user_id=auth.user_id,
+        provider_id=provider_id,
+        state_value=body.state,
+    )
+    if isinstance(result, OAuthDevicePollPending):
+        return AiProviderOAuthDevicePendingResponse(
+            status="pending",
+            retry_after_seconds=result.retry_after_seconds,
+        )
+    return AiProviderOAuthDeviceReadyResponse(status="ready", provider=result)
+
+
+@router.post(
+    "/accept",
+    response_model=AiProviderAcceptResponse,
+    response_model_exclude_none=True,
+    status_code=status.HTTP_201_CREATED,
+)
+async def accept_ai_provider(
+    body: AiProviderAcceptRequest,
+    idempotency_key: IdempotencyKey,
+    auth: AuthContext = Depends(require_user_auth_unbound),
+    db: AsyncSession = Depends(get_session),
+) -> AiProviderAcceptResponse | JSONResponse:
+    """Atomically create or explicitly replace a provider and credential."""
+
+    request_hash = _ai_provider_accept_request_hash(body)
+    try:
+        await lock_ai_provider_owner(db, auth.user_id)
+        replay = await _load_ai_provider_accept_replay(
+            db,
+            operation=_AI_PROVIDER_ACCEPT_OPERATION,
+            idempotency_key=idempotency_key,
+            request_hash=request_hash,
+            owner_user_id=auth.user_id,
+        )
+        if replay is not None:
+            await db.commit()
+            return JSONResponse(status_code=replay.status_code, content=replay.body)
+
+        result = await _accept_ai_provider(db, auth, body)
+        response_body = result.model_dump(mode="json", exclude_none=True)
+        store_platform_response(
+            db,
+            operation=_AI_PROVIDER_ACCEPT_OPERATION,
+            idempotency_key=idempotency_key,
+            request_hash=request_hash,
+            owner_user_id=auth.user_id,
+            resource_type=(
+                "ai_provider_oauth_setup"
+                if isinstance(result, AiProviderOAuthPendingAcceptResponse)
+                else "ai_provider"
+            ),
+            resource_id=result.provider.provider_id,
+            response_status=status.HTTP_201_CREATED,
+            response_body=response_body,
+        )
+        await db.commit()
+    except Exception:
+        await db.rollback()
+        raise
+    return result
+
+
+@router.post(
+    "/test",
+    response_model=AiProviderConnectionTestResponse,
+    response_model_exclude_none=True,
+)
+async def test_ai_provider(
+    body: AiProviderConnectionTestRequest,
+    _auth: AuthContext = Depends(_require_ai_provider_accept_auth),
+) -> AiProviderConnectionTestResponse:
+    """Verify a draft credential, endpoint, protocol, and model without persisting it."""
+
+    provider = body.provider
+    errors = _validate_provider(provider)
+    if errors:
+        return _connection_test_failure(
+            provider,
+            credential_material="available",
+            category="validation",
+            code="invalid_provider",
+            message="Provider configuration is invalid.",
+            retryable=False,
+        )
+
+    credential_material = "available"
+    if provider.auth.type != "api_key" or provider.auth.source != "managed":
+        return _connection_test_failure(
+            provider,
+            credential_material=credential_material,
+            category="credential",
+            code="credential_contract_mismatch",
+            message="The supplied credential does not match the provider auth configuration.",
+            retryable=False,
+        )
+    credential = body.credential.value.get_secret_value()
+
+    model, model_api_mode = _connection_test_model(provider, body.model)
+    if not model:
+        return _connection_test_failure(
+            provider,
+            credential_material=credential_material,
+            category="validation",
+            code="model_required",
+            message="Choose a model before testing the provider.",
+            retryable=False,
+        )
+    api_mode = effective_provider_api_mode(provider.type, model_api_mode or provider.api_mode)
+    if api_mode is None:
+        return _connection_test_failure(
+            provider,
+            credential_material=credential_material,
+            category="validation",
+            code="protocol_required",
+            message="Choose a provider protocol before testing the provider.",
+            retryable=False,
+        )
+
+    result = await test_ai_provider_connection(
+        provider_type=provider.type,
+        base_url=provider.base_url,
+        api_mode=api_mode,
+        model=model,
+        credential=credential,
+    )
+    endpoint_state = (
+        "verified" if result.ok or (result.error and result.error.endpoint_reachable) else "failed"
+    )
+    readiness = provider_readiness(
+        _provider_capability_input(provider, effective_api_mode=api_mode),
+        credential_material=credential_material,
+        endpoint_reachability=endpoint_state,
+        inference_verification="verified" if result.ok else "failed",
+    )
+    if result.ok:
+        return AiProviderConnectionTestResponse(ok=True, readiness=readiness)
+    if result.error is None:  # pragma: no cover - service result invariant
+        raise RuntimeError("failed connection test is missing an error")
+    return AiProviderConnectionTestResponse(
+        ok=False,
+        readiness=readiness,
+        error=AiProviderConnectionError(
+            category=result.error.category,
+            code=result.error.code,
+            message=result.error.message,
+            retryable=result.error.retryable,
+        ),
+    )
+
+
+@router.post(
+    "/{provider_id}/test",
+    response_model=AiProviderConnectionTestResponse,
+    response_model_exclude_none=True,
+)
+async def test_saved_ai_provider(
+    provider_id: str,
+    body: AiProviderSavedConnectionTestRequest,
+    auth: AuthContext = Depends(_require_ai_provider_accept_auth),
+) -> AiProviderConnectionTestResponse:
+    """Verify a saved managed API key without exposing it to the caller."""
+
+    async with async_session_factory() as db:
+        provider = await _get_provider_or_404(db, auth, provider_id)
+        if provider.native_credential_authority:
+            raise HTTPException(
+                409, "Test this provider in the native runtime that owns its credentials"
+            )
+        active_profile = _active_auth_profile(provider)
+        payload = (
+            await _find_auth_payload(db, auth, provider.provider_id, active_profile)
+            if active_profile is not None
+            else None
+        )
+        payload_keys: set[tuple[str, str, str]] = (
+            {(payload.provider_id, payload.auth_profile, payload.kind)}
+            if payload is not None and payload.archived_at is None
+            else set()
+        )
+        credential_material = _provider_credential_material(provider, payload_keys)
+        readiness = provider_readiness(
+            _provider_capability_input(provider),
+            credential_material=credential_material,
+        )
+        metadata = provider.auth_metadata or {}
+        auth_source = metadata.get("source")
+        auth_ref = provider.auth_ref or ""
+        if auth_source == "env" or auth_ref.startswith("env:"):
+            return _connection_test_failure_with_readiness(
+                readiness,
+                category="credential",
+                code="env_credential_not_testable",
+                message=(
+                    "Environment credentials are resolved inside the target runtime. Test this "
+                    "provider there or replace the credential with a managed API key."
+                ),
+                retryable=False,
+            )
+        if auth_source == "vault" or auth_ref.startswith("iforge://"):
+            return _connection_test_failure_with_readiness(
+                readiness,
+                category="credential",
+                code="vault_credential_not_testable",
+                message=(
+                    "Vault credentials are resolved inside the target runtime. Test this "
+                    "provider there or replace the credential with a managed API key."
+                ),
+                retryable=False,
+            )
+        if provider.auth_type in {"oauth_profile", "agent_profile"}:
+            return _connection_test_failure_with_readiness(
+                readiness,
+                category="credential",
+                code="oauth_credential_not_testable",
+                message=(
+                    "OAuth credentials cannot be used for this connection test. Use the provider "
+                    "sign-in flow or replace the credential with a managed API key."
+                ),
+                retryable=False,
+            )
+        if provider.auth_type == "none":
+            return _connection_test_failure_with_readiness(
+                readiness,
+                category="credential",
+                code="none_auth_not_testable",
+                message=(
+                    "Providers without authentication cannot be tested by the service. Test this "
+                    "provider from its target runtime."
+                ),
+                retryable=False,
+            )
+        if provider.auth_type != "api_key" or auth_source != "managed":
+            return _connection_test_failure_with_readiness(
+                readiness,
+                category="credential",
+                code="saved_auth_not_testable",
+                message=(
+                    "This saved authentication method cannot be tested by the service. Replace "
+                    "it with a managed API key to test it here."
+                ),
+                retryable=False,
+            )
+        if (
+            payload is None
+            or payload.archived_at is not None
+            or payload.kind != "api_key"
+            or payload.source != "managed"
+        ):
+            return _connection_test_failure_with_readiness(
+                readiness,
+                category="credential",
+                code="saved_credential_missing",
+                message="Save the managed API key again before testing this provider.",
+                retryable=False,
+            )
+        try:
+            credential = decrypt(payload.encrypted_payload, payload.nonce)
+        except Exception:
+            return _connection_test_failure_with_readiness(
+                provider_readiness(
+                    _provider_capability_input(provider),
+                    credential_material="missing",
+                ),
+                category="credential",
+                code="saved_credential_unreadable",
+                message="The saved API key could not be read. Save it again before testing.",
+                retryable=False,
+            )
+        if not credential.strip():
+            return _connection_test_failure_with_readiness(
+                provider_readiness(
+                    _provider_capability_input(provider),
+                    credential_material="missing",
+                ),
+                category="credential",
+                code="saved_credential_invalid",
+                message="The saved API key is empty. Save it again before testing.",
+                retryable=False,
+            )
+        model, model_api_mode = _connection_test_model(provider, body.model)
+        if not model:
+            return _connection_test_failure_with_readiness(
+                readiness,
+                category="validation",
+                code="model_required",
+                message="Choose a model before testing the provider.",
+                retryable=False,
+            )
+        api_mode = effective_provider_api_mode(
+            provider.type,
+            model_api_mode or provider.api_mode,
+        )
+        if api_mode is None:
+            return _connection_test_failure_with_readiness(
+                readiness,
+                category="validation",
+                code="protocol_required",
+                message="Choose a provider protocol before testing the provider.",
+                retryable=False,
+            )
+        provider_type = provider.type
+        base_url = provider.base_url
+        capability_input = _provider_capability_input(provider, effective_api_mode=api_mode)
+
+    result = await test_ai_provider_connection(
+        provider_type=provider_type,
+        base_url=base_url,
+        api_mode=api_mode,
+        model=model,
+        credential=credential,
+    )
+    endpoint_state = (
+        "verified" if result.ok or (result.error and result.error.endpoint_reachable) else "failed"
+    )
+    readiness = provider_readiness(
+        capability_input,
+        credential_material="available",
+        endpoint_reachability=endpoint_state,
+        inference_verification="verified" if result.ok else "failed",
+    )
+    if result.ok:
+        return AiProviderConnectionTestResponse(ok=True, readiness=readiness)
+    if result.error is None:  # pragma: no cover - service result invariant
+        return _connection_test_failure_with_readiness(
+            readiness,
+            category="network",
+            code="request_failed",
+            message="Provider request failed.",
+            retryable=True,
+        )
+    return AiProviderConnectionTestResponse(
+        ok=False,
+        readiness=readiness,
+        error=AiProviderConnectionError(
+            category=result.error.category,
+            code=result.error.code,
+            message=result.error.message,
+            retryable=result.error.retryable,
+        ),
+    )
+
+
+@router.get("/{provider_id}", response_model=AiProviderResponse, response_model_exclude_none=True)
+async def get_ai_provider(
+    provider_id: str,
+    auth: AuthContext = Depends(require_user_auth),
+    db: AsyncSession = Depends(get_session),
+) -> AiProviderResponse:
+    provider = await _get_provider_or_404(db, auth, provider_id)
+    return await _to_response(db, auth, provider)
+
+
+@router.patch("/{provider_id}", response_model=AiProviderResponse, response_model_exclude_none=True)
+async def patch_ai_provider(
+    provider_id: str,
+    body: AiProviderPatch,
+    auth: AuthContext = Depends(require_user_auth_unbound),
+    db: AsyncSession = Depends(get_session),
+) -> AiProviderResponse:
+    await lock_ai_provider_owner(db, auth.user_id)
+    provider = await _get_provider_or_404_for_update(db, auth, provider_id)
+    previous_non_auth_signature = runtime_manifest_provider_non_auth_signature(provider)
+    auth_event_queued = False
+    merged = await _to_response(db, auth, provider)
+    update = {
+        field: getattr(body, field) for field in body.model_fields_set if field != "credential"
+    }
+    if body.credential is not None and provider.configuration_mode not in {"connection", "custom"}:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT, "Inline key replacement requires an existing connection"
+        )
+    if update.get("configuration_mode") == "custom" and provider.configuration_mode != "custom":
+        if provider.configuration_mode not in {"catalog", "connection"} or set(update) != {
+            "configuration_mode"
+        }:
+            raise HTTPException(409, "Transfer model ownership separately from connection changes")
+        if merged.readiness is None or not merged.readiness.deployable:
+            raise HTTPException(409, "Custom providers require a deliverable API key")
+        await require_connection_ownership_migration(
+            db,
+            owner_user_id=auth.user_id,
+            provider_id=provider.provider_id,
+            versions_spec=SUPPORTED_CUSTOM_PROVIDER_CLI_VERSIONS_SPEC,
+            allow_unbound=True,
+        )
+        provider.configuration_mode = "custom"
+        merged.models = None
+        merged.native_provider = None
+        merged.native_variant = None
+        merged.api_mode = TypeAdapter(ApiMode).validate_python(
+            effective_provider_api_mode(provider.type, provider.api_mode)
+        )
+    if provider.configuration_mode in {"connection", "custom"}:
+        if (
+            (
+                "configuration_mode" in update
+                and update["configuration_mode"] != provider.configuration_mode
+            )
+            or "models" in update
+            or ("auth" in update and update["auth"] != merged.auth)
+            or (
+                "runtime_env_name" in update
+                and update["runtime_env_name"] != provider.runtime_env_name
+            )
+        ):
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                "Agent-owned models and credential environment cannot be replaced.",
+            )
+    elif update.get("configuration_mode") == "connection":
+        if provider.configuration_mode != "catalog" or set(update) != {"configuration_mode"}:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                "Transfer model ownership separately from connection changes.",
+            )
+        if merged.readiness is None or not merged.readiness.deployable:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT, "Model ownership transfer requires a deliverable API key"
+            )
+        await require_connection_ownership_migration(
+            db, owner_user_id=auth.user_id, provider_id=provider.provider_id
+        )
+    null_errors = _validate_patch_nulls(update)
+    if null_errors:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, {"errors": null_errors})
+    for key, value in update.items():
+        setattr(merged, key, value)
+    if merged.configuration_mode == "native":
+        try:
+            native_input = merged.model_dump(exclude_none=True)
+            if (
+                "native_provider" in update
+                and update["native_provider"] != provider.native_provider
+                and "native_variant" not in update
+            ):
+                native_input.pop("native_variant", None)
+            if "native_provider" in update or "native_variant" in update:
+                for field in ("type", "base_url", "api_mode", "runtime_env_name"):
+                    if field not in update:
+                        native_input.pop(field, None)
+            merged = AiProviderResponse.model_validate(native_input)
+        except ValidationError as exc:
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_CONTENT, "Invalid native provider configuration"
+            ) from exc
+    errors = _validate_provider(merged)
+    if errors:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, {"errors": errors})
+    await _validate_hosted_consumer_endpoint(
+        db,
+        owner_user_id=auth.user_id,
+        provider_id=provider.provider_id,
+        base_url=merged.base_url,
+    )
+    await _validate_runtime_env_unique(db, auth, merged, exclude_provider_id=provider.provider_id)
+    _apply_provider_body(provider, merged, apply_auth=False)
+    if "auth" in body.model_fields_set or body.credential is not None:
+        auth_ref, auth_metadata = merged.auth.persistence_fields()
+        try:
+            transition = await transition_ai_provider_auth(
+                db,
+                owner_user_id=auth.user_id,
+                provider=provider,
+                auth_type=merged.auth.type,
+                auth_ref=auth_ref,
+                auth_metadata=auth_metadata,
+                credential=(
+                    AuthCredentialWrite(
+                        profile=str((auth_metadata or {}).get("profile") or "default"),
+                        kind="api_key",
+                        plaintext=body.credential.value.get_secret_value(),
+                        metadata=auth_metadata,
+                    )
+                    if body.credential is not None
+                    else None
+                ),
+            )
+        except OAuthCredentialClaimConflict as exc:
+            raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
+        auth_event_queued = transition.manifest_event_queued
+    if (
+        previous_non_auth_signature != runtime_manifest_provider_non_auth_signature(provider)
+        and not auth_event_queued
+    ):
+        await queue_provider_runtime_manifest_changed(db, auth.user_id, provider.provider_id)
+    await db.commit()
+    await db.refresh(provider)
+    return await _to_response(db, auth, provider)
+
+
+@router.delete("/{provider_id}", response_model=AiProviderDeleteResponse)
+async def delete_ai_provider(
+    provider_id: str,
+    auth: AuthContext = Depends(require_user_auth_unbound),
+    db: AsyncSession = Depends(get_session),
+) -> AiProviderDeleteResponse:
+    await lock_ai_provider_owner(db, auth.user_id)
+    provider = await _get_provider_or_404_for_update(db, auth, provider_id)
+    if await provider_has_hosted_runtime_consumer(
+        db,
+        owner_user_id=auth.user_id,
+        provider_id=provider.provider_id,
+    ):
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "Remove this provider through Hosted so affected agents are set to Unset first.",
+        )
+    result = await transition_ai_provider_auth(
+        db,
+        owner_user_id=auth.user_id,
+        provider=provider,
+        auth_type=provider.auth_type,
+        auth_ref=provider.auth_ref,
+        auth_metadata=provider.auth_metadata,
+        archive_provider=True,
+    )
+    response_provider_id = runtime_managed_provider_id(provider.provider_id)
+    await db.commit()
+    return AiProviderDeleteResponse(
+        status="deleted",
+        provider_id=response_provider_id,
+        remote_revoke_status=result.remote_revoke_status,
+    )
+
+
+@router.post("/{provider_id}/validate", response_model=AiProviderValidationResponse)
+async def validate_ai_provider(
+    provider_id: str,
+    auth: AuthContext = Depends(require_user_auth),
+    db: AsyncSession = Depends(get_session),
+) -> AiProviderValidationResponse:
+    provider = await _get_provider_or_404(db, auth, provider_id)
+    body = await _to_response(db, auth, provider)
+    errors = _validate_provider(body)
+    return AiProviderValidationResponse(valid=not errors, errors=errors, warnings=[])
+
+
+@router.post(
+    "/{provider_id}/auth/api-key",
+    response_model=AiProviderResponse,
+    response_model_exclude_none=True,
+)
+async def set_ai_provider_api_key(
+    provider_id: str,
+    body: AiProviderManagedApiKeyRequest,
+    auth: AuthContext = Depends(require_user_auth_unbound),
+    db: AsyncSession = Depends(get_session),
+) -> AiProviderResponse:
+    await lock_ai_provider_owner(db, auth.user_id)
+    provider = await _get_provider_or_404_for_update(db, auth, provider_id)
+    profile = "default"
+    runtime_env_name = body.runtime_env_name
+    if runtime_env_name is not None and not _is_runtime_env_name(runtime_env_name):
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, "invalid runtime_env_name")
+    proposed_runtime_env_name = runtime_env_name or provider.runtime_env_name
+    if (
+        provider.configuration_mode in {"connection", "custom"}
+        and runtime_env_name is not None
+        and runtime_env_name != provider.runtime_env_name
+    ):
+        raise HTTPException(
+            status.HTTP_409_CONFLICT, "Connection credential environment is immutable"
+        )
+    if provider.configuration_mode == "native":
+        try:
+            routing = native_provider_routing(provider.native_provider, provider.native_variant)
+        except ValueError as exc:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT, "Stored native provider identity is invalid"
+            ) from exc
+        if runtime_env_name is not None and runtime_env_name != routing.runtime_env_name:
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_CONTENT,
+                "Native credential environment is derived from its provider",
+            )
+    else:
+        await _validate_runtime_env_name_unique(
+            db,
+            auth,
+            proposed_runtime_env_name,
+            exclude_provider_id=provider.provider_id,
+        )
+    metadata: dict[str, JsonValue] = {"source": "managed", "profile": profile}
+    await transition_ai_provider_auth(
+        db,
+        owner_user_id=auth.user_id,
+        provider=provider,
+        auth_type="api_key",
+        auth_ref=None,
+        auth_metadata=metadata,
+        credential=AuthCredentialWrite(
+            profile=profile,
+            kind="api_key",
+            plaintext=body.value.get_secret_value(),
+            metadata=_compact({"runtime_env_name": runtime_env_name}),
+        ),
+    )
+    if runtime_env_name is not None:
+        provider.runtime_env_name = runtime_env_name
+    await db.commit()
+    await db.refresh(provider)
+    return await _to_response(db, auth, provider)
+
+
+@router.post(
+    "/{provider_id}/auth/import",
+    response_model=AiProviderResponse,
+    response_model_exclude_none=True,
+)
+async def import_ai_provider_auth(
+    provider_id: str,
+    body: AiProviderAuthImportRequest,
+    auth: AuthContext = Depends(require_user_auth_unbound),
+    db: AsyncSession = Depends(get_session),
+) -> AiProviderResponse:
+    await lock_ai_provider_owner(db, auth.user_id)
+    provider = await _get_provider_or_404_for_update(db, auth, provider_id)
+    auth_import = body.root
+    if provider.configuration_mode in {"connection", "custom"}:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT, "Connection providers require API-key authentication"
+        )
+    profile = _normalize_profile(auth_import.profile)
+    if auth_import.type == "oauth_profile":
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_CONTENT,
+            "oauth_profile import is not supported; use Codex OAuth connect",
+        )
+    tool = _normalize_profile(auth_import.tool)
+    _validate_supported_agent_profile_tool(tool)
+    metadata: dict[str, JsonValue] = {
+        "tool": tool,
+        "profile": profile,
+    }
+    try:
+        await transition_ai_provider_auth(
+            db,
+            owner_user_id=auth.user_id,
+            provider=provider,
+            auth_type=auth_import.type,
+            auth_ref=None,
+            auth_metadata=metadata,
+            credential=AuthCredentialWrite(
+                profile=profile,
+                kind=auth_import.type,
+                plaintext=auth_import.payload.get_secret_value(),
+                metadata=metadata,
+            ),
+        )
+    except OAuthCredentialClaimConflict as exc:
+        raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
+    await db.commit()
+    await db.refresh(provider)
+    return await _to_response(db, auth, provider)
+
+
+async def _build_codex_device_authorization(
+    *,
+    db: AsyncSession,
+    auth: AuthContext,
+    provider: AiProvider,
+    oauth_provider: str,
+) -> AiProviderOAuthDeviceStartResponse:
+    _validate_codex_oauth_provider_shape(provider)
+    config = _oauth_config_for(oauth_provider)
+    client_id = _required_oauth_config(config, "client_id", oauth_provider)
+    if client_id != CODEX_OAUTH_CLIENT_ID:
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "ChatGPT device sign-in requires the official Codex OAuth client",
+        )
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            authorization = await start_device_authorization(client, client_id)
+    except CodexOAuthUpstreamError as exc:
+        headers = {"Retry-After": str(exc.retry_after)} if exc.retry_after is not None else None
+        raise HTTPException(
+            status.HTTP_429_TOO_MANY_REQUESTS
+            if exc.retry_after is not None
+            else (
+                status.HTTP_503_SERVICE_UNAVAILABLE
+                if exc.unavailable
+                else status.HTTP_502_BAD_GATEWAY
+            ),
+            str(exc),
+            headers=headers,
+        ) from exc
+    profile = "default"
+    expires_at = datetime.now(UTC) + timedelta(seconds=OAUTH_DEVICE_STATE_TTL_SECONDS)
+    state_value = await _oauth_attempt_service(auth).persist_attempt(
+        db,
+        owner_user_id=auth.user_id,
+        provider=provider,
+        profile=profile,
+        flow_kind="device_code",
+        expires_at=expires_at,
+        flow_payload={
+            "device_auth_id": authorization.device_auth_id,
+            "user_code": authorization.user_code,
+            "poll_interval_seconds": authorization.poll_interval_seconds,
+        },
+    )
+    return AiProviderOAuthDeviceStartResponse(
+        provider_id=runtime_managed_provider_id(provider.provider_id),
+        oauth_provider=oauth_provider,
+        profile=profile,
+        verification_url=CODEX_DEVICE_VERIFICATION_URL,
+        user_code=authorization.user_code,
+        state=state_value,
+        expires_at=expires_at,
+        poll_interval_seconds=authorization.poll_interval_seconds,
+    )
+
+
+@router.post(
+    "/{provider_id}/auth/oauth/device/start",
+    response_model=AiProviderOAuthDeviceStartResponse,
+)
+async def start_ai_provider_oauth_device(
+    provider_id: str,
+    body: AiProviderOAuthDeviceStartRequest,
+    auth: AuthContext = Depends(require_user_auth_unbound),
+    db: AsyncSession = Depends(get_session),
+) -> AiProviderOAuthDeviceStartResponse:
+    provider = await _get_provider_or_404(db, auth, provider_id)
+    oauth_provider = _normalize_profile(body.provider)
+    _validate_supported_oauth_provider(oauth_provider)
+    response = await _build_codex_device_authorization(
+        db=db,
+        auth=auth,
+        provider=provider,
+        oauth_provider=oauth_provider,
+    )
+    await db.commit()
+    return response
+
+
+@router.post(
+    "/{provider_id}/auth/oauth/start",
+    response_model=AiProviderOAuthStartResponse,
+)
+async def start_ai_provider_oauth(
+    provider_id: str,
+    body: AiProviderOAuthStartRequest,
+    auth: AuthContext = Depends(require_user_auth_unbound),
+    db: AsyncSession = Depends(get_session),
+) -> AiProviderOAuthStartResponse:
+    provider = await _get_provider_or_404(db, auth, provider_id)
+    _validate_codex_oauth_provider_shape(provider)
+    oauth_provider = _normalize_profile(body.provider)
+    _validate_supported_oauth_provider(oauth_provider)
+    profile = "default"
+    config = _oauth_config_for(oauth_provider)
+    authorization_url = _required_oauth_config(config, "authorization_url", oauth_provider)
+    client_id = _required_oauth_config(config, "client_id", oauth_provider)
+    redirect_uri = _oauth_authorization_code_redirect_uri(
+        config=config,
+        client_id=client_id,
+        requested=body.redirect_uri,
+        oauth_provider=oauth_provider,
+    )
+    _validate_oauth_url(authorization_url, "authorization_url")
+
+    code_verifier = secrets.token_urlsafe(48)
+    code_challenge = _code_challenge(code_verifier)
+    expires_at = datetime.now(UTC) + timedelta(seconds=OAUTH_STATE_TTL_SECONDS)
+    state = await _oauth_attempt_service(auth).persist_attempt(
+        db,
+        owner_user_id=auth.user_id,
+        provider=provider,
+        profile=profile,
+        flow_kind="authorization_code",
+        expires_at=expires_at,
+        flow_payload={
+            "redirect_uri": redirect_uri,
+            "code_verifier": code_verifier,
+        },
+    )
+    params: dict[str, str] = {
+        "response_type": "code",
+        "client_id": client_id,
+        "redirect_uri": redirect_uri,
+        "state": state,
+        "code_challenge": code_challenge,
+        "code_challenge_method": "S256",
+    }
+    scope = str(config.get("scope") or "")
+    if scope:
+        params["scope"] = scope
+    audience = str(config.get("audience") or "")
+    if audience:
+        params["audience"] = audience
+    extra = config.get("extra_authorize_params")
+    if isinstance(extra, dict):
+        for key, value in extra.items():
+            if isinstance(value, str):
+                if key in RESERVED_OAUTH_AUTHORIZE_PARAMS:
+                    raise HTTPException(
+                        status.HTTP_503_SERVICE_UNAVAILABLE,
+                        f"AI Provider OAuth config for {oauth_provider} cannot override {key}",
+                    )
+                params[key] = value
+
+    separator = "&" if "?" in authorization_url else "?"
+    auth_url = f"{authorization_url}{separator}{urlencode(params)}"
+    response = AiProviderOAuthStartResponse(
+        provider_id=runtime_managed_provider_id(provider.provider_id),
+        oauth_provider=oauth_provider,
+        profile=profile,
+        auth_url=auth_url,
+        state=state,
+        redirect_uri=redirect_uri,
+        expires_at=expires_at,
+    )
+    await db.commit()
+    return response
+
+
+@router.post(
+    "/{provider_id}/auth/oauth/complete",
+    response_model=AiProviderResponse,
+    response_model_exclude_none=True,
+)
+async def complete_ai_provider_oauth(
+    provider_id: str,
+    body: AiProviderOAuthCompleteRequest,
+    auth: AuthContext = Depends(require_user_auth_unbound),
+    db: AsyncSession = Depends(get_session),
+) -> AiProviderResponse:
+    await _get_provider_or_404(db, auth, provider_id)
+    service = _oauth_attempt_service(auth)
+    begin = await service.begin_exchange(
+        owner_user_id=auth.user_id,
+        provider_id=provider_id,
+        state_value=body.state,
+        flow_kind="authorization_code",
+        payload_updates={
+            "authorization_code": body.code,
+            "requested_redirect_uri": body.redirect_uri,
+        },
+    )
+    if isinstance(begin, AiProviderResponse):
+        return begin
+    return await service.exchange_and_commit(
+        attempt_id=begin,
+        owner_user_id=auth.user_id,
+    )
+
+
+def _ai_provider_accept_request_hash(body: AiProviderAcceptRequest) -> str:
+    credential = body.credential
+    if isinstance(credential, AiProviderApiKeyAcceptCredential):
+        credential_payload: dict[str, JsonValue] = {
+            "type": credential.type,
+            "value_sha256": hashlib.sha256(
+                credential.value.get_secret_value().encode()
+            ).hexdigest(),
+        }
+    else:
+        credential_payload = credential.model_dump(mode="json", exclude_none=False)
+    request_payload: dict[str, JsonValue] = {
+        "provider": body.provider.model_dump(mode="json", exclude_none=False),
+        "credential": credential_payload,
+    }
+    # Preserve hashes written before the optional replacement contract existed.
+    # A default create retry must continue replaying across a rolling deploy.
+    if body.replace:
+        request_payload["replace"] = True
+    return platform_request_hash(request_payload)
+
+
+async def _load_ai_provider_accept_replay(
+    db: AsyncSession,
+    *,
+    operation: str,
+    idempotency_key: str,
+    request_hash: str,
+    owner_user_id: UUID,
+) -> PlatformReplay | None:
+    existing = await lock_platform_idempotency(
+        db,
+        operation=operation,
+        idempotency_key=idempotency_key,
+    )
+    if existing is None:
+        return None
+    if existing.request_hash != request_hash or existing.owner_user_id != owner_user_id:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "Idempotency-Key was already used with a different request",
+        )
+    return read_platform_replay(existing)
+
+
+async def _accept_ai_provider(
+    db: AsyncSession,
+    auth: AuthContext,
+    body: AiProviderAcceptRequest,
+) -> AiProviderAcceptResponse:
+    provider_body = body.provider
+    _raise_if_deployment_managed_provider_id(provider_body.provider_id)
+    if provider_body.provider_id in V2_MANAGED_AI_PROVIDER_IDS:
+        provider_body = provider_body.model_copy(update={"provider_id": V2_MANAGED_AI_PROVIDER_ID})
+    oauth_provider = _validate_ai_provider_accept_contract(provider_body, body.credential)
+    errors = _validate_provider(provider_body)
+    if errors:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, {"errors": errors})
+
+    await lock_ai_provider_owner(db, auth.user_id)
+    await _validate_hosted_consumer_endpoint(
+        db,
+        owner_user_id=auth.user_id,
+        provider_id=provider_body.provider_id,
+        base_url=provider_body.base_url,
+    )
+    await _validate_runtime_env_unique(db, auth, provider_body)
+    existing = await _find_provider(
+        db,
+        auth,
+        provider_body.provider_id,
+        include_archived=True,
+    )
+    if existing is not None and existing.archived_at is None:
+        if existing.configuration_mode in {"custom", "connection"}:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT, "Edit an existing custom connection with PATCH"
+            )
+        existing_response = await _to_response(db, auth, existing)
+        can_resume = not existing_response.usable and _accept_can_resume(
+            existing,
+            body.credential,
+            oauth_provider=oauth_provider,
+        )
+        if not body.replace and not can_resume:
+            raise HTTPException(status.HTTP_409_CONFLICT, "AI Provider already exists")
+
+    previous_non_auth_signature = runtime_manifest_provider_non_auth_signature(existing)
+    provider = existing or AiProvider(
+        owner_user_id=auth.user_id,
+        provider_id=provider_body.provider_id,
+    )
+    auth_ref, auth_metadata = provider_body.auth.persistence_fields()
+    _apply_provider_body(provider, provider_body, apply_auth=False)
+    if existing is None or (
+        isinstance(body.credential, AiProviderOAuthAcceptCredential)
+        and provider_body.auth.type != existing.auth_type
+    ):
+        try:
+            await validate_prospective_bound_runtime_auth(
+                db,
+                owner_user_id=auth.user_id,
+                provider_id=provider.provider_id,
+                prospective_auth_type=provider_body.auth.type,
+            )
+        except OAuthCredentialClaimConflict as exc:
+            raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
+    if existing is None:
+        provider.auth_type = provider_body.auth.type
+        provider.auth_ref = auth_ref
+        provider.auth_metadata = auth_metadata
+    provider.activate()
+    db.add(provider)
+    # Make the provider row real inside the transaction before the credential
+    # write. A later failure must roll this flush back, never expose a half row.
+    await db.flush()
+
+    if isinstance(body.credential, AiProviderApiKeyAcceptCredential):
+        profile = str((auth_metadata or {}).get("profile") or "default")
+        transition = await transition_ai_provider_auth(
+            db,
+            owner_user_id=auth.user_id,
+            provider=provider,
+            auth_type=provider_body.auth.type,
+            auth_ref=auth_ref,
+            auth_metadata=auth_metadata,
+            credential=AuthCredentialWrite(
+                profile=profile,
+                kind="api_key",
+                plaintext=body.credential.value.get_secret_value(),
+                metadata=auth_metadata,
+            ),
+        )
+        if (
+            previous_non_auth_signature != runtime_manifest_provider_non_auth_signature(provider)
+            and not transition.manifest_event_queued
+        ):
+            await queue_provider_runtime_manifest_changed(
+                db,
+                auth.user_id,
+                provider.provider_id,
+            )
+        await db.flush()
+        await db.refresh(provider)
+        provider_response = await _to_response(db, auth, provider)
+        if not provider_response.usable:
+            raise RuntimeError("API-key AI provider accept is not usable")
+        return AiProviderReadyAcceptResponse(
+            status="ready",
+            provider=provider_response,
+        )
+
+    if oauth_provider is None:
+        raise RuntimeError("OAuth accept contract is missing its provider")
+    authorization = await _build_codex_device_authorization(
+        db=db,
+        auth=auth,
+        provider=provider,
+        oauth_provider=oauth_provider,
+    )
+    if (
+        previous_non_auth_signature != runtime_manifest_provider_non_auth_signature(provider)
+        or existing is None
+    ):
+        await queue_provider_runtime_manifest_changed(
+            db,
+            auth.user_id,
+            provider.provider_id,
+        )
+    await db.flush()
+    await db.refresh(provider)
+    provider_response = await _to_response(db, auth, provider)
+    return AiProviderOAuthPendingAcceptResponse(
+        status="pending",
+        provider=provider_response,
+        authorization=authorization,
+    )
+
+
+def _validate_ai_provider_accept_contract(
+    provider: AiProviderUpsert,
+    credential: AiProviderApiKeyAcceptCredential | AiProviderOAuthAcceptCredential,
+) -> str | None:
+    if isinstance(credential, AiProviderApiKeyAcceptCredential):
+        if provider.auth.type != "api_key" or provider.auth.source != "managed":
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_CONTENT,
+                "API-key accept requires managed api_key provider auth",
+            )
+        return None
+
+    oauth_provider = _normalize_profile(credential.provider)
+    _validate_supported_oauth_provider(oauth_provider)
+    if (
+        provider.auth.type != "agent_profile"
+        or provider.auth.tool != oauth_provider
+        or provider.auth.profile != "default"
+    ):
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_CONTENT,
+            "OAuth accept requires the default Codex agent profile",
+        )
+    return oauth_provider
+
+
+def _accept_can_resume(
+    provider: AiProvider,
+    credential: AiProviderApiKeyAcceptCredential | AiProviderOAuthAcceptCredential,
+    *,
+    oauth_provider: str | None,
+) -> bool:
+    metadata = provider.auth_metadata or {}
+    if isinstance(credential, AiProviderApiKeyAcceptCredential):
+        return provider.auth_type == "api_key" and metadata.get("source") == "managed"
+    return oauth_provider is not None and (
+        provider.auth_type == "agent_profile"
+        and metadata.get("tool") == oauth_provider
+        and str(metadata.get("profile") or "default") == "default"
+    )
+
+
+async def _get_provider_or_404_for_update(
+    db: AsyncSession,
+    auth: AuthContext,
+    provider_id: str,
+) -> AiProvider:
+    provider_ids = (
+        V2_MANAGED_AI_PROVIDER_IDS
+        if provider_id in V2_MANAGED_AI_PROVIDER_IDS
+        else frozenset({provider_id})
+    )
+    providers = (
+        (
+            await db.execute(
+                select(AiProvider)
+                .where(
+                    AiProvider.owner_user_id == auth.user_id,
+                    AiProvider.provider_id.in_(provider_ids),
+                    AiProvider.archived_at.is_(None),
+                )
+                .order_by(AiProvider.provider_id)
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    if not providers:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "AI Provider not found")
+    priority = {V2_MANAGED_AI_PROVIDER_ID: 0, provider_id: 1}
+    provider = min(
+        providers,
+        key=lambda candidate: priority.get(candidate.provider_id, 2),
+    )
+    if is_v2_deployment_managed_provider_id(provider.provider_id):
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "AI Provider not found")
+    return provider
+
+
+@router.post("/{provider_id}/auth/resolve", response_model=AiProviderAuthResolveResponse)
+async def resolve_ai_provider_auth(
+    provider_id: str,
+    body: AiProviderAuthResolveRequest,
+    auth: AuthContext = Depends(require_user_cli),
+    db: AsyncSession = Depends(get_session),
+) -> AiProviderAuthResolveResponse:
+    await lock_ai_provider_owner(db, auth.user_id)
+    provider = await _get_provider_or_404_for_update(db, auth, provider_id)
+    metadata = provider.auth_metadata or {}
+    if provider.auth_type == "api_key" and metadata.get("source") != "managed":
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "AI Provider does not use managed api_key auth",
+        )
+    profile = _normalize_profile(body.profile)
+    active_profile = _active_auth_profile(provider)
+    if active_profile is not None and profile != active_profile:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "AI Provider auth payload not found")
+    payload = await _find_auth_payload(
+        db,
+        auth,
+        provider.provider_id,
+        profile,
+        for_update=True,
+    )
+    if payload is None or payload.archived_at is not None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "AI Provider auth payload not found")
+    consumer: OAuthCredentialConsumer | None = None
+    key_environment_id = auth.api_key.environment_id if auth.api_key is not None else None
+    if key_environment_id is not None and body.environment_id is None:
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            "Agent-bound auth resolve requires an explicit runtime consumer",
+        )
+    if body.environment_id is not None and body.consumer_runtime is not None:
+        if key_environment_id is not None and key_environment_id != body.environment_id:
+            raise HTTPException(
+                status.HTTP_403_FORBIDDEN,
+                "Agent API key cannot resolve credentials for another Agent",
+            )
+        if not await environment_matches_runtime(
+            db,
+            owner_user_id=auth.user_id,
+            environment_id=body.environment_id,
+            runtime=body.consumer_runtime,
+        ):
+            raise HTTPException(
+                status.HTTP_403_FORBIDDEN,
+                "OAuth consumer does not match an owned Agent runtime",
+            )
+        if key_environment_id is not None and not await environment_binds_provider(
+            db,
+            owner_user_id=auth.user_id,
+            environment_id=body.environment_id,
+            runtime=body.consumer_runtime,
+            provider_id=provider.provider_id,
+        ):
+            raise HTTPException(
+                status.HTTP_403_FORBIDDEN,
+                "Agent is not bound to this AI Provider",
+            )
+        consumer = OAuthCredentialConsumer(body.environment_id, body.consumer_runtime)
+    if provider.auth_type in {"agent_profile", "oauth_profile"}:
+        if consumer is None:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                "OAuth auth resolve requires an explicit Agent runtime consumer",
+            )
+        previous_consumer = (
+            payload.consumer_environment_id,
+            payload.consumer_runtime,
+        )
+        try:
+            await claim_oauth_payload(db, payload=payload, consumer=consumer)
+        except OAuthCredentialClaimConflict as exc:
+            raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
+        if previous_consumer != (
+            payload.consumer_environment_id,
+            payload.consumer_runtime,
+        ):
+            await queue_environment_runtime_manifest_changed(
+                db,
+                auth.user_id,
+                consumer.environment_id,
+            )
+        plaintext = decrypt(payload.encrypted_payload, payload.nonce)
+        await db.commit()
+    else:
+        plaintext = decrypt(payload.encrypted_payload, payload.nonce)
+    if provider.auth_type == "api_key":
+        return AiProviderAuthResolveResponse(
+            provider_id=runtime_managed_provider_id(provider.provider_id),
+            auth_type="api_key",
+            value=plaintext,
+            profile=profile,
+            credential_revision=payload.credential_revision,
+        )
+    if provider.auth_type in {"agent_profile", "oauth_profile"}:
+        return AiProviderAuthResolveResponse.model_validate(
+            {
+                "provider_id": runtime_managed_provider_id(provider.provider_id),
+                "auth_type": provider.auth_type,
+                "payload": plaintext,
+                "tool": metadata.get("tool"),
+                "provider": metadata.get("provider"),
+                "profile": profile,
+                "credential_revision": payload.credential_revision,
+            }
+        )
+    raise HTTPException(
+        status.HTTP_409_CONFLICT,
+        "AI Provider auth has no managed payload",
+    )
+
+
+def _code_challenge(code_verifier: str) -> str:
+    return _base64url(hashlib.sha256(code_verifier.encode()).digest())
+
+
+def _base64url(raw: bytes) -> str:
+    return base64.urlsafe_b64encode(raw).decode().rstrip("=")
+
+
+def _oauth_authorization_code_redirect_uri(
+    *,
+    config: Mapping[str, JsonValue],
+    client_id: str,
+    requested: str | None,
+    oauth_provider: str,
+) -> str:
+    if client_id == CODEX_OAUTH_CLIENT_ID:
+        if requested is None:
+            raise HTTPException(
+                status.HTTP_503_SERVICE_UNAVAILABLE,
+                f"AI Provider OAuth config for {oauth_provider} is missing redirect_uri",
+            )
+        parsed = urlparse(requested)
+        if (
+            parsed.scheme != "http"
+            or parsed.hostname not in {"localhost", "127.0.0.1", "::1"}
+            or parsed.username is not None
+            or parsed.password is not None
+        ):
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_CONTENT,
+                "the official Codex OAuth client only supports a loopback http redirect_uri",
+            )
+        return requested
+
+    registered = _required_oauth_config(config, "redirect_uri", oauth_provider)
+    _validate_redirect_uri(registered)
+    if requested is not None and not secrets.compare_digest(requested, registered):
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_CONTENT,
+            "redirect_uri must match the server-registered OAuth callback",
+        )
+    return registered
+
+
+async def _validate_hosted_consumer_endpoint(
+    db: AsyncSession,
+    *,
+    owner_user_id: UUID,
+    provider_id: str,
+    base_url: str,
+) -> None:
+    if is_public_https_url(base_url):
+        return
+    if await provider_has_hosted_runtime_consumer(
+        db,
+        owner_user_id=owner_user_id,
+        provider_id=provider_id,
+    ):
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_CONTENT,
+            "Hosted AI Provider base_url must be a public HTTPS URL",
+        )
+
+
+async def _validate_runtime_env_unique(
+    db: AsyncSession,
+    auth: AuthContext,
+    provider: AiProviderUpsert | AiProviderResponse,
+    *,
+    exclude_provider_id: str | None = None,
+) -> None:
+    if provider.configuration_mode == "native":
+        return
+    auth_ref, _metadata = provider.auth.persistence_fields()
+    names: set[str] = (
+        {provider.runtime_env_name}
+        if provider.runtime_env_name and provider.auth.type in {"api_key", "secret_ref"}
+        else set()
+    )
+    if auth_ref is not None and auth_ref.startswith("env:"):
+        names.add(auth_ref.removeprefix("env:"))
+    effective_exclude = exclude_provider_id or provider.provider_id
+    for runtime_env_name in names:
+        await _validate_runtime_env_name_unique(
+            db,
+            auth,
+            runtime_env_name,
+            exclude_provider_id=effective_exclude,
+        )
+
+
+async def _validate_runtime_env_name_unique(
+    db: AsyncSession,
+    auth: AuthContext,
+    runtime_env_name: str | None,
+    *,
+    exclude_provider_id: str,
+) -> None:
+    if runtime_env_name is None:
+        return
+    conflicting_provider_id = await db.scalar(
+        select(AiProvider.provider_id)
+        .where(
+            AiProvider.owner_user_id == auth.user_id,
+            AiProvider.provider_id != exclude_provider_id,
+            AiProvider.managed_by == "user",
+            AiProvider.configuration_mode != "native",
+            AiProvider.archived_at.is_(None),
+            (
+                (AiProvider.runtime_env_name == runtime_env_name)
+                | (AiProvider.auth_ref == f"env:{runtime_env_name}")
+                | (AiProvider.identity_handoff["native_env_name"].astext == runtime_env_name)
+            ),
+        )
+        .limit(1)
+    )
+    if conflicting_provider_id is not None:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "runtime_env_name is already used by another AI Provider",
+        )
+
+
+async def _find_provider(
+    db: AsyncSession,
+    auth: AuthContext,
+    provider_id: str,
+    *,
+    include_archived: bool = False,
+) -> AiProvider | None:
+    provider_ids = (
+        V2_MANAGED_AI_PROVIDER_IDS
+        if provider_id in V2_MANAGED_AI_PROVIDER_IDS
+        else frozenset({provider_id})
+    )
+    stmt = select(AiProvider).where(
+        AiProvider.owner_user_id == auth.user_id,
+        AiProvider.provider_id.in_(provider_ids),
+    )
+    if not include_archived:
+        stmt = stmt.where(AiProvider.archived_at.is_(None))
+    providers = (await db.execute(stmt)).scalars().all()
+    if not providers:
+        return None
+    priority = {
+        V2_MANAGED_AI_PROVIDER_ID: 0,
+        provider_id: 1,
+    }
+    return min(providers, key=lambda provider: priority.get(provider.provider_id, 2))
+
+
+async def _get_provider_or_404(db: AsyncSession, auth: AuthContext, provider_id: str) -> AiProvider:
+    provider = await _find_provider(db, auth, provider_id)
+    if provider is None or is_v2_deployment_managed_provider_id(provider.provider_id):
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "AI Provider not found")
+    return provider
+
+
+def _raise_if_deployment_managed_provider_id(provider_id: str) -> None:
+    if is_v2_deployment_managed_provider_id(provider_id):
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "AI Provider not found")
+
+
+def _same_credential_authority(left: AiProviderAuth, right: AiProviderAuth) -> bool:
+    # API-key writes persist an explicit default profile; omitted means the same slot.
+    if left.type == "api_key" and right.type == "api_key":
+        left = left.model_copy(update={"profile": left.profile or "default"})
+        right = right.model_copy(update={"profile": right.profile or "default"})
+    return left == right
+
+
+def _apply_provider_body(
+    provider: AiProvider,
+    body: AiProviderUpsert | AiProviderResponse,
+    *,
+    apply_auth: bool = True,
+) -> None:
+    if provider.identity_handoff_pending:
+        raise HTTPException(409, "Complete the pending provider identity handoff first")
+    if (
+        provider.configuration_mode in {"connection", "custom"}
+        and body.configuration_mode != provider.configuration_mode
+    ):
+        raise HTTPException(
+            status.HTTP_409_CONFLICT, "Connection ownership cannot be replaced through upsert"
+        )
+    if (
+        provider.configuration_mode in {"connection", "custom"}
+        and body.runtime_env_name != provider.runtime_env_name
+    ):
+        raise HTTPException(409, "Connection credential environment is immutable")
+    if provider.configuration_mode in {"connection", "custom"} and not _same_credential_authority(
+        body.auth, _to_auth(provider)
+    ):
+        raise HTTPException(409, "Connection credential authority is immutable")
+    if apply_auth and provider.configuration_mode == "custom":
+        if body.models or body.auth.type != "api_key" or body.auth.source != "managed":
+            raise HTTPException(409, "Custom credential identity is immutable; use PATCH to edit")
+    provider.type = body.type
+    if body.configuration_mode == "custom" and provider.configuration_mode not in {None, "custom"}:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT, "Transfer existing model ownership separately"
+        )
+    provider.configuration_mode = body.configuration_mode or "catalog"
+    provider.native_provider = body.native_provider
+    provider.native_variant = body.native_variant
+    provider.label = body.label
+    provider.base_url = body.base_url
+    provider.api_mode = managed_provider_api_mode(body.provider_id) or body.api_mode
+    provider.capabilities = body.capabilities
+    if body.configuration_mode not in {"connection", "custom"}:
+        provider.models = _provider_models_payload(body.models)
+    provider.managed_by = body.managed_by
+    provider.runtime_env_name = body.runtime_env_name
+    if apply_auth:
+        provider.auth_type = body.auth.type
+        provider.auth_ref, provider.auth_metadata = body.auth.persistence_fields()
+
+
+def _provider_models_payload(
+    models: list[AiProviderModel] | None,
+) -> list[dict[str, JsonValue]] | None:
+    if models is None:
+        return None
+    return [model.model_dump(mode="json", exclude_none=True) for model in models]
+
+
+def _to_auth(provider: AiProvider) -> AiProviderAuth:
+    try:
+        return ai_provider_auth_from_persistence(
+            provider.auth_type,
+            provider.auth_ref,
+            provider.auth_metadata,
+        )
+    except (ValidationError, ValueError) as exc:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "Stored AI provider auth metadata is invalid",
+        ) from exc
+
+
+async def _to_response(
+    db: AsyncSession,
+    auth: AuthContext,
+    provider: AiProvider,
+) -> AiProviderResponse:
+    return (await _to_responses(db, auth, [provider]))[0]
+
+
+async def _to_responses(
+    db: AsyncSession,
+    auth: AuthContext,
+    providers: list[AiProvider],
+) -> list[AiProviderResponse]:
+    payload_provider_ids = {
+        provider.provider_id for provider in providers if _active_auth_profile(provider) is not None
+    }
+    payload_consumers: dict[tuple[str, str, str], AiProviderConsumer | None] = {}
+    if payload_provider_ids:
+        rows = (
+            await db.execute(
+                select(
+                    AiProviderAuthPayload.provider_id,
+                    AiProviderAuthPayload.auth_profile,
+                    AiProviderAuthPayload.kind,
+                    AiProviderAuthPayload.consumer_environment_id,
+                    AiProviderAuthPayload.consumer_runtime,
+                ).where(
+                    AiProviderAuthPayload.owner_user_id == auth.user_id,
+                    AiProviderAuthPayload.provider_id.in_(payload_provider_ids),
+                    AiProviderAuthPayload.archived_at.is_(None),
+                )
+            )
+        ).all()
+        for row in rows:
+            key = (row.provider_id, row.auth_profile, row.kind)
+            payload_consumers[key] = (
+                AiProviderConsumer(
+                    environment_id=row.consumer_environment_id,
+                    runtime=row.consumer_runtime,
+                )
+                if row.consumer_environment_id is not None and row.consumer_runtime is not None
+                else None
+            )
+    payload_keys = set(payload_consumers)
+    return [
+        _build_response(
+            provider,
+            credential_material=_provider_credential_material(provider, payload_keys),
+            consumer=_provider_consumer(provider, payload_consumers),
+        )
+        for provider in providers
+    ]
+
+
+def _provider_credential_material(
+    provider: AiProvider,
+    payload_keys: set[tuple[str, str, str]],
+) -> CredentialMaterialState:
+    active_profile = _active_auth_profile(provider)
+    if active_profile is not None:
+        if (provider.provider_id, active_profile, provider.auth_type) in payload_keys:
+            return "available"
+        return "missing"
+    if provider.auth_type == "none":
+        return "not_required"
+    if provider.auth_type == "secret_ref":
+        return "referenced" if provider.auth_ref else "missing"
+    if provider.auth_type == "api_key":
+        source = (provider.auth_metadata or {}).get("source")
+        if source in {"env", "vault"} and provider.auth_ref:
+            return "referenced"
+    return "missing"
+
+
+def _provider_consumer(
+    provider: AiProvider,
+    payload_consumers: dict[tuple[str, str, str], AiProviderConsumer | None],
+) -> AiProviderConsumer | None:
+    active_profile = _active_auth_profile(provider)
+    if active_profile is None:
+        return None
+    return payload_consumers.get((provider.provider_id, active_profile, provider.auth_type))
+
+
+def _build_response(
+    provider: AiProvider,
+    *,
+    credential_material: CredentialMaterialState,
+    consumer: AiProviderConsumer | None = None,
+) -> AiProviderResponse:
+    api_mode = managed_provider_api_mode(provider.provider_id) or provider.api_mode
+    readiness = provider_readiness(
+        _provider_capability_input(provider, effective_api_mode=api_mode),
+        credential_material=credential_material,
+    )
+    return AiProviderResponse.model_validate(
+        {
+            "id": str(provider.id),
+            "provider_id": runtime_managed_provider_id(provider.provider_id),
+            "scope": AI_PROVIDER_SCOPE,
+            "type": provider.type,
+            "configuration_mode": provider.configuration_mode or "catalog",
+            "native_provider": provider.native_provider,
+            "native_variant": provider.native_variant,
+            "label": provider.label,
+            "base_url": provider.base_url,
+            "api_mode": api_mode,
+            "auth": _to_auth(provider),
+            "credential_authority": "native" if provider.native_credential_authority else None,
+            "usable": credential_material != "missing",
+            "readiness": readiness,
+            "consumer": consumer,
+            "managed_by": provider.managed_by,
+            "runtime_env_name": provider.runtime_env_name,
+            "capabilities": provider.capabilities,
+            "models": None if provider.configuration_mode == "custom" else provider.models,
+            "created_at": provider.created_at,
+            "updated_at": provider.updated_at,
+        }
+    )
+
+
+def _provider_capability_input(
+    provider: AiProvider | AiProviderUpsert | AiProviderResponse,
+    *,
+    effective_api_mode: str | None = None,
+) -> AiProviderCapabilityInput:
+    if isinstance(provider, AiProvider):
+        metadata = provider.auth_metadata or {}
+        return AiProviderCapabilityInput(
+            provider_type=provider.type,
+            api_mode=effective_api_mode or provider.api_mode,
+            base_url=provider.base_url,
+            auth_type=provider.auth_type,
+            auth_source=(str(metadata.get("source")) if metadata.get("source") else None),
+            auth_tool=str(metadata.get("tool")) if metadata.get("tool") else None,
+            auth_ref=provider.auth_ref,
+            runtime_env_name=provider.runtime_env_name,
+            configuration_mode=provider.configuration_mode or "catalog",
+            native_provider=provider.native_provider,
+            native_variant=provider.native_variant,
+        )
+    auth_ref, metadata = provider.auth.persistence_fields()
+    return AiProviderCapabilityInput(
+        provider_type=provider.type,
+        api_mode=effective_api_mode or provider.api_mode,
+        base_url=provider.base_url,
+        auth_type=provider.auth.type,
+        auth_source=(str(metadata.get("source")) if metadata and metadata.get("source") else None),
+        auth_tool=(str(metadata.get("tool")) if metadata and metadata.get("tool") else None),
+        auth_ref=auth_ref,
+        runtime_env_name=provider.runtime_env_name,
+        configuration_mode=provider.configuration_mode or "catalog",
+        native_provider=provider.native_provider,
+        native_variant=provider.native_variant,
+    )
+
+
+def _connection_test_model(
+    provider: AiProvider | AiProviderUpsert,
+    requested_model: str | None,
+) -> tuple[str | None, str | None]:
+    models = provider.models or []
+    model_id = requested_model.strip() if requested_model is not None else None
+    if not model_id:
+        model_id = next((_model_id(model) for model in models if _model_id(model)), None)
+    if model_id is None:
+        return None, None
+    model_api_mode = next(
+        (
+            _model_api_mode(model)
+            for model in models
+            if _model_id(model) == model_id and _model_api_mode(model) is not None
+        ),
+        None,
+    )
+    return model_id, model_api_mode
+
+
+def _model_id(model: AiProviderModel | Mapping[str, JsonValue]) -> str:
+    value = model.id if isinstance(model, AiProviderModel) else model.get("id")
+    return value.strip() if isinstance(value, str) else ""
+
+
+def _model_api_mode(model: AiProviderModel | Mapping[str, JsonValue]) -> str | None:
+    value = model.api_mode if isinstance(model, AiProviderModel) else model.get("api_mode")
+    return value if isinstance(value, str) else None
+
+
+def _connection_test_failure(
+    provider: AiProviderUpsert,
+    *,
+    credential_material: CredentialMaterialState,
+    category: ConnectionErrorCategory,
+    code: str,
+    message: str,
+    retryable: bool,
+) -> AiProviderConnectionTestResponse:
+    return _connection_test_failure_with_readiness(
+        provider_readiness(
+            _provider_capability_input(provider),
+            credential_material=credential_material,
+            endpoint_reachability="not_tested",
+            inference_verification="not_tested",
+        ),
+        category=category,
+        code=code,
+        message=message,
+        retryable=retryable,
+    )
+
+
+def _connection_test_failure_with_readiness(
+    readiness: AiProviderReadiness,
+    *,
+    category: ConnectionErrorCategory,
+    code: str,
+    message: str,
+    retryable: bool,
+) -> AiProviderConnectionTestResponse:
+    return AiProviderConnectionTestResponse(
+        ok=False,
+        readiness=readiness,
+        error=AiProviderConnectionError(
+            category=category,
+            code=code,
+            message=message,
+            retryable=retryable,
+        ),
+    )
+
+
+def _validate_provider(body: AiProviderUpsert | AiProviderResponse) -> list[str]:
+    errors: list[str] = []
+    if body.configuration_mode in {"connection", "custom"} and (
+        body.managed_by != "user"
+        or body.auth.type not in {"api_key", "secret_ref"}
+        or not body.runtime_env_name
+    ):
+        errors.append("connection management requires a user API-key connection")
+    if body.configuration_mode == "custom" and (not body.api_mode or body.models):
+        errors.append("custom providers require an explicit API format without model metadata")
+    if body.configuration_mode != "native" and (body.native_provider or body.native_variant):
+        errors.append("catalog configuration cannot include native provider identity")
+    if body.configuration_mode == "native":
+        is_codex = body.auth.type == "agent_profile" and body.auth.tool == "codex"
+        if (body.native_provider == "openai-codex") != is_codex:
+            errors.append("native Codex credentials require Codex OAuth auth")
+    errors.extend(_validate_base_url(body.base_url, body.auth))
+    if body.runtime_env_name is not None and not _is_runtime_env_name(body.runtime_env_name):
+        errors.append("runtime_env_name must be an uppercase environment variable name")
+    if body.configuration_mode not in {"connection", "custom"}:
+        errors.extend(_validate_provider_models(body))
+    allowed_modes = ALLOWED_API_MODES[body.type]
+    if (
+        body.configuration_mode != "custom"
+        and body.api_mode is not None
+        and body.api_mode not in allowed_modes
+    ):
+        errors.append(f"type {body.type} is incompatible with api_mode {body.api_mode}")
+    if body.type == "custom_openai_compatible" and body.api_mode is None:
+        errors.append("custom_openai_compatible requires api_mode")
+    errors.extend(_validate_managed_provider_contract(body))
+    errors.extend(_validate_auth_business_rules(body.auth))
+    auth_ref, _auth_metadata = body.auth.persistence_fields()
+    if (
+        auth_ref is not None
+        and auth_ref.startswith("env:")
+        and body.runtime_env_name is not None
+        and body.runtime_env_name != auth_ref.removeprefix("env:")
+    ):
+        errors.append("runtime_env_name must match the env auth ref")
+    return errors
+
+
+def _validate_provider_models(body: AiProviderUpsert | AiProviderResponse) -> list[str]:
+    if not body.models:
+        return []
+    errors: list[str] = []
+    seen: set[str] = set()
+    for model in body.models:
+        model_id = model.id.strip()
+        if not model_id:
+            errors.append("models must include non-empty model ids")
+            continue
+        if model_id in seen:
+            errors.append(f"duplicate model id: {model_id}")
+        seen.add(model_id)
+        if model_id.startswith("openai-codex/") and body.provider_id not in MANAGED_AI_PROVIDER_IDS:
+            errors.append(
+                "model ids must use the OpenAI model id without the legacy openai-codex prefix"
+            )
+        if model.api_mode is not None and model.api_mode not in ALLOWED_API_MODES[body.type]:
+            errors.append(f"model {model_id} api_mode is incompatible with type {body.type}")
+    return errors
+
+
+def _validate_managed_provider_contract(body: AiProviderUpsert | AiProviderResponse) -> list[str]:
+    is_managed_contract = body.provider_id in MANAGED_AI_PROVIDER_IDS or body.managed_by == "clawdi"
+    if not is_managed_contract:
+        return []
+
+    errors: list[str] = []
+    accepted_api_modes = managed_provider_accepted_api_modes(body.provider_id)
+    if accepted_api_modes is None:
+        errors.append(f"managed Clawdi provider must use provider_id {V2_MANAGED_AI_PROVIDER_ID}")
+    if body.managed_by != "clawdi":
+        errors.append("managed Clawdi provider must be managed_by clawdi")
+    if body.type != "custom_openai_compatible":
+        errors.append("managed Clawdi provider must use custom_openai_compatible")
+    if accepted_api_modes is not None and body.api_mode not in accepted_api_modes:
+        errors.append(
+            "managed Clawdi provider must use api_mode " + " or ".join(accepted_api_modes)
+        )
+    if body.auth.type != "api_key" or body.auth.source != "managed":
+        errors.append("managed Clawdi provider must use managed api_key auth")
+    expected_runtime_env_name = managed_provider_runtime_env_name(body.provider_id)
+    if expected_runtime_env_name is not None and body.runtime_env_name != expected_runtime_env_name:
+        errors.append(
+            f"managed Clawdi provider must use runtime_env_name {expected_runtime_env_name}"
+        )
+    return errors
+
+
+def _validate_auth_business_rules(auth: AiProviderAuth) -> list[str]:
+    if auth.type == "agent_profile" and auth.tool not in SUPPORTED_AGENT_PROFILE_TOOLS:
+        return ["agent_profile auth currently supports codex only"]
+    return []
+
+
+def _validate_supported_agent_profile_tool(tool: str) -> None:
+    if tool in SUPPORTED_AGENT_PROFILE_TOOLS:
+        return
+    raise HTTPException(
+        status.HTTP_422_UNPROCESSABLE_CONTENT,
+        "AI Provider auth profiles currently support Codex only",
+    )
+
+
+def _validate_supported_oauth_provider(oauth_provider: str) -> None:
+    if oauth_provider in SUPPORTED_OAUTH_PROVIDERS:
+        return
+    raise HTTPException(
+        status.HTTP_422_UNPROCESSABLE_CONTENT,
+        "AI Provider OAuth currently supports Codex only",
+    )
+
+
+def _validate_patch_nulls(update: Mapping[str, object]) -> list[str]:
+    errors: list[str] = []
+    for field in ("type", "base_url", "auth", "managed_by", "configuration_mode"):
+        if field in update and update[field] is None:
+            errors.append(f"{field} cannot be null")
+    return errors
+
+
+def _validate_base_url(base_url: str, auth: AiProviderAuth) -> list[str]:
+    errors: list[str] = []
+    from urllib.parse import urlparse
+
+    try:
+        parsed = urlparse(base_url)
+    except ValueError:
+        return ["base_url must be an http(s) URL"]
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return ["base_url must be an http(s) URL"]
+    if auth.type != "none":
+        return errors
+    hostname = parsed.hostname or ""
+    if is_private_hostname(hostname):
+        return errors
+    errors.append("none auth is only allowed for loopback or private-network base_url")
+    return errors
+
+
+def _compact(data: dict[str, JsonValue]) -> dict[str, JsonValue] | None:
+    compacted: dict[str, JsonValue] = {
+        key: value for key, value in data.items() if value is not None
+    }
+    return compacted or None
+
+
+async def _find_auth_payload(
+    db: AsyncSession,
+    auth: AuthContext,
+    provider_id: str,
+    profile: str,
+    *,
+    for_update: bool = False,
+) -> AiProviderAuthPayload | None:
+    statement = select(AiProviderAuthPayload).where(
+        AiProviderAuthPayload.owner_user_id == auth.user_id,
+        AiProviderAuthPayload.provider_id == provider_id,
+        AiProviderAuthPayload.auth_profile == profile,
+    )
+    if for_update:
+        statement = statement.with_for_update().execution_options(populate_existing=True)
+    return (await db.execute(statement)).scalar_one_or_none()
+
+
+def _active_auth_profile(provider: AiProvider) -> str | None:
+    metadata = provider.auth_metadata or {}
+    if provider.auth_type == "api_key" and metadata.get("source") == "managed":
+        return str(metadata.get("profile") or "default")
+    if provider.auth_type in {"agent_profile", "oauth_profile"}:
+        return str(metadata.get("profile") or "default")
+    return None
+
+
+def _normalize_profile(input: str) -> str:
+    profile = input.strip().lower()
+    if not re.fullmatch(r"[a-z][a-z0-9._-]{0,119}", profile):
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, "invalid profile")
+    return profile
+
+
+def _is_runtime_env_name(input: str) -> bool:
+    return re.fullmatch(r"[A-Z][A-Z0-9_]{0,127}", input) is not None

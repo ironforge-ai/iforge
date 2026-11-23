@@ -1,0 +1,138 @@
+"""ApiKey minting service.
+
+Single source of truth for ApiKey creation. The dashboard route
+`POST /v1/auth/keys` walks through `mint_api_key()`. Deploy-key
+flow (where the dashboard mints a key for an externally-hosted
+agent pod and hands it to clawdi.ai's control plane) uses the
+SAME route, with `environment_id` set on the request body —
+gated by the user's Clerk JWT, no backend-to-backend secrets.
+
+Deploy-keys differ from interactive keys only in their
+`environment_id` column. Default permissions are full account access
+just like a self-installed clawdi key; the dashboard can pass an
+explicit narrower API permission `scopes` list per use-case if it
+wants.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import secrets
+from dataclasses import dataclass
+from uuid import UUID
+
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.models.api_key import ApiKey
+from app.models.runtime_observation import (
+    RUNTIME_ENVIRONMENT_ACTIVE,
+    V2RuntimeEnvironmentFence,
+)
+from app.models.session import AgentEnvironment
+from app.services.principal_lifecycle import assert_user_authority_active
+
+
+@dataclass
+class MintedKey:
+    """Result of `mint_api_key()`. The raw key is shown once and
+    discarded — only the hash lives in the DB."""
+
+    api_key: ApiKey
+    raw_key: str
+
+
+def _generate() -> tuple[str, str, str]:
+    """Returns (raw_key, key_hash, key_prefix)."""
+    raw = "clawdi_" + secrets.token_urlsafe(32)
+    key_hash = hashlib.sha256(raw.encode()).hexdigest()
+    key_prefix = raw[:16]
+    return raw, key_hash, key_prefix
+
+
+async def mint_api_key(
+    db: AsyncSession,
+    *,
+    user_id: UUID,
+    label: str,
+    scopes: list[str] | None = None,
+    environment_id: UUID | None = None,
+    runtime_deployment_id: str | None = None,
+    managed: bool = False,
+    commit: bool = True,
+) -> MintedKey:
+    """Create a new ApiKey row.
+
+    `scopes=None` means full account access — the default for both
+    interactive keys (`clawdi auth login`) and deploy keys minted
+    by the dashboard with `environment_id` set. `scopes=[...]`
+    narrows API permissions on purpose if a caller wants a tighter
+    blast radius; the route layer doesn't impose narrowing for deploy
+    keys because the agent must do whatever the user does
+    (sessions push, skills writeback, memories update, vault
+    resolve, MCP bridge).
+
+    `environment_id` binds the key to a single AgentEnvironment.
+    A leaked deploy-key from pod A then can't write into pod B's
+    resources on the same account — narrows the blast radius.
+
+    `runtime_deployment_id` is the immutable strict-v2 authority. It is
+    accepted only for a managed environment-bound key whose pre-provisioned
+    fence matches the same owner and deployment in this transaction.
+    """
+    await assert_user_authority_active(db, user_id)
+
+    # Defense-in-depth: every route caller already checks env
+    # ownership before calling this service, but the service
+    # itself enforces it too. A future caller that forgets the
+    # check (or a refactor that drops it) can't accidentally
+    # mint a key bound to someone else's env. Cheap one-row
+    # SELECT compared to the cost of cross-tenant credentials.
+    if environment_id is not None:
+        owner_check = await db.execute(
+            select(AgentEnvironment.id).where(
+                AgentEnvironment.id == environment_id,
+                AgentEnvironment.user_id == user_id,
+                AgentEnvironment.archived_at.is_(None),
+            )
+        )
+        if owner_check.scalar_one_or_none() is None:
+            raise ValueError(
+                f"environment {environment_id} is not owned by user {user_id}; "
+                "refusing to mint cross-tenant deploy key"
+            )
+    if runtime_deployment_id is not None:
+        if not managed or environment_id is None:
+            raise ValueError("runtime_deployment_id requires a managed environment-bound API key")
+        fence = (
+            await db.execute(
+                select(V2RuntimeEnvironmentFence).where(
+                    V2RuntimeEnvironmentFence.environment_id == environment_id,
+                    V2RuntimeEnvironmentFence.owner_id == user_id,
+                    V2RuntimeEnvironmentFence.deployment_id == runtime_deployment_id,
+                    V2RuntimeEnvironmentFence.state == RUNTIME_ENVIRONMENT_ACTIVE,
+                )
+            )
+        ).scalar_one_or_none()
+        if fence is None:
+            raise ValueError(
+                "runtime deployment credential requires a matching active environment fence"
+            )
+    raw, key_hash, key_prefix = _generate()
+    api_key = ApiKey(
+        user_id=user_id,
+        key_hash=key_hash,
+        key_prefix=key_prefix,
+        label=label,
+        scopes=scopes,
+        environment_id=environment_id,
+        runtime_deployment_id=runtime_deployment_id,
+        managed=managed,
+    )
+    db.add(api_key)
+    if commit:
+        await db.commit()
+    else:
+        await db.flush()
+    await db.refresh(api_key)
+    return MintedKey(api_key=api_key, raw_key=raw)

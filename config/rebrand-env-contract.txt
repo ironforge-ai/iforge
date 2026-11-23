@@ -1,0 +1,197 @@
+# The public environment contract -- phase 03.1 (clawdi -> iforge), plan 06.
+#
+# GENERATED ONCE from the pre-rename tree, then FROZEN. After plan 06 lands, the seven
+# membership sources below no longer carry the old spellings, so regenerating would find
+# nothing: this file IS the contract from here on, the same authority idiom as
+# config/postgres-image.txt.
+#
+# GRAMMAR: one `IFORGE_<NAME>=CLAWDI_<NAME>` pair per line, sorted. Blank lines and lines
+# whose first character is `#` are skipped.
+#
+# `IFORGE_<NAME>` is the ONLY spelling a user may set (D-05a). `CLAWDI_<NAME>` is the
+# internal register the alias copies into; it is never documented and never read from the
+# user. Both implementations of the boundary are asserted equal to this file by tests:
+#   packages/cli/src/lib/brand-env.ts   (brand-env.test.ts, contract-parity test)
+#   backend/app/core/brand_env.py       (backend/tests/test_brand_env.py, parity test)
+#
+# MEMBERSHIP RULE (D-05a in machine form). A `CLAWDI_<NAME>` is public -- and therefore has a
+# line here -- if and only if it appeared in at least one of:
+#   1. any `*.env.example`
+#   2. any `docker-compose*.yml`
+#   3. any `config/*.yml`
+#   4. anything under `deploy/**`
+#   5. `install.sh`
+#   6. the `Environment:` block of `addHelpText` in `packages/cli/src/index.ts`
+#   7. any `*.md` outside `.planning/`
+#
+# EXCLUSIONS applied to that union, each with its reason:
+#   - `VITE_CLAWDI_*` (4 keys). Vite substitutes `import.meta.env.X` at build time, so no
+#     runtime alias can reach them. Plan 07 owns all four keys and all their read sites, and
+#     records the four pairs in the WEB BUILD-TIME KEYS section at the foot of this file --
+#     fenced behind `#` so neither alias parser can pick them up.
+#   - the four dynamic prefixes `CLAWDI_`, `CLAWDI_PROVIDER_`, `CLAWDI_EGRESS_` and
+#     `CLAWDI_CHANNEL_`. These construct variable names at runtime; they are not variables.
+#   - `CLAWDI_HOME` (D-07 / X-1) and `CLAWDI_RUNTIME_USER` (D-07 / X-4). Both are durable
+#     entries in config/rebrand-allowlist.txt: the `~/.clawdi` state root and the runtime OS
+#     user are a migration, not a sweep, and are deferred out of this phase.
+#   - `CLAWDI_WA_EGRESS`. Measured, not assumed: `config/deploy.yml:168` reads
+#     `chain=CLAWDI_WA_EGRESS` -- it is the NAME OF AN IPTABLES CHAIN created in the host's
+#     OUTPUT table and asserted by `scripts/deploy-whatsapp-sidecar.sh:196-198`, not an
+#     environment variable. It entered the candidate union only because membership source 3
+#     is a file-level grep. Renaming it would orphan a live chain.
+#   - the test-runner plumbing under `scripts/`: `CLAWDI_REPO_SOURCE`, `CLAWDI_TEST_WORKDIR`,
+#     `CLAWDI_TEST_RUNNER_SKIP_BUILD`, `CLAWDI_TEST_COMPOSE_PROJECT_NAME` and
+#     `CLAWDI_TEST_DB_WAIT_SECONDS`. Recorded by plan 08 as an EXCLUSION rather than left as
+#     an omission (WINDOWS #29), because `scripts/` sits outside the residual scanner's
+#     pathspec, so a green scan says nothing about it and the completeness claim above needed
+#     backing. None appears in any of the seven membership sources: `scripts/test.sh` sets
+#     them for itself and for the container it launches, and no user sets one. They are the
+#     same C-13 internal-plumbing class as `CLAWDI_NATIVE_BINARY`, which the allowlist already
+#     names. `scripts/check_rebrand_residual.py` records the same decision in machine form, in
+#     its `OUT_OF_SCOPE` entry for `scripts`.
+#
+# MEASURED: the union across the seven sources was 47 tokens; 3 exclusions leave 44 pairs.
+# The repository carries 157 distinct non-VITE `CLAWDI_*` tokens in total, so the public
+# contract is 44/157 (28%). The remaining 113 are internal process-to-process plumbing that
+# stays upstream-aligned under D-01, and are NOT listed here.
+#
+# ADDED AFTER THE FREEZE -- one pair, phase 03.1 gap-closure plan 16 (WINDOWS #41):
+#   IFORGE_STATE_DIR -> CLAWDI_STATE_DIR
+# The arrow is deliberate, not decoration. `test_the_migration_runbook_still_matches_the_env_contract`
+# strips a leading `#` before matching, so it counts commented `<public>=<internal>` lines too --
+# that is exactly how the four VITE_ keys at the foot of this file are counted. Writing this note
+# with an `=` would make the file yield a spurious extra pair.
+#
+# ADDED AFTER THE FREEZE AND RETIRED -- one pair, phase 06.1 (upstream sync step 1, Clawdi #973):
+#   IFORGE_AI_API_KEY -> CLAWDI_AI_API_KEY
+# 06.1-03 added it when the step-1 merge brought upstream's `CLAWDI_AI_API_KEY` into the docs.
+# 06.1-04 removed it on user directive (2026-09-30, no Clawdi-name aliases): `CLAWDI_AI_API_KEY`
+# is not a variable a user sets. It is the reserved placeholder NAME the runtime writes into an
+# agent's own configuration, an upstream wire value (config/rebrand-allowlist.txt, C-7), so the
+# docs name it as it is and nothing aliases it.
+#
+# ADDED AFTER THE FREEZE -- two pairs, phase 06.1 (upstream sync step 4, 06.1-11, R9):
+#   IFORGE_CLOUD_WORKLOAD_SIGNING_PRIVATE_KEY -> CLAWDI_CLOUD_WORKLOAD_SIGNING_PRIVATE_KEY
+#   IFORGE_OPENCLAW_HOSTED_SOURCE -> CLAWDI_OPENCLAW_HOSTED_SOURCE
+# The step-4 merge (Clawdi #1530 and the OpenClaw native harness) brought both names into
+# `*.md` outside `.planning/` (docs/ai-providers.md, docs/managed-runtime.md), which is
+# MEMBERSHIP RULE source 7, so each gets its pair and the docs name only the IFORGE_ spelling.
+# Neither is read by name by the CLI or backend today: the workload signer resolves whatever
+# `env://` name PLATFORM_WORKLOAD_SIGNING_KEY_REFS names, and scripts/test-openclaw-native.sh
+# (outside the alias boundary) reads IFORGE_OPENCLAW_HOSTED_SOURCE directly. The pairs make the
+# exclusive boundary refuse a user-set internal spelling. The file now carries 47 pairs.
+#
+# ADDED AFTER THE FREEZE -- six pairs, phase 06.1 (06.1-14, D-23: the desktop app's full rebrand):
+#   IFORGE_DESKTOP_ARCH -> CLAWDI_DESKTOP_ARCH
+#   IFORGE_DESKTOP_UPDATE_CHANNEL -> CLAWDI_DESKTOP_UPDATE_CHANNEL
+#   IFORGE_DESKTOP_UPDATE_FEED_URL -> CLAWDI_DESKTOP_UPDATE_FEED_URL
+#   IFORGE_DESKTOP_VERSION -> CLAWDI_DESKTOP_VERSION
+#   IFORGE_WINDOWS_PUBLISHER -> CLAWDI_WINDOWS_PUBLISHER
+#   IFORGE_WINDOWS_TASK_TEST -> CLAWDI_WINDOWS_TASK_TEST
+# The desktop app (apps/desktop, upstream #1289) documents these six in its README, which is
+# MEMBERSHIP RULE source 7. No iforge build ever read the old spellings, so the pairs retire
+# nothing: they give the desktop's release boundary, apps/desktop/src/iforge-brand-env.ts, one
+# authority to answer to (its test asserts it equals the IFORGE_DESKTOP_* and IFORGE_WINDOWS_*
+# lines here), and they make the CLI, backend and sidecar boundaries refuse a user-set internal
+# spelling of them like any other member. The desktop's other CLAWDI_DESKTOP_* names
+# (CLAWDI_DESKTOP_CLI, CLAWDI_DESKTOP_RUNTIME, CLAWDI_DESKTOP_SMOKE_*) are internal dev, runtime
+# and test plumbing that no user sets, so they are not members. The file now carries 53 pairs.
+#
+# The MEASURED paragraph above is left as it was written, because it records what the ONE-TIME
+# generation actually found; correcting it in place would erase that. Read it together with this
+# note: the union was 47 tokens and 3 exclusions left 44 pairs, and the file now carries 45
+# (one pair added by plan 16; the 06.1 pair above was added and then retired).
+#
+# `CLAWDI_STATE_DIR` satisfies MEMBERSHIP RULE source 6 and has since before the freeze: an
+# `Environment:` help block prints it to the user as a name they may set. Source 6 is worded
+# `packages/cli/src/index.ts`, but the CLI has TWO such `addHelpText` blocks -- measured:
+# `packages/cli/src/index.ts:76` and `packages/cli/src/commands/serve-cli.ts:74` -- and the serve
+# state directory is documented in the second one. Naming a single file is what made the one-time
+# generation's source-6 read miss it. Its absence was therefore a GENERATION MISS, not a decision
+# to exclude it, and adding it applies the membership rule rather than widening it -- which is why
+# exactly one pair was added and no second candidate was accepted.
+#
+# Read source 6 as "the `Environment:` block of any `addHelpText` under packages/cli/src". Plan 10
+# rewrites the serve-cli block to name `IFORGE_STATE_DIR`; this line is what makes that name exist.
+#
+# It is NOT the `CLAWDI_HOME` exclusion by another name. `CLAWDI_HOME` is the `~/.clawdi` state
+# ROOT, deferred out of this phase as a migration (D-07 / X-1). `CLAWDI_STATE_DIR` is a serve-state
+# redirect the daemon reads at `packages/cli/src/serve/paths.ts`; renaming the public spelling
+# moves no directory and migrates nothing on disk.
+IFORGE_AGENT_TYPE=CLAWDI_AGENT_TYPE
+IFORGE_API_URL=CLAWDI_API_URL
+IFORGE_AUTH_TOKEN=CLAWDI_AUTH_TOKEN
+IFORGE_AUTH_TOKEN_ORIGIN=CLAWDI_AUTH_TOKEN_ORIGIN
+IFORGE_BACKEND_IMAGE=CLAWDI_BACKEND_IMAGE
+IFORGE_BACKEND_IMAGE_TAG=CLAWDI_BACKEND_IMAGE_TAG
+IFORGE_CHANNEL=CLAWDI_CHANNEL
+IFORGE_CLOUD_ADMIN_API_KEY=CLAWDI_CLOUD_ADMIN_API_KEY
+IFORGE_CLOUD_WORKLOAD_SIGNING_PRIVATE_KEY=CLAWDI_CLOUD_WORKLOAD_SIGNING_PRIVATE_KEY
+IFORGE_DAEMON_RPC_ALLOW_REMOTE=CLAWDI_DAEMON_RPC_ALLOW_REMOTE
+IFORGE_DAEMON_RPC_HOST=CLAWDI_DAEMON_RPC_HOST
+IFORGE_DAEMON_RPC_PORT=CLAWDI_DAEMON_RPC_PORT
+IFORGE_DAEMON_RPC_TOKEN=CLAWDI_DAEMON_RPC_TOKEN
+IFORGE_DEBUG=CLAWDI_DEBUG
+IFORGE_DEPLOY_API_URL=CLAWDI_DEPLOY_API_URL
+IFORGE_DESKTOP_ARCH=CLAWDI_DESKTOP_ARCH
+IFORGE_DESKTOP_UPDATE_CHANNEL=CLAWDI_DESKTOP_UPDATE_CHANNEL
+IFORGE_DESKTOP_UPDATE_FEED_URL=CLAWDI_DESKTOP_UPDATE_FEED_URL
+IFORGE_DESKTOP_VERSION=CLAWDI_DESKTOP_VERSION
+IFORGE_EGRESS_GID=CLAWDI_EGRESS_GID
+IFORGE_EGRESS_UID=CLAWDI_EGRESS_UID
+IFORGE_ENVIRONMENT_ID=CLAWDI_ENVIRONMENT_ID
+IFORGE_INSTALL_PREFIX=CLAWDI_INSTALL_PREFIX
+IFORGE_NO_AUTO_UPDATE=CLAWDI_NO_AUTO_UPDATE
+IFORGE_NO_UPDATE_CHECK=CLAWDI_NO_UPDATE_CHECK
+IFORGE_OPENCLAW_HOSTED_SOURCE=CLAWDI_OPENCLAW_HOSTED_SOURCE
+IFORGE_PROCESS_ROLE=CLAWDI_PROCESS_ROLE
+IFORGE_RUN_DIR=CLAWDI_RUN_DIR
+IFORGE_RUNTIME_GID=CLAWDI_RUNTIME_GID
+IFORGE_RUNTIME_HOME=CLAWDI_RUNTIME_HOME
+IFORGE_RUNTIME_MODE=CLAWDI_RUNTIME_MODE
+IFORGE_RUNTIME_UID=CLAWDI_RUNTIME_UID
+IFORGE_SECRET_EXPORT_PASSPHRASE=CLAWDI_SECRET_EXPORT_PASSPHRASE
+IFORGE_SERVE_DEBUG=CLAWDI_SERVE_DEBUG
+IFORGE_SERVE_MODE=CLAWDI_SERVE_MODE
+IFORGE_STATE_DIR=CLAWDI_STATE_DIR
+IFORGE_SYSTEMD_APPLY=CLAWDI_SYSTEMD_APPLY
+IFORGE_TEST_POSTGRES_CPUS=CLAWDI_TEST_POSTGRES_CPUS
+IFORGE_TEST_POSTGRES_MEMORY_LIMIT=CLAWDI_TEST_POSTGRES_MEMORY_LIMIT
+IFORGE_TEST_POSTGRES_PIDS_LIMIT=CLAWDI_TEST_POSTGRES_PIDS_LIMIT
+IFORGE_TEST_RUNNER_CPUS=CLAWDI_TEST_RUNNER_CPUS
+IFORGE_TEST_RUNNER_MEMORY_LIMIT=CLAWDI_TEST_RUNNER_MEMORY_LIMIT
+IFORGE_TEST_RUNNER_PIDS_LIMIT=CLAWDI_TEST_RUNNER_PIDS_LIMIT
+IFORGE_VERSION=CLAWDI_VERSION
+IFORGE_WA_NETWORK_NAMESPACE_MARKER=CLAWDI_WA_NETWORK_NAMESPACE_MARKER
+IFORGE_WA_SIDECAR_LOG_LEVEL=CLAWDI_WA_SIDECAR_LOG_LEVEL
+IFORGE_WA_SIDECAR_SOCKET_PATH=CLAWDI_WA_SIDECAR_SOCKET_PATH
+IFORGE_WA_SIDECAR_STATE_ROOT=CLAWDI_WA_SIDECAR_STATE_ROOT
+IFORGE_WA_WEBSOCKET_URL=CLAWDI_WA_WEBSOCKET_URL
+IFORGE_WEB_IMAGE=CLAWDI_WEB_IMAGE
+IFORGE_WEB_IMAGE_TAG=CLAWDI_WEB_IMAGE_TAG
+IFORGE_WINDOWS_PUBLISHER=CLAWDI_WINDOWS_PUBLISHER
+IFORGE_WINDOWS_TASK_TEST=CLAWDI_WINDOWS_TASK_TEST
+
+# ---------------------------------------------------------------------------
+# WEB BUILD-TIME KEYS (plan 07) -- COMMENTED BY DESIGN. NOT PART OF THE ALIAS MAP.
+# ---------------------------------------------------------------------------
+# The four Vite client keys, in the same `<public>=<internal>` line format as the pairs above
+# but written as COMMENTS. That is the exclusion mechanism, not an oversight:
+#
+#   1. Both alias parsers -- packages/cli/src/lib/brand-env.ts and
+#      backend/app/core/brand_env.py, and the two test-side parsers that assert equality with
+#      this file -- already skip any line whose first non-space character is `#`. The file's
+#      own GRAMMAR says so. So no parser change was needed, and BRAND_ENV_ALIASES cannot gain
+#      a web key by accident.
+#   2. A runtime alias could not serve them anyway. Vite substitutes `import.meta.env.X` at
+#      BUILD time, so there is no read to intercept; the 19 read sites were edited literally.
+#   3. The parity tests additionally assert every public name starts with `IFORGE_`. These
+#      start with `VITE_IFORGE_`, so an uncommented line would fail that assertion too.
+#
+# Plan 08's migration runbook reads BOTH sections: the 44 uncommented runtime pairs, and the
+# four below. A user renaming their environment has to move all 48.
+#
+# VITE_IFORGE_API_URL=VITE_CLAWDI_API_URL
+# VITE_IFORGE_DEPLOY_API_URL=VITE_CLAWDI_DEPLOY_API_URL
+# VITE_IFORGE_HOSTED=VITE_CLAWDI_HOSTED
+# VITE_IFORGE_LEGACY_DASHBOARD_URL=VITE_CLAWDI_LEGACY_DASHBOARD_URL

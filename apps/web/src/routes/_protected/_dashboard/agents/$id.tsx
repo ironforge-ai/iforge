@@ -1,0 +1,110 @@
+import {
+	createFileRoute,
+	lazyRouteComponent,
+	notFound,
+	Outlet,
+	redirect,
+} from "@tanstack/react-router";
+import {
+	agentConnectorDetailLink,
+	agentMemoryDetailLink,
+	agentProjectDetailLink,
+	agentProjectResourceLink,
+	agentRouteIdsEqual,
+	agentSectionLink,
+	agentSessionDetailLink,
+	agentSkillDetailLink,
+	agentVaultDetailLink,
+	isAgentRouteId,
+	legacyAgentRoute,
+	parseAgentPathname,
+	validateAgentRouteSearch,
+} from "@/lib/agent-routes";
+
+const IS_HOSTED_BUILD = import.meta.env.VITE_IFORGE_HOSTED === "true";
+
+export const Route = createFileRoute("/_protected/_dashboard/agents/$id")({
+	codeSplitGroupings: [],
+	validateSearch: validateAgentRouteSearch,
+	beforeLoad: ({ params, search, location }) => {
+		if (!isAgentRouteId(params.id)) throw notFound();
+		const currentRoute = parseAgentPathname(location.pathname);
+		const fallbackSection =
+			currentRoute && agentRouteIdsEqual(currentRoute.agentId, params.id)
+				? currentRoute.section
+				: "overview";
+		// Project tabs belong to the shared Project page, not legacy Agent section navigation.
+		const legacy = currentRoute?.projectId ? null : legacyAgentRoute(fallbackSection, search);
+		if (legacy) {
+			if (currentRoute?.sessionId) {
+				throw redirect({
+					...agentSessionDetailLink(params.id, currentRoute.sessionId),
+					search: legacy.search,
+					replace: true,
+				});
+			}
+			if (currentRoute?.skillKey) {
+				const projectId =
+					typeof legacy.search?.project === "string" ? legacy.search.project : undefined;
+				throw redirect({
+					...agentSkillDetailLink(params.id, currentRoute.skillKey, projectId),
+					search: legacy.search,
+					replace: true,
+				});
+			}
+			if (currentRoute?.projectId && currentRoute.projectResource) {
+				throw redirect({
+					...agentProjectResourceLink(
+						params.id,
+						currentRoute.projectId,
+						currentRoute.projectResource,
+					),
+					search: legacy.search,
+					replace: true,
+				});
+			}
+			if (currentRoute?.projectId) {
+				throw redirect({
+					...agentProjectDetailLink(params.id, currentRoute.projectId),
+					search: legacy.search,
+					replace: true,
+				});
+			}
+			if (currentRoute?.vaultSlug) {
+				throw redirect({
+					...agentVaultDetailLink(params.id, currentRoute.vaultSlug, {
+						projectId:
+							typeof legacy.search?.project === "string" ? legacy.search.project : undefined,
+						vaultId: typeof legacy.search?.vault === "string" ? legacy.search.vault : undefined,
+					}),
+					search: legacy.search,
+					replace: true,
+				});
+			}
+			if (currentRoute?.memoryId) {
+				throw redirect({
+					...agentMemoryDetailLink(params.id, currentRoute.memoryId),
+					search: legacy.search,
+					replace: true,
+				});
+			}
+			if (currentRoute?.connectorName) {
+				throw redirect({
+					...agentConnectorDetailLink(params.id, currentRoute.connectorName),
+					search: legacy.search,
+					replace: true,
+				});
+			}
+			throw redirect({
+				...agentSectionLink(params.id, legacy.section, legacy.search),
+				replace: true,
+			});
+		}
+	},
+	component: IS_HOSTED_BUILD
+		? lazyRouteComponent(
+				() => import("@/hosted/agents/hosted-agent-event-stream-layout"),
+				"HostedAgentEventStreamLayout",
+			)
+		: Outlet,
+});

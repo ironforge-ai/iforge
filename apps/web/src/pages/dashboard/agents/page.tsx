@@ -1,0 +1,98 @@
+"use client";
+
+import { lazy, Suspense, useMemo, useState } from "react";
+import { AgentsCard, selfManagedAgentTiles } from "@/components/dashboard/agents-card";
+import { PageHeader } from "@/components/page-header";
+import { CENTERED_PAGE_WIDTH_CLASS } from "@/components/page-width";
+import { useOpenApi } from "@/lib/api";
+import { useProductAccess } from "@/lib/product-access";
+import { shouldBlockQueryError } from "@/lib/query-state";
+
+const IS_HOSTED_BUILD = import.meta.env.VITE_IFORGE_HOSTED === "true";
+const AGENTS_POLL_INTERVAL_MS = 10_000;
+const AGENTS_EVENT_STREAM_FALLBACK_INTERVAL_MS = 100_000;
+
+/**
+ * Flat index of every agent — self-managed (connected) and, for hosted users,
+ * hosted deployments. The 'Agents' breadcrumb parent and the
+ * sidebar's "View all (N)" overflow both resolve here.
+ *
+ * Hosted merges deployments into the list via `HostedAgentsSection`;
+ * the hosted-build gated dynamic import keeps that cross-origin chunk out of OSS
+ * bundles (same pattern as the Overview agent panel).
+ */
+const HostedAgentsByCompute = IS_HOSTED_BUILD
+	? lazy(() =>
+			import("@/hosted/hosted-agents-section").then((m) => ({
+				default: m.HostedAgentsByCompute,
+			})),
+		)
+	: null;
+
+export default function AgentsIndexPage() {
+	const api = useOpenApi();
+	const hostedAccess = useProductAccess();
+	const [hostedEventStreamActive, setHostedEventStreamActive] = useState(false);
+	const {
+		data: environments,
+		isLoading: envsLoading,
+		error: envsError,
+		refetch: refetchEnvs,
+	} = api.useQuery(
+		"get",
+		"/v1/agents",
+		{},
+		{
+			// Match the Overview/agent-detail 10s cadence so the live status badges
+			// stay live on this list too.
+			refetchInterval: hostedEventStreamActive
+				? AGENTS_EVENT_STREAM_FALLBACK_INTERVAL_MS
+				: AGENTS_POLL_INTERVAL_MS,
+			refetchIntervalInBackground: false,
+		},
+	);
+
+	const selfManagedTiles = useMemo(() => selfManagedAgentTiles(environments), [environments]);
+	const selfManagedCount = selfManagedTiles.length;
+	const blockingEnvsError = shouldBlockQueryError(envsError, environments) ? envsError : null;
+	const hostedAccessLoading = Boolean(HostedAgentsByCompute && hostedAccess.isLoading);
+	const cloudDeploymentManagementEnabled = Boolean(HostedAgentsByCompute);
+	const legacyHostedAgentsEnabled = Boolean(
+		HostedAgentsByCompute && hostedAccess.canUseLegacyHostedDashboard,
+	);
+	const hostedSectionEnabled = cloudDeploymentManagementEnabled || legacyHostedAgentsEnabled;
+
+	return (
+		<div className={`${CENTERED_PAGE_WIDTH_CLASS.page} space-y-6 px-4 lg:px-6`}>
+			<PageHeader title="Agents" description="Every Agent in your account." />
+			{hostedAccessLoading ? (
+				<AgentsCard agents={selfManagedTiles} isLoading />
+			) : hostedSectionEnabled && HostedAgentsByCompute ? (
+				<Suspense fallback={<AgentsCard agents={selfManagedTiles} isLoading />}>
+					<HostedAgentsByCompute
+						envsLoading={envsLoading}
+						selfManagedError={blockingEnvsError}
+						onRetrySelfManaged={() => {
+							void refetchEnvs();
+						}}
+						selfManagedCount={selfManagedCount}
+						cloudEnvs={environments ?? []}
+						canDeployOnClawdi={hostedAccess.canCreateCloudAgents}
+						showCloudDeployments={cloudDeploymentManagementEnabled}
+						showLegacyAgents={legacyHostedAgentsEnabled}
+						onEventStreamActiveChange={setHostedEventStreamActive}
+					/>
+				</Suspense>
+			) : (
+				<AgentsCard
+					agents={selfManagedTiles}
+					isLoading={envsLoading}
+					error={blockingEnvsError}
+					onRetry={() => {
+						void refetchEnvs();
+					}}
+				/>
+			)}
+		</div>
+	);
+}

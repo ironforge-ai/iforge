@@ -1,0 +1,1514 @@
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import hmac
+import logging
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
+from uuid import UUID
+
+import httpx
+import jwt
+from fastapi import Depends, Header, HTTPException, status
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from pydantic import BaseModel, Field, JsonValue, TypeAdapter, ValidationError
+from sqlalchemy import and_, bindparam, or_, select
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm.attributes import get_history
+
+from app.core.config import canonical_clerk_issuer, settings
+from app.core.database import get_session
+from app.models.api_key import ApiKey
+from app.models.principal_lifecycle import PrincipalLifecycle
+from app.models.session import AgentEnvironment
+from app.models.user import PRINCIPAL_KIND_CLERK, USER_AVATAR_URL_MAX_LENGTH, User
+from app.schemas.problem import ACCOUNT_SUSPENDED_DETAIL, AccountSuspendedProblem
+from app.services.app_setting_registry import CLERK_CLI_OAUTH_SPEC
+from app.services.app_settings import AppSettingUnavailable, resolve_app_setting
+from app.services.billing_gate import ensure_unlocked
+from app.services.clerk_backend import clerk_backend_headers, clerk_user_url
+from app.services.clerk_cli_oauth_settings import ClerkCliOAuthSetting
+from app.services.principal_lifecycle import (
+    PrincipalIdentityConflictError,
+    PrincipalSuspendedError,
+    PrincipalTerminatedError,
+    assert_clerk_principal_active,
+    assert_user_authority_active,
+    load_clerk_user_for_issuer,
+    lock_api_key_user_authority_shared,
+    user_authority_sql_expressions,
+)
+from app.services.user_provisioning import lazy_create_user_with_personal_project
+
+bearer_scheme = HTTPBearer()
+
+# Same scheme but with `auto_error=False` so missing-credential requests
+# don't 401 at the FastAPI dependency layer — handlers using this can
+# treat the request as anonymous and decide their own response. Used by
+# routes that serve both signed-in and signed-out visitors (e.g. the
+# public share read where owner sees one view and anonymous sees
+# another).
+optional_bearer_scheme = HTTPBearer(auto_error=False)
+logger = logging.getLogger(__name__)
+
+API_KEY_PREFIX = "clawdi_"
+_OAUTH_ACCESS_JWT_TYPES = frozenset({"at+jwt", "application/at+jwt"})
+_CLERK_JWKS_LIFESPAN_SECONDS = 300
+_CLERK_JWKS_TIMEOUT_SECONDS = 5
+
+type _JwtClaims = dict[str, JsonValue]
+_JWT_CLAIMS_ADAPTER: TypeAdapter[_JwtClaims] = TypeAdapter(dict[str, JsonValue])
+
+
+class AccountSuspendedHTTPException(HTTPException):
+    """401 with a stable public Problem Details body for every auth mode."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=ACCOUNT_SUSPENDED_DETAIL,
+            headers={
+                "WWW-Authenticate": "Bearer",
+                "Cache-Control": "no-store, private",
+            },
+        )
+        self.problem = AccountSuspendedProblem()
+
+
+class ClerkEmailVerification(BaseModel):
+    status: str | None = None
+
+
+class ClerkEmailAddress(BaseModel):
+    id: str
+    email_address: str
+    verification: ClerkEmailVerification | None = None
+
+
+class ClerkUserResponse(BaseModel):
+    primary_email_address_id: str | None = None
+    email_addresses: list[ClerkEmailAddress] = Field(default_factory=list)
+
+
+_clerk_jwks_client = (
+    jwt.PyJWKClient(
+        f"{settings.clerk_jwt_issuer}/.well-known/jwks.json",
+        cache_keys=True,
+        lifespan=_CLERK_JWKS_LIFESPAN_SECONDS,
+        timeout=_CLERK_JWKS_TIMEOUT_SECONDS,
+    )
+    if settings.clerk_jwt_issuer
+    else None
+)
+
+# Only touch api_key.last_used_at if the previous update was at least this
+# long ago. Every authenticated CLI request used to write+commit the row,
+# which becomes write-lock contention on a hot key at scale.
+LAST_USED_THROTTLE = timedelta(minutes=1)
+
+# Reuse only the query structure; authority is read anew after acquiring its lock.
+_USER_AUTHORITY_SQL = user_authority_sql_expressions()
+_API_KEY_AUTHORITY_QUERY = (
+    select(
+        ApiKey,
+        User,
+        AgentEnvironment.default_project_id,
+        _USER_AUTHORITY_SQL.suspended.label("principal_suspended"),
+        _USER_AUTHORITY_SQL.disabled.label("principal_disabled"),
+    )
+    .outerjoin(User, User.id == ApiKey.user_id)
+    .outerjoin(
+        AgentEnvironment,
+        and_(
+            AgentEnvironment.id == ApiKey.environment_id,
+            AgentEnvironment.user_id == ApiKey.user_id,
+            AgentEnvironment.archived_at.is_(None),
+        ),
+    )
+    .where(ApiKey.key_hash == bindparam("key_hash"))
+    .execution_options(populate_existing=True)
+)
+
+
+@dataclass(frozen=True, slots=True)
+class _ApiKeyAuthority:
+    api_key: ApiKey
+    user: User | None
+    api_key_project_id: UUID | None
+    suspended: bool
+    disabled: bool
+
+
+async def _assert_active_user_or_401(db: AsyncSession, user_id: UUID) -> None:
+    try:
+        await assert_user_authority_active(db, user_id)
+    except PrincipalSuspendedError:
+        raise AccountSuspendedHTTPException() from None
+    except PrincipalTerminatedError:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Account has been terminated") from None
+
+
+class AuthContext:
+    def __init__(
+        self,
+        user: User,
+        api_key: ApiKey | None = None,
+        api_key_project_id: UUID | None = None,
+        oauth_cli: bool = False,
+        oauth_access_expires_at: datetime | None = None,
+        credential_expires_at: datetime | None = None,
+    ):
+        self.user = user
+        self.api_key = api_key
+        # Keep `is_cli` API-key-only for compatibility with the existing
+        # scope and capability gates. OAuth CLI access tokens carry this
+        # separate marker so routes can explicitly opt into that identity.
+        self.oauth_cli = oauth_cli
+        if oauth_cli and (
+            oauth_access_expires_at is None
+            or oauth_access_expires_at.tzinfo is None
+            or oauth_access_expires_at.utcoffset() is None
+        ):
+            raise ValueError("OAuth CLI auth requires a timezone-aware access-token expiry")
+        self.oauth_access_expires_at: datetime | None = oauth_access_expires_at
+        self.credential_expires_at = (
+            credential_expires_at
+            or oauth_access_expires_at
+            or (api_key.expires_at if api_key is not None else None)
+        )
+        self.is_cli = api_key is not None
+        self.api_key_project_id = api_key_project_id
+        self._user_id = user.id
+        self.skills_revision = int(user.skills_revision or 0)
+
+    @property
+    def user_id(self):
+        return self._user_id
+
+    @property
+    def bound_environment_id(self) -> UUID | None:
+        """Environment fence carried by an Agent-bound API key."""
+        return self.api_key.environment_id if self.api_key is not None else None
+
+
+async def _auth_via_api_key(
+    token: str, db: AsyncSession, *, enforce_billing_gate: bool = True
+) -> AuthContext | None:
+    if not token.startswith(API_KEY_PREFIX):
+        return None
+
+    key_hash = hashlib.sha256(token.encode()).hexdigest()
+    # A separate statement after the advisory lock is intentional: under
+    # READ COMMITTED a statement snapshot is fixed before a lock wait, so the
+    # joined authority read must start only after any committed lifecycle
+    # mutation holding the exclusive lock has finished.
+    user_id = await lock_api_key_user_authority_shared(db, key_hash)
+    if user_id is None:
+        return None
+    authority = await _load_api_key_authority(db, key_hash)
+    if authority is None:
+        return None
+    now = datetime.now(UTC)
+    context = _validated_api_key_auth_context(authority, now=now)
+
+    # Throttle last_used_at writes: once per LAST_USED_THROTTLE per key.
+    last = authority.api_key.last_used_at
+    if last is None or (now - last) > LAST_USED_THROTTLE:
+        authority.api_key.last_used_at = now
+        await db.commit()
+        # Commit releases the authority lock. Reacquire it and rerun the full
+        # key/user/lifecycle/Agent read before returning authority.
+        if await lock_api_key_user_authority_shared(db, key_hash) is None:
+            raise HTTPException(status.HTTP_401_UNAUTHORIZED, "API key has been revoked")
+        authority = await _load_api_key_authority(db, key_hash)
+        if authority is None:
+            raise HTTPException(status.HTTP_401_UNAUTHORIZED, "API key has been revoked")
+        now = datetime.now(UTC)
+        context = _validated_api_key_auth_context(authority, now=now)
+
+    # Billing gate (D-09, 03-06): after the key/user/lifecycle/Agent fence,
+    # before the route. #1238 retired the worker-local key cache, so this is
+    # the only API-key exit. It is skipped only for `get_auth_billing_exempt`
+    # (06.3 D-03, identity bootstrap); every other caller is gated.
+    if enforce_billing_gate:
+        transaction = db.get_transaction()
+        await ensure_unlocked(db, context.user)
+        if db.get_transaction() is not transaction:
+            # The gate committed (an unlock or a lapse re-check), which released
+            # the authority lock. Reacquire it and rerun the full read, as after
+            # the last_used_at write, so the route never runs on stale authority.
+            if await lock_api_key_user_authority_shared(db, key_hash) is None:
+                raise HTTPException(status.HTTP_401_UNAUTHORIZED, "API key has been revoked")
+            authority = await _load_api_key_authority(db, key_hash)
+            if authority is None:
+                raise HTTPException(status.HTTP_401_UNAUTHORIZED, "API key has been revoked")
+            context = _validated_api_key_auth_context(authority, now=datetime.now(UTC))
+    return context
+
+
+async def _load_api_key_authority(
+    db: AsyncSession,
+    key_hash: str,
+) -> _ApiKeyAuthority | None:
+    row = (await db.execute(_API_KEY_AUTHORITY_QUERY, {"key_hash": key_hash})).one_or_none()
+    if row is None:
+        return None
+    api_key, user, api_key_project_id, suspended, disabled = row
+    return _ApiKeyAuthority(
+        api_key=api_key,
+        user=user,
+        api_key_project_id=api_key_project_id,
+        suspended=bool(suspended),
+        disabled=bool(disabled),
+    )
+
+
+def _validated_api_key_auth_context(
+    authority: _ApiKeyAuthority,
+    *,
+    now: datetime,
+) -> AuthContext:
+    api_key = authority.api_key
+    if api_key.revoked_at:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "API key has been revoked")
+    if api_key.expires_at and api_key.expires_at < now:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "API key has expired")
+    user = authority.user
+    if user is None:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "User not found")
+    if authority.suspended:
+        raise AccountSuspendedHTTPException()
+    if authority.disabled:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Account has been terminated")
+    if api_key.environment_id is not None and authority.api_key_project_id is None:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Agent is archived")
+    return AuthContext(
+        user=user,
+        api_key=api_key,
+        api_key_project_id=authority.api_key_project_id,
+    )
+
+
+async def _auth_via_dev_bypass(
+    token: str, db: AsyncSession, *, enforce_billing_gate: bool = True
+) -> AuthContext | None:
+    if not settings.dev_auth_bypass:
+        return None
+    if token != settings.dev_auth_token:
+        return None
+    if settings.environment != "development":
+        logger.error(
+            "dev_auth_bypass refused outside development environment=%s",
+            settings.environment,
+        )
+        raise HTTPException(
+            status.HTTP_500_INTERNAL_SERVER_ERROR,
+            "dev auth bypass is only available in development",
+        )
+
+    clerk_id = settings.dev_auth_clerk_id
+    try:
+        issuer = await assert_clerk_principal_active(db, subject=clerk_id)
+    except PrincipalSuspendedError:
+        raise AccountSuspendedHTTPException() from None
+    except PrincipalTerminatedError:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Account has been terminated") from None
+    if issuer is None:
+        user = (
+            await db.execute(
+                select(User).where(
+                    User.principal_kind == PRINCIPAL_KIND_CLERK,
+                    User.clerk_id == clerk_id,
+                )
+            )
+        ).scalar_one_or_none()
+    else:
+        try:
+            user = await load_clerk_user_for_issuer(
+                db,
+                issuer=issuer,
+                subject=clerk_id,
+                bind_legacy=True,
+            )
+        except PrincipalIdentityConflictError:
+            raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid account identity") from None
+    if user is None:
+        user = await lazy_create_user_with_personal_project(
+            db,
+            clerk_id=clerk_id,
+            clerk_issuer=issuer,
+            email=settings.dev_auth_email,
+            name=settings.dev_auth_name,
+            avatar_url=None,
+            race_loser_status=status.HTTP_401_UNAUTHORIZED,
+            inactive_status=status.HTTP_401_UNAUTHORIZED,
+        )
+        await db.commit()
+        await db.refresh(user)
+        logger.info("dev_auth_user_created clerk_id=%s user_id=%s", clerk_id, user.id)
+    await _assert_active_user_or_401(db, user.id)
+    # Billing gate (D-09, 03-06): the dev bypass is a full principal path,
+    # so it is gated like the JWT path — "no route around billing". It is
+    # skipped only for `get_auth_billing_exempt` (06.3 D-03, identity bootstrap).
+    if enforce_billing_gate:
+        await ensure_unlocked(db, user)
+    return AuthContext(user=user)
+
+
+async def _fetch_clerk_primary_email(clerk_user_id: str) -> str | None:
+    """Look up a Clerk user's verified primary email via the Backend API.
+
+    Returns the email only if Clerk explicitly marks it as the user's primary
+    AND its verification status is "verified". Returns None for any other
+    outcome (network failure, non-200, malformed payload, no primary marked,
+    primary unverified). This is identity-binding: callers use the result to
+    decide which existing user row to take over, so we refuse to guess.
+    """
+    url = clerk_user_url(clerk_user_id)
+    # Clerk's API is fronted by Cloudflare, which serves a 403 (error 1010)
+    # for requests lacking a recognizable User-Agent — including httpx's
+    # default. Set an explicit one.
+    headers = clerk_backend_headers()
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.get(url, headers=headers)
+        if resp.status_code != 200:
+            logger.warning(
+                "clerk backend api returned %s for user %s",
+                resp.status_code,
+                clerk_user_id,
+            )
+            return None
+        data = ClerkUserResponse.model_validate_json(resp.content)
+    except (httpx.HTTPError, ValidationError) as e:
+        logger.warning("clerk backend api lookup failed for %s: %s", clerk_user_id, e)
+        return None
+
+    primary_id = data.primary_email_address_id
+    if not primary_id:
+        logger.warning("clerk user %s has no primary_email_address_id", clerk_user_id)
+        return None
+    for entry in data.email_addresses:
+        if entry.id != primary_id:
+            continue
+        verification_status = entry.verification.status if entry.verification is not None else None
+        if verification_status != "verified":
+            logger.warning(
+                "clerk primary email for %s is not verified (status=%s)",
+                clerk_user_id,
+                verification_status,
+            )
+            return None
+        return entry.email_address
+    logger.warning(
+        "clerk user %s primary_email_address_id %s not in email_addresses",
+        clerk_user_id,
+        primary_id,
+    )
+    return None
+
+
+def _is_oauth_access_jwt(token: str) -> bool:
+    """Return whether a token declares Clerk's OAuth access-token media type.
+
+    Header inspection only selects the validation profile; all trust decisions
+    still happen in the signature-verified decode below.
+    """
+    try:
+        header = jwt.get_unverified_header(token)
+    except jwt.InvalidTokenError:
+        return False
+    token_type: object = header.get("typ")
+    return token_type in _OAUTH_ACCESS_JWT_TYPES
+
+
+def _oauth_audience_matches(payload: _JwtClaims, oauth_setting: ClerkCliOAuthSetting) -> bool:
+    expected = oauth_setting.audience
+    audience = payload.get("aud")
+    if not expected or audience is None:
+        return True
+    if isinstance(audience, str):
+        token_audiences = {audience}
+    elif (
+        isinstance(audience, list) and audience and all(isinstance(item, str) for item in audience)
+    ):
+        token_audiences = set(audience)
+    else:
+        return False
+
+    return expected in token_audiences
+
+
+def _oauth_authorized_party_matches(
+    payload: _JwtClaims, oauth_setting: ClerkCliOAuthSetting
+) -> bool:
+    expected = set(oauth_setting.authorized_parties)
+    if not expected:
+        return True
+    authorized_party = payload.get("azp")
+    if not isinstance(authorized_party, str) or not authorized_party:
+        return False
+    return authorized_party in expected
+
+
+def _session_claims_match_configured_clerk_values(payload: _JwtClaims) -> bool:
+    """Apply independently configured claim binding to browser sessions.
+
+    Browser session JWTs predate the OAuth Public App integration, so an empty
+    setting preserves the historical signature-only behavior. Once an issuer
+    or audience is configured, its claim is required and must match exactly.
+    """
+    if settings.clerk_jwt_issuer and payload.get("iss") != settings.clerk_jwt_issuer:
+        return False
+
+    if settings.clerk_jwt_audience:
+        audience = payload.get("aud")
+        if isinstance(audience, str):
+            return audience == settings.clerk_jwt_audience
+        if isinstance(audience, list):
+            return settings.clerk_jwt_audience in audience
+        return False
+
+    return True
+
+
+async def warm_clerk_jwks() -> None:
+    """Warm the shared JWKS cache without making startup depend on Clerk."""
+    if settings.clerk_pem_public_key or _clerk_jwks_client is None:
+        return
+    try:
+        await asyncio.to_thread(_clerk_jwks_client.get_signing_keys)
+    except (jwt.PyJWTError, OSError, TimeoutError, ValueError):
+        logger.warning("Clerk JWKS warmup failed.", exc_info=True)
+    else:
+        logger.info("Clerk JWKS cache warmed.")
+
+
+async def _resolve_clerk_signing_key(token: str) -> str | jwt.PyJWK | None:
+    if settings.clerk_pem_public_key:
+        return settings.clerk_pem_public_key
+    if _clerk_jwks_client is None:
+        logger.error("Clerk JWT verification is not configured: CLERK_JWT_ISSUER is empty.")
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "Clerk JWT verification is not configured",
+        )
+
+    try:
+        return await asyncio.to_thread(_clerk_jwks_client.get_signing_key_from_jwt, token)
+    except jwt.PyJWKClientConnectionError as error:
+        logger.exception("Clerk JWKS signing-key lookup failed.")
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "Clerk JWT verification is temporarily unavailable",
+        ) from error
+    except (jwt.InvalidTokenError, jwt.PyJWKClientError):
+        return None
+    except (OSError, TimeoutError, ValueError) as error:
+        logger.exception("Clerk JWKS signing-key lookup failed.")
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "Clerk JWT verification is temporarily unavailable",
+        ) from error
+
+
+def _decode_clerk_session_jwt(token: str, signing_key: str | jwt.PyJWK) -> _JwtClaims | None:
+    try:
+        payload = _JWT_CLAIMS_ADAPTER.validate_python(
+            jwt.decode(
+                token,
+                signing_key,
+                algorithms=["RS256"],
+                options={"verify_aud": False, "verify_iss": False},
+            )
+        )
+    except (jwt.InvalidTokenError, ValidationError):
+        return None
+    return payload if _session_claims_match_configured_clerk_values(payload) else None
+
+
+def _decode_clerk_oauth_access_jwt(
+    token: str,
+    signing_key: str | jwt.PyJWK,
+    oauth_setting: ClerkCliOAuthSetting,
+) -> _JwtClaims | None:
+    try:
+        payload = _JWT_CLAIMS_ADAPTER.validate_python(
+            jwt.decode(
+                token,
+                signing_key,
+                algorithms=["RS256"],
+                issuer=oauth_setting.issuer,
+                leeway=5,
+                options={
+                    "require": ["iss", "exp", "sub", "client_id"],
+                    # Clerk OAuth JWTs do not always include aud. Match Clerk's
+                    # SDK contract: validate it only when the claim is present.
+                    "verify_aud": False,
+                    "verify_exp": True,
+                    "verify_iat": True,
+                    "verify_iss": True,
+                    "verify_nbf": True,
+                },
+            )
+        )
+    except (jwt.InvalidTokenError, ValidationError):
+        return None
+
+    clerk_id = payload.get("sub")
+    client_id = payload.get("client_id")
+    if not isinstance(clerk_id, str) or not clerk_id.strip():
+        return None
+    if client_id != oauth_setting.client_id:
+        return None
+    if not _oauth_audience_matches(payload, oauth_setting):
+        return None
+    if not _oauth_authorized_party_matches(payload, oauth_setting):
+        return None
+    return payload
+
+
+@dataclass(frozen=True, slots=True)
+class VerifiedClerkJwt:
+    payload: _JwtClaims
+    oauth_setting: ClerkCliOAuthSetting | None
+
+
+async def verify_clerk_jwt(token: str, db: AsyncSession) -> VerifiedClerkJwt | None:
+    oauth_setting: ClerkCliOAuthSetting | None = None
+    if _is_oauth_access_jwt(token):
+        try:
+            oauth_setting = await resolve_app_setting(db, CLERK_CLI_OAUTH_SPEC)
+        except AppSettingUnavailable as error:
+            raise HTTPException(
+                status.HTTP_503_SERVICE_UNAVAILABLE,
+                "OAuth CLI authentication is not configured",
+            ) from error
+        if not oauth_setting.enabled:
+            raise HTTPException(
+                status.HTTP_503_SERVICE_UNAVAILABLE,
+                "OAuth CLI authentication is not configured",
+            )
+        # Only the validated setting value is needed during the JWKS network
+        # lookup. Principal authority locks are acquired after JWT verification.
+        await db.rollback()
+    signing_key = await _resolve_clerk_signing_key(token)
+    if signing_key is None:
+        return None
+    if oauth_setting is None:
+        payload = _decode_clerk_session_jwt(token, signing_key)
+    else:
+        payload = _decode_clerk_oauth_access_jwt(token, signing_key, oauth_setting)
+    if payload is None:
+        return None
+    return VerifiedClerkJwt(payload=payload, oauth_setting=oauth_setting)
+
+
+@dataclass(frozen=True, slots=True)
+class _VerifiedClerkToken:
+    """A verified Clerk JWT with its subject and issuer resolved, before any user-row resolution."""
+
+    payload: _JwtClaims
+    clerk_id: str
+    issuer: str | None
+    oauth_setting: ClerkCliOAuthSetting | None
+
+
+def _verified_clerk_identity(verified: VerifiedClerkJwt) -> _VerifiedClerkToken | None:
+    """Resolve the subject and issuer a verified Clerk JWT names.
+
+    Shared by the claims-only dependency (`require_clerk_claims`) and the provisioning path
+    (`auth_via_verified_clerk_jwt`), so the two cannot disagree about which principal a token
+    names.
+    """
+    payload = verified.payload
+    oauth_setting = verified.oauth_setting
+    clerk_id = payload.get("sub")
+    if not isinstance(clerk_id, str) or not clerk_id:
+        return None
+    # OAuth access tokens are independently bound to the issuer stored in the
+    # validated Public App setting. Browser sessions use the configured Clerk
+    # JWT issuer (or, for the legacy PEM-only mode, their verified claim).
+    issuer = oauth_setting.issuer if oauth_setting is not None else settings.clerk_jwt_issuer
+    if not issuer:
+        claimed_issuer = payload.get("iss")
+        if isinstance(claimed_issuer, str):
+            try:
+                issuer = canonical_clerk_issuer(claimed_issuer)
+            except ValueError:
+                return None
+    return _VerifiedClerkToken(
+        payload=payload,
+        clerk_id=clerk_id,
+        issuer=issuer or None,
+        oauth_setting=oauth_setting,
+    )
+
+
+async def _verify_clerk_token(token: str, db: AsyncSession) -> _VerifiedClerkToken | None:
+    """Verify a Clerk JWT (session or OAuth access) without touching `users`.
+
+    This is the verification half of `_auth_via_clerk_jwt`: resolve the
+    signing key, decode + validate claims, extract subject and issuer. It
+    performs NO lazy provisioning and requires no User row, so the claims-only
+    dependency behind GET /access/status can authenticate identities that have
+    not been provisioned yet.
+    """
+    verified = await verify_clerk_jwt(token, db)
+    if verified is None:
+        return None
+    return _verified_clerk_identity(verified)
+
+
+@dataclass(frozen=True, slots=True)
+class ClerkClaims:
+    """Verified Clerk identity claims, independent of any `users` row.
+
+    Handed out by `require_clerk_claims` for the one route that must work for
+    authenticated-but-unprovisioned identities: GET /access/status.
+    """
+
+    subject: str
+    issuer: str | None
+    email: str | None
+    name: str | None
+    avatar_url: str | None
+
+
+def _dev_bypass_claims(token: str) -> ClerkClaims | None:
+    """The dev principal's claims, or ``None`` when the bypass does not apply.
+
+    The three guards are `_auth_via_dev_bypass`'s, deliberately spelled the same
+    way: the bypass must be enabled, the token must match, and a non-development
+    environment is a 500 rather than a quiet `None` — a deployment that shipped
+    `DEV_AUTH_BYPASS=true` should fail loudly, not authenticate strangers.
+
+    It stops there, and the stopping is the point. This is the CLAIMS-only path:
+    it never provisions, never reads a `users` row, and never consults the
+    billing gate, because the route it serves (`GET /access/status`) exists for
+    identities that may have no row yet.
+    `_auth_via_dev_bypass` does all of that instead, because it answers the
+    different question of what a principal may DO.
+
+    Without this branch the dev bypass was only half real: every route on
+    `get_auth` honoured it while the dashboard's own access gate — which runs on
+    `require_clerk_claims` — rejected `dev-bypass` as an unverifiable JWT and
+    returned 401, which the browser renders as "Your session expired". Two auth
+    dependencies disagreeing about whether a token is valid is the bug; one
+    shared set of guards is the fix.
+    """
+    if not settings.dev_auth_bypass:
+        return None
+    if token != settings.dev_auth_token:
+        return None
+    if settings.environment != "development":
+        logger.error(
+            "dev_auth_bypass refused outside development environment=%s",
+            settings.environment,
+        )
+        raise HTTPException(
+            status.HTTP_500_INTERNAL_SERVER_ERROR,
+            "dev auth bypass is only available in development",
+        )
+    return ClerkClaims(
+        subject=settings.dev_auth_clerk_id,
+        # No issuer: nothing verified one. The dev principal is bound by
+        # configuration rather than by a signed `iss`, and inventing a value
+        # here would make an unverified identity indistinguishable from a
+        # verified one to every downstream reader.
+        issuer=None,
+        email=settings.dev_auth_email,
+        name=settings.dev_auth_name,
+        avatar_url=None,
+    )
+
+
+async def require_clerk_claims(
+    credentials: HTTPAuthorizationCredentials = Depends(bearer_scheme),
+    db: AsyncSession = Depends(get_session),
+) -> ClerkClaims:
+    """Claims-only auth dependency — verifies the JWT, never provisions.
+
+    Unlike `get_auth`, a missing User row is NOT an error here: GET
+    /access/status exists precisely for identities that have no row yet.
+    Signature/issuer verification is identical to
+    `_auth_via_clerk_jwt`.
+
+    The dev bypass is consulted FIRST, on the same three guards
+    `_auth_via_dev_bypass` uses, so the documented local-development path works
+    on this dependency too. In any environment but `development` it cannot
+    match, and a bypass enabled outside development raises rather than falling
+    through to the JWT path.
+    """
+    bypassed = _dev_bypass_claims(credentials.credentials)
+    if bypassed is not None:
+        return bypassed
+
+    verified = await _verify_clerk_token(credentials.credentials, db)
+    if verified is None:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid credentials")
+    payload = verified.payload
+    raw_email = payload.get("email") or payload.get("email_address")
+    email = raw_email if isinstance(raw_email, str) and raw_email else None
+    raw_name = payload.get("name")
+    name = raw_name if isinstance(raw_name, str) and raw_name else None
+    raw_picture = payload.get("picture")
+    picture = raw_picture if isinstance(raw_picture, str) and raw_picture else None
+    return ClerkClaims(
+        subject=verified.clerk_id,
+        issuer=verified.issuer,
+        email=email,
+        name=name,
+        avatar_url=picture,
+    )
+
+
+async def _auth_via_clerk_jwt(
+    token: str, db: AsyncSession, *, enforce_billing_gate: bool = True
+) -> AuthContext | None:
+    verified = await verify_clerk_jwt(token, db)
+    if verified is None:
+        return None
+    return await auth_via_verified_clerk_jwt(
+        verified, db, enforce_billing_gate=enforce_billing_gate
+    )
+
+
+async def auth_via_verified_clerk_jwt(
+    verified: VerifiedClerkJwt, db: AsyncSession, *, enforce_billing_gate: bool = True
+) -> AuthContext | None:
+    identity = _verified_clerk_identity(verified)
+    if identity is None:
+        return None
+    payload = identity.payload
+    clerk_id = identity.clerk_id
+    issuer = identity.issuer
+    oauth_setting = identity.oauth_setting
+    try:
+        await assert_clerk_principal_active(
+            db,
+            subject=clerk_id,
+            issuer=issuer or None,
+        )
+        if issuer:
+            user = await load_clerk_user_for_issuer(
+                db,
+                issuer=issuer,
+                subject=clerk_id,
+                bind_legacy=True,
+            )
+        else:
+            user = (
+                await db.execute(
+                    select(User).where(
+                        User.principal_kind == PRINCIPAL_KIND_CLERK,
+                        User.clerk_id == clerk_id,
+                    )
+                )
+            ).scalar_one_or_none()
+    except PrincipalSuspendedError:
+        raise AccountSuspendedHTTPException() from None
+    except PrincipalTerminatedError:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Account has been terminated") from None
+    except PrincipalIdentityConflictError:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid account identity") from None
+    # The user-authority read can autoflush the legacy issuer assignment.
+    # Capture its persistence obligation before that clears attribute history.
+    issuer_binding_pending = user is not None and get_history(user, "clerk_issuer").has_changes()
+    if user is not None:
+        await _assert_active_user_or_401(db, user.id)
+    authorized_user_id = user.id if user is not None else None
+    authorized_transaction = db.get_nested_transaction() or db.get_transaction()
+
+    raw_email = payload.get("email") or payload.get("email_address")
+    email = raw_email if isinstance(raw_email, str) and raw_email else None
+    raw_name = payload.get("name")
+    name = raw_name if isinstance(raw_name, str) and raw_name else None
+    raw_picture = payload.get("picture")
+    # Optional profile metadata must fit PostgreSQL's character limit; a signed
+    # but oversized URL must not break bootstrap or retry a failed write on every request.
+    picture = (
+        raw_picture
+        if isinstance(raw_picture, str) and 0 < len(raw_picture) <= USER_AVATAR_URL_MAX_LENGTH
+        else None
+    )
+
+    # Backfill email/name on rows that were lazy-created via the
+    # admin path (`_resolve_or_create_user` in routes/admin.py) — that
+    # path doesn't have a Clerk JWT in context so the row starts with
+    # email=None / name=None. The first time the user signs into
+    # cloud.clawdi.ai directly, this branch fills them in.
+    #
+    # Idempotent: once filled, subsequent JWTs hit the same row,
+    # see non-null values, and skip the update. Backfill only — we
+    # NEVER overwrite an existing email/name because that would let
+    # a Clerk-side display-name change silently rewrite our row
+    # (Clerk is the source of truth for identity, not display).
+    needs_profile_backfill = user is not None and (
+        (user.email is None and email is not None) or (user.name is None and name is not None)
+    )
+    if user is not None and (issuer_binding_pending or needs_profile_backfill):
+        if user.email is None and email:
+            user.email = email
+        if user.name is None and name:
+            user.name = name
+        try:
+            await db.commit()
+            await db.refresh(user)
+            # Log only on the success path. If the commit raises and
+            # we fall into the rollback branch below, this request is
+            # the race LOSER — the winner already wrote the values
+            # and is the one whose log line should claim the backfill.
+            # Logging here both ways would lie about who wrote what
+            # and corrupt audit / debugging trails.
+            if needs_profile_backfill:
+                logger.info("user_backfill clerk_id=%s user_id=%s", clerk_id, user.id)
+        except IntegrityError:
+            # Accept only a compatible persisted winner. Retrying the binding
+            # here could leave it uncommitted again in a read-only request.
+            await db.rollback()
+            if issuer:
+                user = await load_clerk_user_for_issuer(
+                    db,
+                    issuer=issuer,
+                    subject=clerk_id,
+                    bind_legacy=False,
+                    allow_issuer_mismatch=True,
+                )
+            else:
+                user = (
+                    await db.execute(
+                        select(User).where(
+                            User.principal_kind == PRINCIPAL_KIND_CLERK,
+                            User.clerk_id == clerk_id,
+                        )
+                    )
+                ).scalar_one_or_none()
+            if user is None or (issuer and user.clerk_issuer != issuer):
+                raise HTTPException(
+                    status.HTTP_401_UNAUTHORIZED, "Invalid account identity"
+                ) from None
+
+    # Sub miss + snapshot-rebind opted in: try to attach to an existing
+    # snapshot row by verified email. We deliberately fail closed if any
+    # part of the identity proof is missing or ambiguous — a flaky Clerk
+    # API or a duplicate-email row must NOT silently fall through to
+    # auto-create, because the resulting empty row would then match this
+    # Clerk sub on every subsequent login and permanently shadow the
+    # real snapshot row.
+    if not user and settings.enable_snapshot_email_rebind:
+        if not email and settings.clerk_secret_key:
+            email = await _fetch_clerk_primary_email(clerk_id)
+        if not email:
+            logger.warning(
+                "snapshot rebind: refusing sign-in for clerk_id %s — no verified email",
+                clerk_id,
+            )
+            raise HTTPException(
+                status.HTTP_401_UNAUTHORIZED,
+                "Could not verify account identity for snapshot rebind.",
+            )
+
+        # `users.email` is not unique in the schema (production allows
+        # duplicates). Refuse to pick one if the result is ambiguous —
+        # whoever signs in first would otherwise get to choose which
+        # row they take over.
+        result = await db.execute(
+            select(User)
+            .where(
+                User.principal_kind == PRINCIPAL_KIND_CLERK,
+                User.email == email,
+                ~select(PrincipalLifecycle.id)
+                .where(PrincipalLifecycle.user_id == User.id)
+                .exists(),
+                or_(
+                    User.clerk_issuer.is_(None),
+                    User.clerk_issuer == issuer,
+                )
+                if issuer
+                else User.clerk_issuer.is_(None),
+            )
+            .order_by(User.created_at)
+            .limit(2)
+        )
+        candidates = list(result.scalars())
+        if len(candidates) > 1:
+            logger.error("snapshot rebind: ambiguous email match for %s (>=2 users)", email)
+            raise HTTPException(
+                status.HTTP_401_UNAUTHORIZED,
+                "Multiple accounts match this email; cannot rebind.",
+            )
+        if candidates:
+            user = candidates[0]
+            await _assert_active_user_or_401(db, user.id)
+            logger.info(
+                "snapshot rebind: user %s clerk_id %s -> %s (email match)",
+                user.id,
+                user.clerk_id,
+                clerk_id,
+            )
+            user.clerk_id = clerk_id
+            user.clerk_issuer = issuer or None
+            # Concurrent rebind race: two requests carrying the
+            # same Clerk JWT can both read the same candidate
+            # row, both write the same `clerk_id`, and the
+            # second commit hits `users_clerk_id_key` unique
+            # violation. Pre-fix this 500'd dashboard /stats /
+            # contribution / memories for affected users (14
+            # events observed in prod log post-#66 deploy).
+            # Catch the IntegrityError, rollback, and re-query
+            # by clerk_id — by the time we get here the winner
+            # has committed and the row carries the new
+            # clerk_id, so the lookup converges.
+            try:
+                await db.commit()
+                await db.refresh(user)
+            except IntegrityError:
+                await db.rollback()
+                if issuer:
+                    try:
+                        user = await load_clerk_user_for_issuer(
+                            db,
+                            issuer=issuer,
+                            subject=clerk_id,
+                            bind_legacy=True,
+                        )
+                    except PrincipalIdentityConflictError:
+                        user = None
+                else:
+                    result = await db.execute(
+                        select(User).where(
+                            User.principal_kind == PRINCIPAL_KIND_CLERK,
+                            User.clerk_id == clerk_id,
+                        )
+                    )
+                    user = result.scalar_one_or_none()
+                if user is None:
+                    # Both writers somehow lost the row — extremely
+                    # unlikely (would require a concurrent delete
+                    # of all matching rows). Fail closed with
+                    # 401 rather than 500 so the client retries.
+                    raise HTTPException(
+                        status.HTTP_401_UNAUTHORIZED,
+                        "could not load user after rebind race",
+                    ) from None
+
+    if not user:
+        # First login (production path, or rebind enabled with no
+        # match): create a fresh user row + Personal project bound to
+        # this Clerk sub. Downstream resolvers assume every user has
+        # a Personal project; the helper enforces that invariant in a
+        # single transaction.
+        #
+        # Race-loser status is 401: this is a user-auth flow, so a
+        # vanishing winner row is fail-closed-and-let-the-client-
+        # retry territory, not the operational 500 the admin path
+        # uses.
+        user = await lazy_create_user_with_personal_project(
+            db,
+            clerk_id=clerk_id,
+            clerk_issuer=issuer or None,
+            email=email,
+            name=name,
+            avatar_url=picture,
+            race_loser_status=status.HTTP_401_UNAUTHORIZED,
+            inactive_status=status.HTTP_401_UNAUTHORIZED,
+        )
+        # Helper leaves rows flushed-not-committed so admin callers
+        # can bundle their own writes. The JWT path has nothing else
+        # to write, so commit + refresh here.
+        await db.commit()
+        await db.refresh(user)
+
+    # Refresh `avatar_url` opportunistically on every login — Clerk
+    # rotates signed picture URLs, and the share page would otherwise
+    # render a stale 404'd avatar. Only commit when the value actually
+    # changed to avoid a write-per-request. `name` is intentionally NOT
+    # synced here: the contract elsewhere (see backfill tests) is that
+    # user.name is one-way — once set, it's user-owned and not
+    # clobbered by Clerk on subsequent logins.
+    new_avatar = picture
+    if new_avatar and user.avatar_url != new_avatar:
+        avatar_user_id = user.id
+        user.avatar_url = new_avatar
+        try:
+            await db.commit()
+        except SQLAlchemyError:
+            # Rollback expires ORM state even with expire_on_commit=False.
+            # Reload the persisted identity before any synchronous attribute
+            # access; a concurrent identity change must fail closed.
+            await db.rollback()
+            user = await db.get(User, avatar_user_id, populate_existing=True)
+            if (
+                user is None
+                or user.principal_kind != PRINCIPAL_KIND_CLERK
+                or user.clerk_id != clerk_id
+                or (issuer and user.clerk_issuer != issuer)
+            ):
+                raise HTTPException(
+                    status.HTTP_401_UNAUTHORIZED, "Invalid account identity"
+                ) from None
+
+    oauth_cli = oauth_setting is not None
+    oauth_access_expires_at: datetime | None = None
+    credential_expires_at: datetime | None = None
+    if oauth_cli or "exp" in payload:
+        expires_at = payload.get("exp")
+        if not isinstance(expires_at, (int, float)) or isinstance(expires_at, bool):
+            return None
+        try:
+            credential_expires_at = datetime.fromtimestamp(expires_at, UTC)
+            if oauth_cli:
+                oauth_access_expires_at = credential_expires_at
+        except (OverflowError, OSError, ValueError):
+            # PyJWT can validate a numerically huge future exp even when the
+            # platform datetime cannot represent it. Treat hostile/unusable
+            # timestamps as invalid auth instead of turning them into a 500.
+            return None
+
+    # Only the same live transaction retains the principal and user fences.
+    # Commits, rollbacks (including inside helpers), and user replacement must
+    # reauthorize. Include savepoints because their rollback releases locks too.
+    async def assert_fences() -> None:
+        try:
+            await assert_clerk_principal_active(
+                db,
+                subject=clerk_id,
+                issuer=issuer or None,
+            )
+        except PrincipalSuspendedError:
+            raise AccountSuspendedHTTPException() from None
+        except PrincipalTerminatedError:
+            raise HTTPException(
+                status.HTTP_401_UNAUTHORIZED, "Account has been terminated"
+            ) from None
+        await _assert_active_user_or_401(db, user.id)
+
+    if not (
+        authorized_user_id == user.id
+        and authorized_transaction is not None
+        and authorized_transaction.is_active
+        and authorized_transaction is (db.get_nested_transaction() or db.get_transaction())
+    ):
+        await assert_fences()
+    # Billing gate (D-09, 03-06): after the fence check, before the route. It runs on every
+    # request, including one whose principal fences upstream's same-transaction rule let skip.
+    # It is skipped only for `get_auth_billing_exempt` (06.3 D-03, identity bootstrap). The
+    # claims-only dependency (`require_clerk_claims`) stays ungated because GET /access/status
+    # is the unlock poll.
+    if enforce_billing_gate:
+        transaction = db.get_transaction()
+        await ensure_unlocked(db, user)
+        if db.get_transaction() is not transaction:
+            # The gate committed, which ended the transaction holding the
+            # principal and user fences; take them again before the route.
+            await assert_fences()
+    return AuthContext(
+        user=user,
+        oauth_cli=oauth_cli,
+        oauth_access_expires_at=oauth_access_expires_at,
+        credential_expires_at=credential_expires_at,
+    )
+
+
+async def _resolve_auth(token: str, db: AsyncSession, *, enforce_billing_gate: bool) -> AuthContext:
+    """The one principal chain behind `get_auth` and `get_auth_billing_exempt`.
+
+    Order is fixed: dev bypass, then API key (fast prefix check), then Clerk
+    JWT; 401 when none matches. The two dependencies differ only in
+    `enforce_billing_gate`, so they can never disagree about who a token names
+    or about the revocation, expiry, suspension and termination fences.
+    """
+    ctx = await _auth_via_dev_bypass(token, db, enforce_billing_gate=enforce_billing_gate)
+    if ctx:
+        return ctx
+
+    ctx = await _auth_via_api_key(token, db, enforce_billing_gate=enforce_billing_gate)
+    if ctx:
+        return ctx
+
+    ctx = await _auth_via_clerk_jwt(token, db, enforce_billing_gate=enforce_billing_gate)
+    if ctx:
+        return ctx
+
+    raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid credentials")
+
+
+async def get_auth(
+    credentials: HTTPAuthorizationCredentials = Depends(bearer_scheme),
+    db: AsyncSession = Depends(get_session),
+) -> AuthContext:
+    return await _resolve_auth(credentials.credentials, db, enforce_billing_gate=True)
+
+
+async def get_auth_billing_exempt(
+    credentials: HTTPAuthorizationCredentials = Depends(bearer_scheme),
+    db: AsyncSession = Depends(get_session),
+) -> AuthContext:
+    """`get_auth` without the billing gate, for identity bootstrap ONLY (06.3 D-03).
+
+    A billing-locked user must still be identified (GET /auth/me) so the
+    dashboard can render the locked shell and reach the billing surface. Every
+    other fence still runs: revoked or expired keys, suspended and terminated
+    principals are refused exactly as on `get_auth`.
+
+    The routes depending on this are pinned by
+    `backend/tests/test_billing_gate_allowlist.py`. Adding a route to it is a
+    reviewed policy change, never a convenience. There is deliberately no
+    exempt twin of `get_auth_short_session`, so MCP, SSE and short-session
+    routes stay gated.
+    """
+    return await _resolve_auth(credentials.credentials, db, enforce_billing_gate=False)
+
+
+async def get_auth_short_session(
+    credentials: HTTPAuthorizationCredentials = Depends(bearer_scheme),
+) -> AuthContext:
+    """Like `get_auth` but opens and CLOSES its own short-lived DB
+    session before returning, instead of consuming the request-scoped
+    `get_session` dependency.
+
+    Long-lived endpoints (SSE) use this so each connected daemon
+    doesn't pin one `AsyncSession` / DB connection for the entire
+    stream lifetime. High-frequency routes that do their own DB work
+    also use it so auth does not keep a request-scoped transaction open
+    while the handler reads request bodies or object storage. FastAPI's
+    yield-dependency contract finalises `get_session` only after the
+    response ends, which would otherwise exhaust the pool under daemon
+    fan-out. The handler is responsible for opening its own short-lived
+    sessions inside the stream loop (see `routes/sync.py`) or releasing
+    read transactions before slow external I/O.
+    """
+    from app.core.database import async_session_factory
+
+    token = credentials.credentials
+    async with async_session_factory() as db:
+        ctx = await _auth_via_dev_bypass(token, db)
+        if not ctx:
+            ctx = await _auth_via_api_key(token, db)
+        if not ctx:
+            ctx = await _auth_via_clerk_jwt(token, db)
+    if not ctx:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid credentials")
+    return ctx
+
+
+def require_auth_scopes(auth: AuthContext, *needed: str) -> None:
+    """Enforce API-key scopes consistently across HTTP and MCP boundaries."""
+    if not auth.is_cli or auth.api_key is None:
+        return
+    scopes = auth.api_key.scopes
+    if scopes is None and not is_runtime_deployment_principal(auth):
+        return
+    missing = list(needed) if scopes is None else [scope for scope in needed if scope not in scopes]
+    if missing:
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            f"missing scope: {', '.join(missing)}",
+        )
+
+
+def require_scope_short_session(*needed: str):
+    """Same scope-check semantics as `require_scope`, paired with
+    `get_auth_short_session` so the route doesn't pin a DB connection
+    for its entire lifetime. Used by `/v1/sync/events` and high-frequency
+    daemon routes."""
+
+    async def _check(auth: AuthContext = Depends(get_auth_short_session)) -> AuthContext:
+        require_auth_scopes(auth, *needed)
+        return auth
+
+    return _check
+
+
+def require_scope(*needed: str):
+    """Build a FastAPI dependency that gates a route on `auth.api_key`
+    holding all of the given scope strings. Clerk-JWT auth (`is_cli =
+    False`) bypasses the check — interactive dashboard sessions
+    have implicit full access for now; tightening that comes with
+    the authz overhaul, not v1.
+
+    API keys with `scopes=NULL` keep wide access for legacy
+    compatibility. Strict-v2 runtime deployment keys instead carry
+    an explicit issuer-owned scope bundle.
+    """
+
+    async def _check(auth: AuthContext = Depends(get_auth)) -> AuthContext:
+        require_auth_scopes(auth, *needed)
+        return auth
+
+    return _check
+
+
+def require_any_scope(*accepted: str):
+    """Require at least one accepted scope for scoped CLI keys."""
+
+    async def _check(auth: AuthContext = Depends(get_auth)) -> AuthContext:
+        if not auth.is_cli or auth.api_key is None:
+            return auth
+        scopes = auth.api_key.scopes
+        if scopes is None and not is_runtime_deployment_principal(auth):
+            return auth
+        if scopes is not None and any(scope in scopes for scope in accepted):
+            return auth
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            f"missing one of scopes: {', '.join(accepted)}",
+        )
+
+    return _check
+
+
+async def require_cli_auth(auth: AuthContext = Depends(get_auth)) -> AuthContext:
+    """Require a legacy API key or the first-party OAuth CLI identity."""
+    if not auth.is_cli and not auth.oauth_cli:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "This endpoint requires CLI authentication")
+    return auth
+
+
+async def require_oauth_cli_auth(auth: AuthContext = Depends(get_auth)) -> AuthContext:
+    """Require a validated Clerk Public OAuth App CLI access token."""
+    if not auth.oauth_cli:
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            "This endpoint requires OAuth CLI authentication",
+        )
+    return auth
+
+
+def is_scoped_api_key(auth: AuthContext) -> bool:
+    """Any api_key with an explicit scope list is treated as
+    "narrow capability" and rejected from user-only routes. Today
+    that's just Agent API keys with narrow scopes, but the
+    check is on the scope list rather than `environment_id` so a
+    future scoped Personal key — minted with explicit scopes but
+    no env binding — slips into the same protective bucket
+    instead of inheriting Personal's wide-access bypass."""
+    return auth.is_cli and auth.api_key is not None and auth.api_key.scopes is not None
+
+
+def is_runtime_deployment_principal(auth: AuthContext) -> bool:
+    """Identify one fenced strict-v2 workload independently of its permissions."""
+    key = auth.api_key
+    return bool(
+        auth.is_cli
+        and key is not None
+        and key.managed
+        and key.environment_id is not None
+        and key.runtime_deployment_id
+    )
+
+
+def is_connected_agent_principal(auth: AuthContext) -> bool:
+    """Identify a current self-managed CLI, never a deployment-bound workload."""
+    if auth.oauth_cli:
+        return auth.api_key is None
+    key = auth.api_key
+    return bool(
+        key is not None
+        and not key.managed
+        and key.environment_id is None
+        and key.runtime_deployment_id is None
+    )
+
+
+def is_env_bound_api_key(auth: AuthContext) -> bool:
+    """An api_key pinned to a specific `environment_id` —
+    independent of whether its `scopes` list is narrow or full.
+    Legacy v1 Agent keys may have `scopes=None` (full account
+    capability, same as a user's own laptop key), while strict-v2
+    runtime deployment keys carry an issuer-owned scope bundle.
+    Project-scoped resources (skills and Vault attachments) honour this
+    binding. Memory is account-shared, and strict Hosted runtimes also receive
+    account session history; legacy environment keys retain environment-local
+    session visibility. The environment id remains provenance for Memory.
+
+    Distinct from `is_scoped_api_key`: the latter is about
+    capability narrowing (used to reject from user-only routes);
+    this one is about env-project identity and visibility."""
+    return auth.is_cli and auth.api_key is not None and auth.api_key.environment_id is not None
+
+
+async def require_user_auth(auth: AuthContext = Depends(get_auth)) -> AuthContext:
+    """Allow Clerk JWT (dashboard) and wide-access CLI keys;
+    reject any narrowly-scoped api_key. Use on routes whose
+    surface is intended for the user themselves (their laptop
+    CLI, the dashboard).
+
+    Legacy v1 Agent environment keys with `scopes=None` (the default
+    for keys minted via `POST /v1/auth/keys` with `environment_id`
+    set) PASS this gate by explicit policy. Strict-v2 runtime
+    deployment keys carry explicit scopes and are evaluated as scoped
+    keys. The blast-radius boundary for Agent API keys is enforced
+    inside the route's own `project_ids_visible_to` /
+    `_project_filter_*` calls, not here.
+
+    Only narrowly-scoped keys (explicit `scopes` list) are
+    rejected — those are deliberate capability narrowing and
+    have no business hitting the user's full surface.
+    """
+    if is_scoped_api_key(auth):
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            "This endpoint is not available to scoped api keys",
+        )
+    return auth
+
+
+async def require_user_auth_short_session(
+    auth: AuthContext = Depends(get_auth_short_session),
+) -> AuthContext:
+    """Apply the user-level gate without holding auth DB state across slow I/O."""
+    return await require_user_auth(auth)
+
+
+def require_clerk_id(auth: AuthContext) -> str:
+    """Return the Clerk id required by user-scoped integrations."""
+    clerk_id = auth.user.clerk_id
+    if not clerk_id:
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            "Clerk user authentication is required",
+        )
+    return clerk_id
+
+
+async def require_user_auth_unbound(
+    auth: AuthContext = Depends(require_user_auth),
+) -> AuthContext:
+    """Require Clerk JWT OR fully-unbound CLI api_key.
+
+    `require_user_auth` already rejects narrowly-scoped api_keys
+    (those with explicit `scopes` list). This wrapper adds the
+    additional rejection: api_keys bound to a specific environment
+    cannot invoke sharing operations.
+    """
+    if auth.is_cli and auth.api_key is not None and auth.api_key.environment_id is not None:
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            "user-level auth is required (Agent API keys cannot manage account resources)",
+        )
+    return auth
+
+
+async def require_user_cli(auth: AuthContext = Depends(get_auth)) -> AuthContext:
+    """CLI auth only (legacy API key or first-party OAuth access token).
+
+    Browser session JWTs remain rejected so plaintext is never exposed to the
+    web adapter. Narrowly-scoped API keys are also rejected. Agent API keys
+    pass by the same "behaves like user-installed clawdi" policy
+    as `require_user_auth` — `clawdi run` from a hosted agent pod
+    must resolve vault plaintext for the env it's bound to.
+    Per-env data filtering is enforced inside the resolve handler."""
+    if not auth.is_cli and not auth.oauth_cli:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "This endpoint requires CLI authentication")
+    if is_scoped_api_key(auth):
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            "Vault plaintext is not available to scoped api keys",
+        )
+    return auth
+
+
+async def optional_web_auth(
+    credentials: HTTPAuthorizationCredentials | None = Depends(optional_bearer_scheme),
+    db: AsyncSession = Depends(get_session),
+) -> AuthContext | None:
+    """Best-effort dashboard auth — returns the AuthContext if a valid
+    Clerk JWT is present, otherwise None. Never raises.
+
+    Used by the public share routes to detect the visitor: the owner
+    bypasses the permission check (their own private session is always
+    accessible to them), and direct `kind='user'` grants need a
+    visitor identity to match against. CLI api-keys are deliberately
+    ignored here — share URLs are for human browsers, not agent fetches
+    (those go through the owner-auth `/v1/sessions/{id}` routes).
+    """
+    if credentials is None:
+        return None
+    token = credentials.credentials
+    ctx = await _auth_via_dev_bypass(token, db)
+    if ctx:
+        return ctx
+    try:
+        ctx = await _auth_via_clerk_jwt(token, db)
+    except HTTPException:
+        # Treat any auth failure as anonymous — caller will then check
+        # public access permissions. We deliberately do NOT fall back to
+        # API-key auth here (see docstring).
+        return None
+    return None if ctx is not None and ctx.oauth_cli else ctx
+
+
+async def require_web_auth(auth: AuthContext = Depends(get_auth)) -> AuthContext:
+    """Require dashboard authentication (Clerk JWT only, not API key).
+
+    Used by endpoints whose intent is human-in-the-browser — e.g. the device
+    authorization approval flow. Refusing API keys here means a leaked key
+    can't be turned into a *new* API key by an attacker calling the approve
+    endpoint themselves.
+    """
+    if auth.is_cli or auth.oauth_cli:
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN, "This endpoint requires dashboard authentication"
+        )
+    return auth
+
+
+async def require_admin_api_key(
+    x_admin_key: str | None = Header(default=None, alias="X-Admin-Key"),
+) -> None:
+    """Gate admin-only endpoints (`POST/DELETE /v1/admin/auth/keys`) with
+    a shared secret in the `X-Admin-Key` header. Used by SaaS batch tooling
+    + ops-side scripts that don't have a per-user Clerk JWT in context.
+
+    503 when `admin_api_key` is empty — endpoints are disabled by default
+    for OSS self-hosters who don't need ops tooling. Constant-time
+    comparison once configured (defense against timing oracle even though
+    the gate is binary).
+    """
+    expected = settings.admin_api_key
+    if not expected:
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "admin endpoints are disabled (admin_api_key not configured)",
+        )
+    if not x_admin_key or not hmac.compare_digest(x_admin_key, expected):
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "invalid admin auth")
+
+
+class ShareTokenContext:
+    """What require_share_token returns."""
+
+    def __init__(self, project_id: UUID, link_id: UUID) -> None:
+        self.project_id = project_id
+        self.link_id = link_id
+
+
+async def require_share_token(
+    token: str,
+    db: AsyncSession = Depends(get_session),
+) -> ShareTokenContext:
+    """Validate an opaque share token from the URL path.
+
+    Anonymous endpoint dep - does NOT establish an AuthContext and
+    does NOT carry user identity. Token holders are bearers of access
+    to one specific project's skill content, nothing more.
+    """
+    from app.models.project_share_link import ProjectShareLink
+    from app.services.sharing import hash_share_token
+
+    token_hash = hash_share_token(token)
+    result = await db.execute(
+        select(ProjectShareLink).where(ProjectShareLink.token_hash == token_hash)
+    )
+    link = result.scalar_one_or_none()
+    if link is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "share link not found")
+    if link.revoked_at is not None:
+        raise HTTPException(status.HTTP_410_GONE, "share link has been revoked")
+    if link.expires_at is not None and link.expires_at < datetime.now(UTC):
+        raise HTTPException(status.HTTP_410_GONE, "share link has expired")
+    return ShareTokenContext(project_id=link.project_id, link_id=link.id)

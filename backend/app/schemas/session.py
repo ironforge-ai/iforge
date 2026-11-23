@@ -1,0 +1,842 @@
+import re
+import uuid
+from datetime import UTC, datetime
+from typing import Annotated, Any, Literal, Self
+
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    ModelWrapValidatorHandler,
+    PrivateAttr,
+    StringConstraints,
+    TypeAdapter,
+    field_validator,
+    model_validator,
+)
+
+from app.schemas.runtime_observed import (
+    HostedRuntimeObservedProviderPayload,
+    RuntimeObservedConfigResponse,
+    RuntimeObservedConfigSummaryResponse,
+)
+
+# Lone UTF-16 surrogates (U+D800..U+DFFF) are valid Python `str`
+# but cannot be encoded as UTF-8, so asyncpg rejects the bound
+# parameter and 500s the whole batch. The CLI used to truncate
+# `summary` with JS `.slice` (UTF-16 code units), which split an
+# emoji's surrogate pair and left a lone high surrogate at the
+# cut. The CLI now truncates by codepoint, but a stuck daemon
+# retried the bad payload ~34k times in prod before we shipped
+# the fix — strip on ingest so one bad record can't take the
+# batch down again.
+_LONE_SURROGATE_RE = re.compile(r"[\ud800-\udfff]")
+_MODEL_FIELD_RE = re.compile(r"""["'](?:default|model)["']\s*:\s*["']([^"']+)["']""")
+_MAX_MODEL_LENGTH = 100
+_SESSION_INPUT_ADAPTER = TypeAdapter(dict[str, object], config=ConfigDict(strict=True))
+
+
+# local_session_id flows straight into a file-store key
+# (`sessions/{user_id}/{local_session_id}.json`). Restrict to a safe charset
+# so a malicious client can't smuggle `/` or `..` and escape their own tenant
+# prefix. Claude Code / Codex session IDs are UUIDs or short slugs in practice;
+# we accept dashes, underscores, dots, and alphanumerics up to 200 chars.
+_LOCAL_SESSION_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._\-]{0,199}$")
+SafeLocalSessionId = Annotated[
+    str,
+    StringConstraints(
+        strip_whitespace=True,
+        min_length=1,
+        max_length=200,
+        pattern=_LOCAL_SESSION_ID_RE.pattern,
+    ),
+]
+
+
+def _is_negative_int_like(v: object) -> bool:
+    if v is None or isinstance(v, bool):
+        return False
+    if isinstance(v, int):
+        return v < 0
+    if isinstance(v, float):
+        return v.is_integer() and v < 0
+    if isinstance(v, str):
+        value = v.strip()
+        if not value:
+            return False
+        try:
+            return int(value) < 0
+        except ValueError:
+            return False
+    return False
+
+
+def _session_input(value: object) -> dict[str, object] | None:
+    try:
+        return _SESSION_INPUT_ADAPTER.validate_python(value)
+    except ValueError:
+        return None
+
+
+class SessionCreate(BaseModel):
+    _duration_seconds_clamped: bool = PrivateAttr(default=False)
+
+    # Typed as UUID so Pydantic returns a 422 on garbage input — without this
+    # the route's `uuid.UUID(...)` raises and FastAPI surfaces a 500.
+    environment_id: uuid.UUID
+    local_session_id: SafeLocalSessionId
+    project_path: str | None = None
+    started_at: datetime
+    ended_at: datetime | None = None
+    # Optional: caller-supplied "user actually used the session
+    # last" timestamp (= max of message timestamps in the JSONL).
+    # Adapters that can compute it (claude_code, codex) should
+    # send it; ones that can't (or don't yet) leave it null and
+    # the server falls back to ended_at / started_at. The route
+    # applies a clock-skew guard before persisting — see
+    # `_clamp_last_activity` in routes/sessions.py.
+    last_activity_at: datetime | None = None
+    # Non-negative numeric observables. Without `ge=0` a malformed
+    # client could post negative tokens / duration and corrupt the
+    # dashboard's aggregate counters. Duration can go negative when
+    # client clocks move backward; clamp that measurement noise at
+    # the boundary while keeping counters strict.
+    duration_seconds: int | None = Field(default=None, ge=0)
+    message_count: int = Field(default=0, ge=0)
+    input_tokens: int = Field(default=0, ge=0)
+    output_tokens: int = Field(default=0, ge=0)
+    cache_read_tokens: int = Field(default=0, ge=0)
+    # IronHermes records a per-session tool-call count; no other adapter
+    # does. It joins this block rather than the event row because there is no
+    # per-call field to attribute it to (D-16).
+    #
+    # The default is load-bearing for the other four runtimes: Claude Code,
+    # Codex, OpenClaw and Hermes have no such counter and will never send the
+    # field, so a required field here would 422 every push from every one of
+    # them. There is deliberately no cost and no cache-creation field beside
+    # it — both stay on `usage_events` at per-model grain (D-15).
+    tool_call_count: int = Field(default=0, ge=0)
+    model: str | None = None
+    models_used: list[str] | None = None
+    summary: str | None = None
+    tags: list[str] | None = None
+    status: str = "completed"
+    # SHA-256 hex of the JSON-serialized messages array. Server compares
+    # against the stored value to decide whether content needs reupload.
+    # Optional so old clients that don't compute hashes still get inserted;
+    # legacy rows with NULL hash are always treated as "needs content".
+    content_hash: str | None = None
+    content_protocol: Literal["snapshot-v1", "events-v1"] = "snapshot-v1"
+
+    @model_validator(mode="wrap")
+    @classmethod
+    def _clamp_negative_duration(
+        cls, data: object, handler: ModelWrapValidatorHandler[Self]
+    ) -> Self:
+        clamped = False
+        values = _session_input(data)
+        if values is not None and _is_negative_int_like(values.get("duration_seconds")):
+            data = {**values, "duration_seconds": 0}
+            clamped = True
+        model = handler(data)
+        if clamped:
+            model._duration_seconds_clamped = True
+        return model
+
+    @property
+    def duration_seconds_was_clamped(self) -> bool:
+        return self._duration_seconds_clamped
+
+    @field_validator("summary", mode="after")
+    @classmethod
+    def _strip_summary_surrogates(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        return _LONE_SURROGATE_RE.sub("", v)
+
+    @field_validator("model", mode="after")
+    @classmethod
+    def _clean_model(cls, v: str | None) -> str | None:
+        return _clean_model_value(v)
+
+    @field_validator("models_used", mode="after")
+    @classmethod
+    def _clean_models_used(cls, v: list[str] | None) -> list[str] | None:
+        if v is None:
+            return None
+        models: list[str] = []
+        for raw in v:
+            model = _clean_model_value(raw)
+            if model and model not in models:
+                models.append(model)
+        return models or None
+
+    @field_validator("started_at", "ended_at", "last_activity_at", mode="after")
+    @classmethod
+    def _coerce_to_utc(cls, v: datetime | None) -> datetime | None:
+        # Naive datetimes (no tzinfo) silently break the
+        # `_clamp_last_activity` helper in routes/sessions.py — it
+        # compares client values to `datetime.now(UTC)`, and naive vs
+        # aware comparisons raise TypeError, surfacing as a 500.
+        # JS clients always send `toISOString()` (ends in 'Z' →
+        # aware), but anything sending a Python-style ISO without
+        # offset would land naive. Coerce to UTC at the boundary —
+        # naive timestamps are interpreted as UTC, which is the only
+        # safe assumption for an unmarked value crossing a network.
+        if v is None:
+            return None
+        if v.tzinfo is None:
+            return v.replace(tzinfo=UTC)
+        return v
+
+
+def clean_model_value(v: str | None, *, max_length: int | None = None) -> str | None:
+    """Reduce a model field to a bare model name, or None if nothing survives.
+
+    Public because the usage-event schema shares it (T-02-26). Sharing rather
+    than re-declaring is deliberate and is the opposite call from
+    `_LONE_SURROGATE_RE`, which `usage_event.py` copies: that pattern is the
+    Unicode surrogate block, a constant that cannot drift into disagreement.
+    This is a hand-tuned policy about untrusted input, and two copies of a
+    policy drift — the whitespace bug behind T-02-26 is exactly that failure,
+    where the CLI's parser and this function disagreed about `.strip()`.
+
+    `.strip()` runs BEFORE the brace test, and that ordering is the control: a
+    blob with a leading space, newline or tab is still a blob, and a gate that
+    tests `startswith("{")` on unstripped input passes it through verbatim —
+    carrying whatever `headers` it holds, API keys included.
+
+    `max_length` is a parameter rather than a constant because the two grains
+    cap differently: sessions clamp here at 100, while the event grain leaves
+    length to its own `StringConstraints(max_length=200)`. Truncating inside
+    this function for the event grain would silently accept an over-long model
+    NAME that its schema is supposed to reject (T-02-19 / T-02-25).
+    """
+    if v is None:
+        return None
+    value = _LONE_SURROGATE_RE.sub("", v).strip()
+    if not value:
+        return None
+    if value.startswith("{") or value.startswith("["):
+        # `[` too: an array-shaped config (`[{"api_key": "..."}]`) is just as
+        # much a blob, and the regex below finds a model name in it if one is
+        # there. Without this it fell through and was stored whole.
+        match = _MODEL_FIELD_RE.search(value)
+        if match:
+            value = match.group(1).strip()
+        else:
+            return None
+    if not value:
+        return None
+    return value[:max_length] if max_length is not None else value
+
+
+def _clean_model_value(v: str | None) -> str | None:
+    """Session-grain cleaning: the shared rule, clamped to this grain's cap."""
+    return clean_model_value(v, max_length=_MAX_MODEL_LENGTH)
+
+
+class SessionBatchRequest(BaseModel):
+    # Cap at 500 sessions per request. The upsert builds a single
+    # multi-VALUES INSERT with ~17 bound parameters per row;
+    # asyncpg refuses queries with > 32767 parameters total
+    # (PostgreSQL wire protocol limit). Pre-fix `clawdi push
+    # --modules sessions --all` shipped every session in one
+    # body — observed 500-ing in prod with
+    # `sqlalchemy.exc.InterfaceError: ... query arguments cannot
+    # exceed 32767` for users with > ~1900 sessions. 500 leaves
+    # ample headroom (8500 params) and the CLI side now chunks
+    # to match (packages/cli/src/commands/push.ts).
+    sessions: list[SessionCreate] = Field(max_length=500)
+
+
+class EnvironmentCreate(BaseModel):
+    machine_id: str
+    machine_name: str
+    default_name: str | None = Field(
+        default=None,
+        max_length=200,
+        description="Deprecated and ignored; agent default names are assigned by the server.",
+    )
+    agent_type: str
+    agent_version: str | None = None
+    os: str
+    adapter_modules: list[Literal["sessions", "skills"]] | None = Field(
+        default=None, min_length=1, max_length=2
+    )
+
+    @field_validator("adapter_modules", mode="after")
+    @classmethod
+    def _unique_adapter_modules(
+        cls, value: list[Literal["sessions", "skills"]] | None
+    ) -> list[Literal["sessions", "skills"]] | None:
+        if value is not None and len(set(value)) != len(value):
+            raise ValueError("adapter_modules must not contain duplicates")
+        return value
+
+
+class EnvironmentCreatedResponse(BaseModel):
+    id: str
+
+
+class EnvironmentUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    display_name: str | None = Field(default=None, max_length=120)
+
+    @field_validator("display_name", mode="after")
+    @classmethod
+    def _clean_display_name(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        cleaned = _LONE_SURROGATE_RE.sub("", value).strip()
+        return cleaned or None
+
+
+class EnvironmentReorderRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    environment_ids: list[uuid.UUID] = Field(min_length=1, max_length=500)
+
+
+class AgentReorderRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    agent_ids: list[uuid.UUID] = Field(min_length=1, max_length=500)
+
+
+class AgentResponse(BaseModel):
+    id: str
+    name: str
+    default_name: str | None = None
+    machine_id: str
+    machine_name: str
+    display_name: str | None = None
+    avatar_url: str | None = None
+    sort_order: int = 0
+    agent_type: str
+    agent_version: str | None
+    os: str
+    last_seen_at: datetime | None
+    # `clawdi daemon` liveness / observability — populated by
+    # the heartbeat endpoint. NULL on environments whose daemon
+    # has never checked in (legacy laptops, freshly created
+    # envs). Dashboard renders "offline" red when last_sync_at is
+    # null or older than 90s; "syncing" green when fresh and
+    # last_sync_error is null.
+    last_sync_at: datetime | None = None
+    last_sync_error: str | None = None
+    last_revision_seen: int | None = None
+    queue_depth_high_water: int = 0
+    dropped_count: int = 0
+    sync_enabled: bool = False
+    # True when the row was registered with a caller-owned stable identity.
+    # These rows have no local registration key and cannot be disconnected
+    # through the user-facing dashboard route.
+    explicit_identity: bool = False
+    # Schema-enforced NOT NULL on agent_environments — every env
+    # has a default project after register_environment runs (which
+    # heals legacy rows that lost their value). Daemons rely on this
+    # being present to know which SSE events belong to them.
+    # Stringified for JSON (UUIDs serialise as strings via
+    # FastAPI default).
+    default_project_id: str
+    adapter_modules: list[Literal["sessions", "skills"]] | None = None
+
+
+class EnvironmentResponse(AgentResponse):
+    hosted_managed: bool = Field(
+        default=False,
+        description=(
+            "Deprecated. True only when this environment has direct hosted runtime "
+            "desired state in Cloud API. This no longer infers hosted ownership "
+            "from machine_id, machine_name, or sibling runtime metadata; dashboard "
+            "consumers should use control-plane ownership sets instead."
+        ),
+    )
+    hosted_deployment_id: str | None = Field(
+        default=None,
+        description=(
+            "Deprecated. Deployment id from direct hosted runtime desired state only. "
+            "This no longer falls back to sibling runtime inference."
+        ),
+    )
+
+
+class RuntimeManagedSkillSummary(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    enabled: bool
+    version: int = Field(ge=1)
+
+
+class AgentProjectSkillDesiredItem(BaseModel):
+    project_id: str
+    skill_id: str
+    skill_key: str
+    content_hash: str
+    archive_url: str
+
+
+class AgentProjectSkillDesiredResponse(BaseModel):
+    agent_id: str
+    skills: list[AgentProjectSkillDesiredItem] = Field(default_factory=list)
+
+
+class AgentMcpServerInventoryItem(BaseModel):
+    """A safe row whose user-declaration provenance was proven upstream."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    transport: Literal["stdio", "streamable-http", "sse"]
+    enabled: bool = True
+    source: Literal["explicit_user_declaration"]
+
+
+class AgentMcpInventoryResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    agent_id: str
+    deployment_id: str | None = None
+    availability: Literal["available", "unavailable"]
+    servers: list[AgentMcpServerInventoryItem] = Field(default_factory=list)
+
+
+class RuntimeObservedDesiredResponse(BaseModel):
+    deployment_id: str
+    instance_id: str
+    desired_config_generation: int
+    desired_source_revision: str | None = None
+    provider_id: str | None = None
+    enabled_runtimes: list[str]
+    has_mcp: bool = False
+    has_tools: bool = False
+    updated_at: datetime | None = None
+
+
+class AgentRuntimeObservedDesiredResponse(RuntimeObservedDesiredResponse):
+    managed_skills: list[RuntimeManagedSkillSummary] = Field(default_factory=list)
+
+
+class RuntimeObservedHealthResponse(BaseModel):
+    status: Literal["ok", "error", "stale", "unknown", "not_configured"]
+    reasons: list[str] = Field(default_factory=list, json_schema_extra={"default": []})
+    observed_at: datetime | None = None
+
+
+class RuntimeObservedProviderHealthResponse(BaseModel):
+    provider_id: str
+    status: Literal["ok", "error", "unknown", "not_configured"]
+    reasons: list[str] = Field(default_factory=list, json_schema_extra={"default": []})
+    desired: dict[str, Any] | None = None
+    observed: HostedRuntimeObservedProviderPayload | None = None
+
+
+class RuntimeObservedResponseBase(BaseModel):
+    environment: EnvironmentResponse
+    observed: RuntimeObservedConfigResponse | None = None
+    health: RuntimeObservedHealthResponse
+    provider_health: list[RuntimeObservedProviderHealthResponse] = Field(
+        default_factory=list,
+        json_schema_extra={"default": []},
+    )
+
+
+class RuntimeObservedResponse(RuntimeObservedResponseBase):
+    desired: RuntimeObservedDesiredResponse | None = None
+
+
+class AgentRuntimeObservedResponse(RuntimeObservedResponseBase):
+    desired: AgentRuntimeObservedDesiredResponse | None = None
+
+
+class RuntimeObservedSummaryCountsResponse(BaseModel):
+    ok: int = 0
+    error: int = 0
+    stale: int = 0
+    unknown: int = 0
+    not_configured: int = 0
+
+
+class RuntimeObservedSummaryItemResponse(BaseModel):
+    environment: EnvironmentResponse
+    desired: RuntimeObservedDesiredResponse | None = None
+    observed: RuntimeObservedConfigSummaryResponse | None = None
+    health: RuntimeObservedHealthResponse
+    provider_health: list[RuntimeObservedProviderHealthResponse] = Field(
+        default_factory=list,
+        json_schema_extra={"default": []},
+    )
+
+
+class RuntimeObservedSummaryResponse(BaseModel):
+    counts: RuntimeObservedSummaryCountsResponse
+    items: list[RuntimeObservedSummaryItemResponse]
+
+
+class SessionBatchResponse(BaseModel):
+    # Rows that didn't exist before the batch.
+    created: int
+    # Rows that existed but were modified — either metadata changed,
+    # the content hash differs, or the row had no `file_key` yet.
+    updated: int
+    # Rows whose hash matched and `file_key` was already set — no work to do.
+    unchanged: int
+    # local_session_ids that need a follow-up content upload. Always a
+    # superset of `created` (new rows have no content yet); also includes
+    # any updated row whose stored bytes are stale.
+    needs_content: list[str]
+    # local_session_ids the upsert dropped at the conflict step
+    # (cross-env race window — see sessions.py `WHERE existing.env
+    # IS NULL OR existing.env IS NOT DISTINCT FROM excluded.env`).
+    # CLI/daemon callers MUST treat these as not-yet-synced:
+    # don't write the lock entry, don't mark them done. The next
+    # batch (after the winning writer's row is visible) will hit
+    # the pre-fetch cross-env mismatch check and 409 cleanly.
+    # Pre-round-46 the response silently omitted these ids; the
+    # client treated "id not in needs_content" as success and
+    # wrote a stale lock — the loser never retried.
+    rejected: list[str] = []
+    # Durable dashboard deletions. Callers must not upload content for
+    # these ids, but should cache the current local hash as converged.
+    suppressed: list[str] = []
+
+
+class SessionSearchAnchorResponse(BaseModel):
+    kind: Literal["snapshot_offset", "event_seq"]
+    position: int = Field(ge=0)
+    revision: str
+
+
+class SessionSearchMatchResponse(BaseModel):
+    role: Literal["user", "assistant"]
+    excerpt: str
+    anchor: SessionSearchAnchorResponse
+
+
+class SessionSearchNavigationResponse(BaseModel):
+    index: int = Field(ge=1)
+    total: int = Field(ge=1)
+    current: SessionSearchAnchorResponse
+    previous: SessionSearchAnchorResponse | None = None
+    next: SessionSearchAnchorResponse | None = None
+
+
+class SessionListItemResponse(BaseModel):
+    id: str
+    local_session_id: str
+    project_path: str | None
+    agent_name: str | None = None
+    agent_display_name: str | None = None
+    agent_default_name: str | None = None
+    agent_type: str | None
+    machine_name: str | None = None
+    started_at: datetime
+    ended_at: datetime | None
+    # Server clock — when the row was last written/updated. Used by
+    # ETag/cache layers, NOT shown in the dashboard. Kept in the
+    # response so callers that DO want "row last touched" semantics
+    # (incremental fetch) can read it.
+    updated_at: datetime
+    # User activity time — derived from message timestamps during
+    # ingest. The dashboard's "Last activity" column reads this.
+    # Distinct from updated_at: a session pushed at 9am whose last
+    # message was yesterday at 11pm has updated_at=9am and
+    # last_activity_at=yesterday 11pm.
+    last_activity_at: datetime
+    duration_seconds: int | None
+    message_count: int
+    input_tokens: int
+    output_tokens: int
+    cache_read_tokens: int
+    # Default 0 so rows written before the column existed — and older
+    # generated clients that don't expect the field — still deserialize.
+    # A column that is stored but never returned is a column nobody can
+    # verify.
+    tool_call_count: int = 0
+    model: str | None
+    models_used: list[str] | None
+    summary: str | None
+    tags: list[str] | None
+    status: str
+    # Surfaced so `clawdi pull` can diff cloud vs. local sidecar without
+    # downloading the content body.
+    content_hash: str | None = None
+    content_protocol: Literal["snapshot-v1", "events-v1"] = "snapshot-v1"
+    event_head_hash: str | None = None
+    # True when an active `kind='link'` row exists in `session_permissions`
+    # for this session. Computed via EXISTS subquery in the list/detail
+    # query — there is NO denormalized `sessions.visibility` column.
+    # Default False so old generated clients that don't expect the field
+    # still deserialize cleanly.
+    is_shared: bool = False
+    # Present only when a message body contributed to a `q` search result.
+    # It is a bounded excerpt, never a second copy of the transcript.
+    search_match: SessionSearchMatchResponse | None = None
+
+    # Extracted external entities (PR refs, repo names, branches),
+    # surfaced as sidebar chips. NULL when nothing was found or when
+    # the row was uploaded before the column existed — the sidebar
+    # hides the chip row in that case. See
+    # `services/session_metrics.py` for the upload-time extraction.
+    related_refs: dict[str, list[str]] | None = None
+
+
+class PublicSessionResponse(BaseModel):
+    """Public-safe session detail payload for `/v1/public/sessions/{id}`."""
+
+    id: str
+    summary: str | None
+    project_path: str | None
+    agent_type: str | None
+    model: str | None
+    models_used: list[str] | None
+    started_at: datetime
+    ended_at: datetime | None
+    last_activity_at: datetime | None
+    duration_seconds: int | None
+    message_count: int
+    input_tokens: int
+    output_tokens: int
+    cache_read_tokens: int
+    tags: list[str] | None
+    status: str
+    related_refs: dict[str, list[str] | None] | None = None
+    owner_name: str | None
+    owner_avatar_url: str | None
+
+
+class SessionDetailResponse(SessionListItemResponse):
+    has_content: bool
+
+
+class SessionPermissionResponse(BaseModel):
+    """One row from `session_permissions`.
+
+    Returned by `GET /v1/sessions/{id}/permissions` and as the body of
+    `POST /v1/sessions/{id}/permissions`. Identifier columns mirror
+    Google Drive's `permissions` resource: a `kind` discriminator plus
+    explicit fields for whichever principal type is populated.
+    """
+
+    id: str
+    kind: Literal["link", "user", "email"]
+    # Mutually exclusive based on `kind`. Both NULL for `kind='link'`.
+    user_id: str | None = None
+    email: str | None = None
+    role: Literal["viewer"]
+    invited_by: str | None = None
+    accepted_at: datetime | None = None
+    expires_at: datetime | None = None
+    created_at: datetime
+
+
+class SessionPermissionsResponse(BaseModel):
+    """`GET /v1/sessions/{id}/permissions` — active permissions for a
+    session, newest-first. Preserves legacy live-link management and can
+    later support a "people with access" list.
+    """
+
+    permissions: list[SessionPermissionResponse]
+
+
+class SessionPermissionCreate(BaseModel):
+    """`POST /v1/sessions/{id}/permissions` body.
+
+    Legacy live-link access uses `{"kind": "link"}`. Future
+    invite-by-email sends `{"kind": "email",
+    "email": "alice@x.com"}`; future direct user grant sends
+    `{"kind": "user", "user_id": "..."}`.
+    """
+
+    kind: Literal["link", "user", "email"]
+    user_id: str | None = None
+    email: str | None = None
+    # Optional in the request body — server defaults to 'viewer'.
+    role: Literal["viewer"] | None = None
+
+
+class SessionShareCreate(BaseModel):
+    """Create an immutable public snapshot of all or part of a Session."""
+
+    scope: Literal["session", "through", "response"] = "session"
+    position: int | None = Field(default=None, ge=0)
+
+    @model_validator(mode="after")
+    def validate_scope_position(self) -> Self:
+        if self.scope == "session" and self.position is not None:
+            raise ValueError("session scope must not include a position")
+        if self.scope != "session" and self.position is None:
+            raise ValueError(f"{self.scope} scope requires a position")
+        return self
+
+
+class SessionShareResponse(BaseModel):
+    id: str
+    session_id: str
+    scope: Literal["session", "through", "response"]
+    start_position: int | None
+    end_position: int
+    message_count: int
+    share_url: str
+    created_at: datetime
+
+
+class SessionSharesResponse(BaseModel):
+    shares: list[SessionShareResponse]
+
+
+class SessionShareListItemResponse(BaseModel):
+    """One active Session link in the owner's cross-Session inventory."""
+
+    id: str
+    kind: Literal["snapshot", "live"]
+    session_id: str
+    session_title: str
+    scope: Literal["session", "through", "response"]
+    message_count: int = Field(ge=0)
+    share_url: str
+    created_at: datetime
+
+
+class PublicSessionShareResponse(BaseModel):
+    id: str
+    title: str
+    agent_type: str | None
+    model: str | None
+    started_at: datetime
+    created_at: datetime
+    message_count: int
+    scope: Literal["session", "through", "response"]
+
+
+class SessionUploadResponse(BaseModel):
+    status: Literal["uploaded"]
+    file_key: str
+    # Hash of the bytes the server just stored. Lets the client confirm the
+    # round-trip matched what it computed locally — divergence here would
+    # indicate a multipart corruption or a charset issue worth surfacing.
+    content_hash: str
+
+
+class SessionExtractResponse(BaseModel):
+    """Result of `POST /v1/sessions/{local_session_id}/extract`."""
+
+    memories_created: int
+
+
+class SessionMessageResponse(BaseModel):
+    """One agent message inside a session content file.
+
+    Mirrors the shape the CLI writes via `clawdi push` — the JSON stored
+    in the file store is a list of these. Declared here so it lives in the
+    OpenAPI schema and flows through to generated TS types; keeps the frontend
+    from having to maintain a parallel interface.
+    """
+
+    role: Literal["user", "assistant"]
+    content: str
+    model: str | None = None
+    timestamp: datetime | None = None
+
+
+class PublicSessionShareExportResponse(PublicSessionShareResponse):
+    messages: list[SessionMessageResponse]
+    share_url: str
+
+
+class SessionTimelineMessageResponse(SessionMessageResponse):
+    """Dashboard timeline message with its canonical event position."""
+
+    kind: Literal["message"] = "message"
+    position: int = Field(ge=0)
+
+
+class SessionToolCallResponse(BaseModel):
+    """Safe, owner-only projection of a tool invocation."""
+
+    kind: Literal["tool_call"] = "tool_call"
+    position: int = Field(ge=0)
+    call_id: str
+    name: str
+    arguments_json: str | None = None
+    model: str | None = None
+    timestamp: datetime | None = None
+
+
+class SessionToolResultResponse(BaseModel):
+    """Safe, owner-only projection of a tool result."""
+
+    kind: Literal["tool_result"] = "tool_result"
+    position: int = Field(ge=0)
+    call_id: str
+    name: str | None = None
+    status: Literal["completed", "error"]
+    content: str | None = None
+    result_json: str | None = None
+    timestamp: datetime | None = None
+
+
+SessionTimelineItemResponse = Annotated[
+    SessionTimelineMessageResponse | SessionToolCallResponse | SessionToolResultResponse,
+    Field(discriminator="kind"),
+]
+
+
+class PublicSessionExportResponse(PublicSessionResponse):
+    """Public-safe structured session export payload."""
+
+    messages: list[SessionMessageResponse]
+    share_url: str
+
+
+class SessionMessagesPage(BaseModel):
+    """Paginated slice of a session's messages. Used by the dashboard's
+    detail page; the full-content download endpoint
+    (`GET /v1/sessions/{id}/content`) stays unchanged so the CLI's
+    `clawdi pull` mirror still gets a single full JSON array.
+
+    `total` is the count of visible messages in the current content revision
+    (not the count returned in `items`) so the client can render a
+    "loaded N/M" hint and decide whether to fetch more pages. `offset` is
+    relative to the requested order: zero means the oldest message for
+    ascending reads and the newest message for descending reads.
+    """
+
+    content_revision: str | None = Field(default=None, exclude_if=lambda value: value is None)
+    items: list[SessionMessageResponse]
+    total: int
+    offset: int
+    limit: int
+    # Absolute offset in the requested direction for a resolved search match.
+    # Omitted for ordinary pagination and stale or invalidated search anchors.
+    anchor_offset: int | None = Field(
+        default=None,
+        ge=0,
+        exclude_if=lambda value: value is None,
+    )
+    search_navigation: SessionSearchNavigationResponse | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
+
+
+class SessionTimelinePage(BaseModel):
+    """Paginated owner-only projection of visible messages and tool activity."""
+
+    content_revision: str | None = Field(default=None, exclude_if=lambda value: value is None)
+    items: list[SessionTimelineItemResponse]
+    total: int
+    offset: int
+    limit: int
+    anchor_offset: int | None = Field(
+        default=None,
+        ge=0,
+        exclude_if=lambda value: value is None,
+    )
+    search_navigation: SessionSearchNavigationResponse | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )

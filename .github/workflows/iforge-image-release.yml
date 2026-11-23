@@ -1,0 +1,304 @@
+name: iforge Image Release
+
+on:
+  workflow_run:
+    workflows: ["Backend CI"]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Git ref to build. Defaults to the workflow SHA. Do not use an older ref while an automatic release is running or pending."
+        required: false
+      build_web:
+        description: "Also publish the web image. Requires matching public web build variables."
+        required: false
+        type: boolean
+        default: false
+      web_public_api_url:
+        description: "VITE_IFORGE_API_URL baked into the web image."
+        required: false
+        default: "http://localhost:8000"
+      web_clerk_publishable_key:
+        description: "VITE_CLERK_PUBLISHABLE_KEY baked into the web image."
+        required: false
+      web_public_deploy_api_url:
+        description: "VITE_IFORGE_DEPLOY_API_URL baked into the web image."
+        required: false
+        default: "http://localhost:50021"
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: iforge-image-release-production
+  cancel-in-progress: false
+  queue: max
+
+env:
+  BACKEND_IMAGE_NAME: ghcr.io/ironforge-ai/iforge-backend
+  DOCKER_BUILD_RECORD_UPLOAD: "false"
+  SIDECAR_IMAGE_NAME: ghcr.io/ironforge-ai/iforge-whatsapp-baileys-sidecar
+  WEB_IMAGE_NAME: ghcr.io/ironforge-ai/iforge-web
+
+jobs:
+  build:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.event == 'push' &&
+       github.event.workflow_run.head_branch == 'main' &&
+       github.event.workflow_run.head_repository.full_name == github.repository)
+    runs-on: ${{ vars.CI_RUNNER || 'blacksmith-16vcpu-ubuntu-2404' }}
+    timeout-minutes: 30
+    outputs:
+      image_tag: ${{ steps.rev.outputs.sha }}
+      sidecar_revision: ${{ steps.sidecar-revision.outputs.revision }}
+    steps:
+      - name: Resolve source ref
+        id: source-ref
+        # Refs reach the shell through env, never by expression interpolation,
+        # so a dispatch input cannot inject shell syntax.
+        env:
+          WORKFLOW_RUN_HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          INPUT_REF: ${{ inputs.ref }}
+        run: |
+          if [ "${GITHUB_EVENT_NAME}" = "workflow_run" ]; then
+            ref="${WORKFLOW_RUN_HEAD_SHA}"
+          else
+            ref="${INPUT_REF}"
+            if [ -z "$ref" ]; then
+              ref="${GITHUB_SHA}"
+            fi
+          fi
+          echo "ref=${ref}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ steps.source-ref.outputs.ref }}
+          fetch-depth: 2
+
+      - id: rev
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.3.14"
+
+      - name: Resolve WhatsApp sidecar deployment revision
+        id: sidecar-revision
+        run: |
+          revision="$(bun run scripts/whatsapp-sidecar-deployment-revision.ts)"
+          test "${#revision}" = 64
+          echo "revision=${revision}" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v4
+
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Resolve OCI label metadata
+        id: labels
+        run: |
+          created="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          {
+            echo "created=${created}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Build and push backend image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: backend/Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: ${{ env.BACKEND_IMAGE_NAME }}:${{ steps.rev.outputs.sha }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ steps.rev.outputs.sha }}
+            org.opencontainers.image.version=${{ steps.rev.outputs.sha }}
+            org.opencontainers.image.created=${{ steps.labels.outputs.created }}
+            org.opencontainers.image.title=iforge Backend
+            org.opencontainers.image.description=Open-source iforge FastAPI backend image for self-hosted and Coolify deployments.
+          provenance: false
+          cache-from: type=gha,scope=iforge-backend-image
+          cache-to: type=gha,mode=max,scope=iforge-backend-image
+
+      - name: Build and push WhatsApp sidecar image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: packages/whatsapp-baileys-sidecar/Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: ${{ env.SIDECAR_IMAGE_NAME }}:${{ steps.rev.outputs.sha }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ steps.rev.outputs.sha }}
+            org.opencontainers.image.version=${{ steps.rev.outputs.sha }}
+            org.opencontainers.image.created=${{ steps.labels.outputs.created }}
+            org.opencontainers.image.title=iforge WhatsApp Baileys Sidecar
+            org.opencontainers.image.description=Multiplexed physical WhatsApp transport for iforge.
+            io.clawdi.whatsapp-sidecar.deployment-revision=${{ steps.sidecar-revision.outputs.revision }}
+          provenance: false
+          cache-from: type=gha,scope=iforge-whatsapp-sidecar-image
+          cache-to: type=gha,mode=max,scope=iforge-whatsapp-sidecar-image
+
+      - name: Validate web image inputs
+        if: inputs.build_web
+        env:
+          WEB_CLERK_PUBLISHABLE_KEY: ${{ inputs.web_clerk_publishable_key }}
+        run: |
+          if [ -z "$WEB_CLERK_PUBLISHABLE_KEY" ]; then
+            echo "web_clerk_publishable_key is required when build_web=true." >&2
+            exit 1
+          fi
+
+      - name: Build and push web image
+        if: inputs.build_web
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: apps/web/Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: ${{ env.WEB_IMAGE_NAME }}:${{ steps.rev.outputs.sha }}
+          build-args: |
+            VITE_IFORGE_API_URL=${{ inputs.web_public_api_url }}
+            VITE_CLERK_PUBLISHABLE_KEY=${{ inputs.web_clerk_publishable_key }}
+            VITE_IFORGE_HOSTED=
+            VITE_IFORGE_DEPLOY_API_URL=${{ inputs.web_public_deploy_api_url }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ steps.rev.outputs.sha }}
+            org.opencontainers.image.version=${{ steps.rev.outputs.sha }}
+            org.opencontainers.image.created=${{ steps.labels.outputs.created }}
+            org.opencontainers.image.title=iforge Web
+            org.opencontainers.image.description=Open-source iforge dashboard image for self-hosted deployments.
+          provenance: false
+          cache-from: type=gha,scope=iforge-web-image
+          cache-to: type=gha,mode=max,scope=iforge-web-image
+
+      - name: Print image summary
+        run: |
+          echo "### iforge Images" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Backend: \`${{ env.BACKEND_IMAGE_NAME }}:${{ steps.rev.outputs.sha }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- WhatsApp sidecar: \`${{ env.SIDECAR_IMAGE_NAME }}:${{ steps.rev.outputs.sha }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- WhatsApp sidecar deployment revision: \`${{ steps.sidecar-revision.outputs.revision }}\`" >> "$GITHUB_STEP_SUMMARY"
+          if [ "${{ inputs.build_web }}" = "true" ]; then
+            echo "- Web: \`${{ env.WEB_IMAGE_NAME }}:${{ steps.rev.outputs.sha }}\`" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "- Web: skipped" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+  deploy-vps:
+    needs: build
+    # Reviewers and deploy secrets live on the production GitHub environment.
+    environment: production
+    runs-on: ${{ vars.CI_RUNNER || 'blacksmith-16vcpu-ubuntu-2404' }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.build.outputs.image_tag }}
+
+      - uses: webfactory/ssh-agent@v0.10.0
+        with:
+          ssh-private-key: ${{ secrets.SSH_PRIVATE_KEY }}
+
+      - name: Pin server host keys
+        env:
+          SSH_KNOWN_HOSTS: ${{ secrets.SSH_KNOWN_HOSTS }}
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "$SSH_KNOWN_HOSTS" > ~/.ssh/known_hosts
+
+      - name: Write Kamal secrets
+        env:
+          KAMAL_SECRETS: ${{ secrets.KAMAL_SECRETS }}
+          CHANNEL_WHATSAPP_BAILEYS_SIDECAR_TOKEN: ${{ secrets.CHANNEL_WHATSAPP_BAILEYS_SIDECAR_TOKEN }}
+          TS_AUTHKEY: ${{ secrets.WHATSAPP_TAILSCALE_AUTHKEY }}
+          WHATSAPP_TAILSCALE_EGRESS_ENABLED: ${{ vars.WHATSAPP_TAILSCALE_EGRESS_ENABLED }}
+        run: |
+          test -n "$CHANNEL_WHATSAPP_BAILEYS_SIDECAR_TOKEN"
+          case "$CHANNEL_WHATSAPP_BAILEYS_SIDECAR_TOKEN" in
+            *[!A-Za-z0-9_-]*) exit 1 ;;
+          esac
+          test "${#CHANNEL_WHATSAPP_BAILEYS_SIDECAR_TOKEN}" -ge 43
+          test "${#CHANNEL_WHATSAPP_BAILEYS_SIDECAR_TOKEN}" -le 128
+          install -d -m 700 .kamal
+          printf '%s\n' "$KAMAL_SECRETS" > .kamal/secrets
+          secrets_tmp="$(mktemp)"
+          trap 'rm -f "$secrets_tmp"' EXIT
+          awk '
+            !/^CLOUDFLARE_ORIGIN_CERT=/ && !/^CLOUDFLARE_ORIGIN_KEY=/ { print }
+            END {
+              print "CLOUDFLARE_ORIGIN_CERT=$CLOUDFLARE_ORIGIN_CERT"
+              print "CLOUDFLARE_ORIGIN_KEY=$CLOUDFLARE_ORIGIN_KEY"
+            }
+          ' .kamal/secrets > "$secrets_tmp"
+          mv "$secrets_tmp" .kamal/secrets
+          printf 'CHANNEL_WHATSAPP_BAILEYS_SIDECAR_TOKEN=%s\n' \
+            "$CHANNEL_WHATSAPP_BAILEYS_SIDECAR_TOKEN" >> .kamal/secrets
+          if [ "$WHATSAPP_TAILSCALE_EGRESS_ENABLED" = true ]; then
+            case "$TS_AUTHKEY" in
+              *[!A-Za-z0-9_-]*|"")
+                echo "WHATSAPP_TAILSCALE_AUTHKEY has an invalid format" >&2
+                exit 1
+                ;;
+            esac
+            case "$TS_AUTHKEY" in
+              tskey-*) ;;
+              *)
+                echo "WHATSAPP_TAILSCALE_AUTHKEY has an invalid format" >&2
+                exit 1
+                ;;
+            esac
+            if [ "${#TS_AUTHKEY}" -lt 20 ] || [ "${#TS_AUTHKEY}" -gt 512 ]; then
+              echo "WHATSAPP_TAILSCALE_AUTHKEY has an invalid length" >&2
+              exit 1
+            fi
+            printf 'TS_AUTHKEY=%s\n' "$TS_AUTHKEY" >> .kamal/secrets
+          fi
+          chmod 600 .kamal/secrets
+
+      - uses: ./.github/actions/setup-bun-ci
+        with:
+          bun-version: "1.3.14"
+
+      - name: Prepare runner for Ruby
+        run: |
+          sudo install -d -o "$(id -u)" -g "$(id -g)" /opt/hostedtoolcache
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends libyaml-0-2 build-essential
+
+      - name: Install Kamal
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.4"
+
+      - name: Kamal deploy
+        env:
+          CLOUDFLARE_ORIGIN_CERT: ${{ secrets.CLOUDFLARE_ORIGIN_CERT }}
+          CLOUDFLARE_ORIGIN_KEY: ${{ secrets.CLOUDFLARE_ORIGIN_KEY }}
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_SSH_PROXY_COMMAND: ${{ secrets.DEPLOY_SSH_PROXY_COMMAND }}
+          DEPLOY_IMAGE_VERSION: ${{ needs.build.outputs.image_tag }}
+          SIDECAR_REVISION: ${{ needs.build.outputs.sidecar_revision }}
+          WHATSAPP_TAILSCALE_EGRESS_ENABLED: ${{ vars.WHATSAPP_TAILSCALE_EGRESS_ENABLED }}
+          WHATSAPP_TAILSCALE_EXIT_NODE: ${{ vars.WHATSAPP_TAILSCALE_EXIT_NODE }}
+        run: |
+          gem install kamal -v '2.12.0' --no-document
+          test "$(kamal version)" = "2.12.0"
+          if [ "${WHATSAPP_TAILSCALE_EGRESS_ENABLED:-}" = true ]; then
+            export WHATSAPP_TAILSCALE_CONFIG_REVISION="$(
+              scripts/deploy-whatsapp-sidecar.sh --print-tailscale-config-revision
+            )"
+          fi
+          scripts/deploy-whatsapp-sidecar.sh
+          kamal deploy -P --version "${{ needs.build.outputs.image_tag }}"

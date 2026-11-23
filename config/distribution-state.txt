@@ -1,0 +1,32 @@
+# Is this fork's CLI installable from a public route yet? -- phase 03.1, plan 12.
+#
+# DECIDES: whether any document in this repository may present a network-fetching install
+# instruction as an executable command. It is the single answer to both of BRAND-05's first
+# two verbs -- `installs` and `self-updates` -- because both resolve under the same release
+# repository (NATIVE_RELEASE_REPOSITORY in packages/cli/src/lib/native-release-manifest.ts).
+#
+# DECIDED BY: the user, at the blocking checkpoint in 03.1-12-PLAN.md task 1, on 2026-09-07.
+# DECIDED AS: option A -- document the truth. Rationale, in the terms the decision was taken:
+# option A follows D-03 as written ("private registry now, public names chosen now"), needs
+# no external setup, and is fully reversible. Option B was declined as one-way: npm forbids
+# reusing a `name@version`, so publishing now and renaming later means republishing under a
+# new name and deprecating the old one.
+#
+# WHY IT EXISTS: at verification the documented routes were probed and every one was dead --
+# the raw installer URL 404s, the npm dist-tags endpoint 401s, the package endpoint 404s, and
+# the release repository exists but reports size 0 with an empty releases list. Re-probed on
+# 2026-09-07 at execution time: all four unchanged. A document that instructs a user to pipe
+# a 404 into a shell is an instruction anyone who later creates that path can claim, so the
+# repository states the fact once, here, and the documents are held to it by
+# packages/cli/tests/install-docs-contract.test.ts.
+#
+# GRAMMAR: one `key=value` pair per line. Blank lines and lines whose first character is `#`
+# are skipped. `public_install_routes` accepts exactly `unavailable` or `available`.
+#
+# TO REVERSE (when publishing happens): publish the package publicly, cut a release so the
+# raw installer URL resolves, flip the value below to `available`, add a
+# `public_routes_confirmed` date line, and delete the not-yet-published note from both
+# READMEs. The contract test then requires the one-liners to be present rather than absent,
+# so it fails until the documents are restored -- the flip cannot be forgotten halfway.
+
+public_install_routes=unavailable

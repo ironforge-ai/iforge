@@ -1,0 +1,138 @@
+import { type Dirent, existsSync, realpathSync, statSync } from "node:fs";
+import { homedir } from "node:os";
+import { isAbsolute, join, relative } from "node:path";
+
+/**
+ * Directory names to skip when scanning for skills. Applied by every adapter's
+ * `collectSkills()`. Lives here (not in registry.ts) to avoid a cycle, since
+ * registry.ts already imports every adapter.
+ */
+export const SKIP_DIRS = new Set(["node_modules", ".git", "dist", "build", "__pycache__"]);
+
+export function isPathWithinRoots(path: string, roots: readonly string[]): boolean {
+	return roots.some((root) => {
+		const fromRoot = relative(root, path);
+		return fromRoot === "" || (!fromRoot.startsWith("..") && !isAbsolute(fromRoot));
+	});
+}
+
+/**
+ * Accept real directories and directory symlinks that stay inside the Skill
+ * root. Canonical path segments retain the same hidden/SKIP_DIRS exclusions as
+ * the visible scan, so a symlink cannot bypass those boundaries.
+ */
+export function safeSkillDirectoryPath(
+	root: string,
+	entry: Dirent,
+	parent: string = root,
+): string | null {
+	if (!entry.isDirectory() && !entry.isSymbolicLink()) return null;
+	const candidate = join(parent, entry.name);
+	try {
+		const canonicalRoot = realpathSync(root);
+		const canonicalCandidate = realpathSync(candidate);
+		if (!statSync(canonicalCandidate).isDirectory()) return null;
+		if (!isPathWithinRoots(canonicalCandidate, [canonicalRoot])) return null;
+		const canonicalSegments = relative(canonicalRoot, canonicalCandidate).split(/[\\/]/);
+		if (canonicalSegments.some((segment) => segment.startsWith(".") || SKIP_DIRS.has(segment))) {
+			return null;
+		}
+		return candidate;
+	} catch {
+		return null;
+	}
+}
+
+// All getters compute lazily. Module-level constants would freeze the path at
+// import time and ignore env changes (and break per-test HOME overrides).
+// We read `$HOME` directly because os.homedir() is cached by the runtime.
+
+function home(): string {
+	return process.env.HOME || homedir();
+}
+
+/** Claude Code: honors `$CLAUDE_CONFIG_DIR`; fallback `~/.claude`. */
+export function getClaudeHome(): string {
+	return process.env.CLAUDE_CONFIG_DIR?.trim() || join(home(), ".claude");
+}
+
+/** Codex: honors `$CODEX_HOME`; fallback `~/.codex`. */
+export function getCodexHome(): string {
+	return process.env.CODEX_HOME?.trim() || join(home(), ".codex");
+}
+
+/**
+ * GitHub CLI config home. Mirrors `gh help environment` precedence:
+ * `$GH_CONFIG_DIR`, `$XDG_CONFIG_HOME/gh`, Windows `%AppData%/GitHub CLI`,
+ * then `~/.config/gh`.
+ */
+export function getGhConfigHome(): string {
+	const override = process.env.GH_CONFIG_DIR?.trim();
+	if (override) return override;
+	const xdg = process.env.XDG_CONFIG_HOME?.trim();
+	if (xdg) return join(xdg, "gh");
+	const appData = process.env.APPDATA?.trim() || process.env.AppData?.trim();
+	if (process.platform === "win32" && appData) return join(appData, "GitHub CLI");
+	return join(home(), ".config", "gh");
+}
+
+/** Hermes: honors `$HERMES_HOME`; fallback `~/.hermes`. */
+export function getHermesHome(): string {
+	return process.env.HERMES_HOME?.trim() || join(home(), ".hermes");
+}
+
+/** Pi coding agent: honors `$PI_CODING_AGENT_DIR`; fallback `~/.pi/agent`. */
+export function getPiHome(): string {
+	return process.env.PI_CODING_AGENT_DIR?.trim() || join(home(), ".pi", "agent");
+}
+
+export function getPiSessionsDir(): string {
+	return join(getPiHome(), "sessions");
+}
+
+/** OpenCode data root, matching the official xdg-basedir default. */
+export function getOpenCodeDataDir(): string {
+	const xdgData = process.env.XDG_DATA_HOME?.trim() || join(home(), ".local", "share");
+	return join(xdgData, "opencode");
+}
+
+/** OpenCode SQLite path; relative `$OPENCODE_DB` values live under its data root. */
+export function getOpenCodeDbPath(): string {
+	const override = process.env.OPENCODE_DB?.trim();
+	if (!override) return join(getOpenCodeDataDir(), "opencode.db");
+	return override === ":memory:" || isAbsolute(override)
+		? override
+		: join(getOpenCodeDataDir(), override);
+}
+
+/**
+ * IronHermes: honors `$IRONHERMES_HOME`; fallback `~/.ironhermes`.
+ *
+ * A separate install root from Hermes on purpose — the two runtimes coexist
+ * and each registers as its own iforge agent. Never resolve one from the other.
+ */
+export function getIronHermesHome(): string {
+	return process.env.IRONHERMES_HOME?.trim() || join(home(), ".ironhermes");
+}
+
+/**
+ * OpenClaw: honors `$OPENCLAW_STATE_DIR`, else probes home-relative names
+ * (`.openclaw` → `.clawdbot` → `.moltbot` — same multi-name fallback
+ * vercel/skills uses in `getOpenClawGlobalSkillsDir`), then system-wide
+ * deployment paths (`/data/openclaw`, `/var/openclaw`) for server installs
+ * where state lives outside `$HOME`. Falls back to `~/.openclaw` so the
+ * default-write path stays in user-space.
+ */
+export function getOpenClawHome(): string {
+	const override = process.env.OPENCLAW_STATE_DIR?.trim();
+	if (override) return override;
+	const h = home();
+	for (const name of [".openclaw", ".clawdbot", ".moltbot"]) {
+		const dir = join(h, name);
+		if (existsSync(dir)) return dir;
+	}
+	for (const dir of ["/data/openclaw", "/var/openclaw"]) {
+		if (existsSync(dir)) return dir;
+	}
+	return join(h, ".openclaw");
+}

@@ -1,0 +1,420 @@
+[project]
+name = "clawdi-backend"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+    "anyio>=4.15.1",
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.54.0",
+    "sqlalchemy[asyncio]>=2.0",
+    "asyncpg==0.31.0",
+    "alembic>=1.20.0",
+    "pydantic-settings>=2.14.0",
+    "pyjwt[crypto]==2.15.0",
+    "cryptography>=50.0.1",
+    # SafePublicHttpClient relies on request extension forwarding and
+    # sni_hostname handling verified in these exact paired releases.
+    "httpcore==1.0.9",
+    "httpx==0.28.1",
+    "httpx2>=2.13.1,<3.0.0",
+    "idna>=3.20",
+    "python-multipart>=0.0.20",
+    "aiofiles>=24.1",
+    "psycopg2-binary>=2.9.13",
+    "pgvector>=0.2.5",
+    "openai>=3.19.2",
+    "fastembed>=0.8.1",
+    "sentry-sdk[fastapi]==2.70.0",
+    # https://pypi.org/pypi/websockets/17.0.1/json
+    "websockets==17.1",
+    "zstandard>=0.25.0",
+    "pyyaml>=6.0",
+    # Keep the published pair exact: PyPI composio 0.21.1 metadata pins
+    # composio-client 1.43.0. https://pypi.org/pypi/composio/0.21.1/json
+    "composio==0.21.1",
+    "composio-client==1.43.0",
+    # Official Streamable HTTP client lifecycle for Composio Tool Router.
+    "mcp==2.2.0",
+    "prometheus-client>=0.25.0",
+    # Keep the runtime and generated typing distributions on their latest
+    # common public patch. https://pypi.org/pypi/boto3/1.43.67/json
+    "boto3==1.43.67",
+    "botocore==1.43.67",
+    "xeddsa==1.2.0",
+    # ZoneInfo fallback for slim production images without system zoneinfo.
+    "tzdata==2026.4",
+]
+
+[project.optional-dependencies]
+# Mem0 SaaS-backed memory provider. Source installs keep it optional because
+# most self-hosters use builtin pgvector and mem0ai has a heavier dependency
+# tree. The official backend image installs this extra, but each user still
+# opts in with their own API key. Other deployments can enable it with
+# `uv pip install -e ".[mem0]"`. The `Mem0Provider`
+# class lazy-imports `mem0`, and `get_memory_provider` falls
+# back to the builtin provider with a warning when the import
+# fails — so this extra controls whether mem0 is *available*,
+# not whether memories work at all.
+mem0 = ["mem0ai==2.0.18"]
+
+[dependency-groups]
+dev = [
+    "basedpyright==1.39.10",
+    "pytest>=8.3",
+    "pytest-asyncio>=0.24",
+    "aiosqlite>=0.20",
+    # The /v2 contract suite validates responses against the filtered contract
+    # document's component schemas (06.2 RESEARCH F2). Already locked transitively.
+    "jsonschema==4.26.0",
+    "ruff>=0.16.9",
+    # Catch "import declared in code but not in deps" drift —
+    # the same class of bug that let mem0/mem0ai stay
+    # undeclared for months without CI noticing.
+    "deptry>=0.20",
+    # Generated from boto3/botocore service models and pinned to the runtime
+    # SDK line. The full bundle resolves every generated client overload for
+    # strict Pyright consumers; the base stubs own boto3's public surface.
+    "boto3-stubs==1.43.67",
+    "boto3-stubs-full==1.43.67",
+    "botocore-stubs==1.43.67",
+    # Public annotations for the pinned asyncpg 0.31 runtime contract.
+    "asyncpg-stubs==0.31.3",
+    "types-pyyaml==6.0.12.20260906",
+]
+
+[tool.basedpyright]
+typeCheckingMode = "standard"
+pythonVersion = "3.12"
+include = [
+    "app/__init__.py",
+    "app/core",
+    "app/main.py",
+    "app/middleware",
+    "app/models",
+    "app/routes/__init__.py",
+    "app/routes/a*.py",
+    "app/routes/c*.py",
+    "app/routes/channel_routers",
+    "app/routes/d*.py",
+    "app/routes/m*.py",
+    "app/routes/p*.py",
+    "app/routes/runtime.py",
+    "app/routes/s*.py",
+    "app/routes/v*.py",
+    "app/runtime_entrypoint.py",
+    "app/schemas",
+    "app/services/__init__.py",
+    "app/services/a*.py",
+    "app/services/c*.py",
+    "app/services/d*.py",
+    "app/services/e*.py",
+    "app/services/f*.py",
+    "app/services/h*.py",
+    "app/services/memory*.py",
+    "app/services/metrics*.py",
+    "app/services/p*.py",
+    "app/services/r*.py",
+    "app/services/s*.py",
+    "app/services/t*.py",
+    "app/services/u*.py",
+    "app/services/v*.py",
+    "app/services/w*.py",
+    "app/tasks",
+    "app/workers",
+]
+strict = [
+    "app/__init__.py",
+    "app/core/__init__.py",
+    "app/core/api_scopes.py",
+    "app/core/asyncpg_dialect.py",
+    "app/core/auth.py",
+    "app/core/config.py",
+    "app/core/database.py",
+    "app/core/logging_config.py",
+    "app/core/project.py",
+    "app/core/query_utils.py",
+    "app/core/sentry.py",
+    "app/core/skill_key.py",
+    "app/core/skill_sync_protocol.py",
+    "app/main.py",
+    "app/middleware/__init__.py",
+    "app/middleware/body_size_limit.py",
+    "app/middleware/request_id.py",
+    "app/middleware/request_timing.py",
+    "app/middleware/security_headers.py",
+    "app/middleware/skill_upload_preflight.py",
+    "app/models/__init__.py",
+    "app/models/agent_plugin.py",
+    "app/models/agent_project_binding.py",
+    "app/models/ai_provider.py",
+    "app/models/api_key.py",
+    "app/models/app_setting.py",
+    "app/models/audit.py",
+    "app/models/base.py",
+    "app/models/channel.py",
+    "app/models/device_authorization.py",
+    "app/models/distributed_state.py",
+    "app/models/hosted_runtime.py",
+    "app/models/memory.py",
+    "app/models/platform_idempotency.py",
+    "app/models/platform_workload_auth.py",
+    "app/models/principal_lifecycle.py",
+    "app/models/project.py",
+    "app/models/project_invitation.py",
+    "app/models/project_membership.py",
+    "app/models/project_share_link.py",
+    "app/models/runtime_observation.py",
+    "app/models/session.py",
+    "app/models/session_permission.py",
+    "app/models/session_share.py",
+    "app/models/share_redeem_attempt.py",
+    "app/models/skill.py",
+    "app/models/user.py",
+    "app/models/vault.py",
+    "app/routes/__init__.py",
+    "app/routes/admin.py",
+    "app/routes/agent_project_bindings.py",
+    "app/routes/agent_skills.py",
+    "app/routes/ai_providers.py",
+    "app/routes/audit.py",
+    "app/routes/auth.py",
+    "app/routes/capabilities.py",
+    "app/routes/channel_routers/__init__.py",
+    "app/routes/channel_routers/debug.py",
+    "app/routes/channel_routers/discord.py",
+    "app/routes/channel_routers/public.py",
+    "app/routes/channel_routers/shared.py",
+    "app/routes/channel_routers/telegram.py",
+    "app/routes/channel_routers/whatsapp.py",
+    "app/routes/channel_routers/whatsapp_onboarding.py",
+    "app/routes/channels.py",
+    "app/routes/clerk_webhooks.py",
+    "app/routes/cli_auth.py",
+    "app/routes/connectors.py",
+    "app/routes/dashboard.py",
+    "app/routes/mcp_bridge.py",
+    "app/routes/me.py",
+    "app/routes/memories.py",
+    "app/routes/metrics.py",
+    "app/routes/platform.py",
+    "app/routes/plugin_catalog.py",
+    "app/routes/projects.py",
+    "app/routes/public_sessions.py",
+    "app/routes/runtime.py",
+    "app/routes/runtime_observation_v2.py",
+    "app/routes/search.py",
+    "app/routes/session_content_events.py",
+    "app/routes/session_events.py",
+    "app/routes/session_shares.py",
+    "app/routes/settings.py",
+    "app/routes/share_redeem.py",
+    "app/routes/sharing.py",
+    "app/routes/skills.py",
+    "app/routes/sync.py",
+    "app/routes/vault.py",
+    "app/routes/vault_requests.py",
+    "app/runtime_entrypoint.py",
+    "app/schemas/__init__.py",
+    "app/schemas/admin.py",
+    "app/schemas/ai_provider.py",
+    "app/schemas/api_key.py",
+    "app/schemas/audit.py",
+    "app/schemas/channel.py",
+    "app/schemas/cli_auth.py",
+    "app/schemas/common.py",
+    "app/schemas/connector.py",
+    "app/schemas/dashboard.py",
+    "app/schemas/memory.py",
+    "app/schemas/native_provider.py",
+    "app/schemas/platform.py",
+    "app/schemas/platform_oauth.py",
+    "app/schemas/plugin_catalog.py",
+    "app/schemas/problem.py",
+    "app/schemas/provider_environment_repair.py",
+    "app/schemas/runtime.py",
+    "app/schemas/runtime_observation.py",
+    "app/schemas/runtime_observed.py",
+    "app/schemas/session.py",
+    "app/schemas/session_events.py",
+    "app/schemas/settings.py",
+    "app/schemas/sharing.py",
+    "app/schemas/skill.py",
+    "app/schemas/user.py",
+    "app/schemas/vault.py",
+    "app/schemas/vault_requests.py",
+    "app/services/__init__.py",
+    "app/services/agent_bindings.py",
+    "app/services/agent_environments.py",
+    "app/services/agent_lifecycle.py",
+    "app/services/agent_skill_projection.py",
+    "app/services/ai_provider_auth_transition.py",
+    "app/services/ai_provider_capabilities.py",
+    "app/services/ai_provider_connection.py",
+    "app/services/ai_provider_connection_ownership.py",
+    "app/services/ai_provider_credentials.py",
+    "app/services/ai_provider_oauth_attempt.py",
+    "app/services/ai_provider_oauth_lifecycle.py",
+    "app/services/ai_provider_oauth_revoke_worker.py",
+    "app/services/api_key.py",
+    "app/services/app_setting_registry.py",
+    "app/services/app_settings.py",
+    "app/services/audit.py",
+    "app/services/channel_config.py",
+    "app/services/channel_debug_events.py",
+    "app/services/channel_delivery_worker.py",
+    "app/services/channel_message_retention_worker.py",
+    "app/services/channel_wakeups.py",
+    "app/services/channel_webhook_delivery_worker.py",
+    "app/services/channel_webhooks.py",
+    "app/services/channels.py",
+    "app/services/clerk_backend.py",
+    "app/services/clerk_cli_oauth_settings.py",
+    "app/services/codex_oauth.py",
+    "app/services/composio.py",
+    "app/services/connected_agent_fence.py",
+    "app/services/discord_advisory_session.py",
+    "app/services/discord_command_reconciliation_worker.py",
+    "app/services/discord_gateway_worker.py",
+    "app/services/discord_rate_limiter.py",
+    "app/services/distributed_state.py",
+    "app/services/embedding.py",
+    "app/services/file_store.py",
+    "app/services/file_store_s3.py",
+    "app/services/hosted_runtime_secrets.py",
+    "app/services/http_cache.py",
+    "app/services/managed_ai_provider.py",
+    "app/services/memory_extraction.py",
+    "app/services/memory_provider.py",
+    "app/services/memory_recall.py",
+    "app/services/memory_types.py",
+    "app/services/metrics.py",
+    "app/services/metrics_auth.py",
+    "app/services/platform_contract.py",
+    "app/services/platform_workload_auth.py",
+    "app/services/platform_workload_signer.py",
+    "app/services/plugin_bundle.py",
+    "app/services/plugin_catalog.py",
+    "app/services/postgres_listener.py",
+    "app/services/principal_lifecycle.py",
+    "app/services/principal_lifecycle_cleanup_worker.py",
+    "app/services/private_ip.py",
+    "app/services/project_runtime_skills.py",
+    "app/services/provider_environment_repair.py",
+    "app/services/provider_environment_verifier_access.py",
+    "app/services/provider_identity_handoff.py",
+    "app/services/rate_limiter.py",
+    "app/services/runtime_drift_summary.py",
+    "app/services/runtime_generation.py",
+    "app/services/runtime_manifest_resources.py",
+    "app/services/runtime_observation.py",
+    "app/services/runtime_observation_retention_worker.py",
+    "app/services/runtime_observed_evidence.py",
+    "app/services/runtime_source.py",
+    "app/services/runtime_source_authority.py",
+    "app/services/runtime_source_revision.py",
+    "app/services/runtime_state_cleanup.py",
+    "app/services/runtime_vaults.py",
+    "app/services/safe_public_http.py",
+    "app/services/secret_detection.py",
+    "app/services/session_content.py",
+    "app/services/session_content_notifications.py",
+    "app/services/session_event_retention_worker.py",
+    "app/services/session_events.py",
+    "app/services/session_export.py",
+    "app/services/session_refs.py",
+    "app/services/session_search.py",
+    "app/services/session_shares.py",
+    "app/services/sharing.py",
+    "app/services/skill_installer.py",
+    "app/services/skill_search.py",
+    "app/services/sync_events.py",
+    "app/services/tar_utils.py",
+    "app/services/telegram_rate_limiter.py",
+    "app/services/url_security.py",
+    "app/services/user_provisioning.py",
+    "app/services/vault.py",
+    "app/services/vault_crypto.py",
+    "app/services/vault_requests.py",
+    "app/services/whatsapp_baileys.py",
+    "app/services/whatsapp_delivery_transport.py",
+    "app/services/whatsapp_device_onboarding.py",
+    "app/services/whatsapp_managed_onboarding.py",
+    "app/services/whatsapp_native_transport.py",
+    "app/services/whatsapp_noise.py",
+    "app/services/whatsapp_provider_bridge.py",
+    "app/services/whatsapp_runtime_types.py",
+    "app/services/whatsapp_sidecar_registry.py",
+    "app/services/whatsapp_wabinary_tokens.py",
+    "app/tasks/__init__.py",
+    "app/workers/__init__.py",
+    "app/workers/channels.py",
+    "app/workers/discord_gateway.py",
+    "app/workers/embedding.py",
+]
+
+[tool.deptry]
+known_first_party = ["app"]
+extend_exclude = ["alembic/"]
+
+# `pydantic` and `starlette` are pulled in transitively via
+# fastapi / pydantic-settings; we import them directly in many
+# places without declaring them. Whitelist for now — promote to
+# direct deps if the transitive chain ever changes upstream.
+[tool.deptry.per_rule_ignores]
+DEP003 = ["pydantic", "starlette"]
+# DEP002 = "declared but not imported." These are runtime
+# infrastructure — used via SQLAlchemy/FastAPI/CLI, not
+# imported by name in app/. Removing them would actually
+# break the runtime, so silence the noise.
+DEP002 = [
+    "asyncpg",            # SQLAlchemy postgresql+asyncpg driver.
+    "alembic",            # Migration CLI.
+    "httpcore",           # Pinned transport behavior used by HTTPX request extensions.
+    "python-multipart",   # FastAPI multipart parser; loaded via Form().
+    "aiofiles",           # FastAPI's UploadFile uses async file I/O internally.
+    "psycopg2-binary",    # Sync PG driver kept for alembic offline-mode SQL.
+    "mem0ai",             # Optional untyped SDK; loaded by the narrow Mem0 adapter at runtime.
+    "tzdata",             # IANA database loaded indirectly by the stdlib zoneinfo module.
+]
+
+# `app/services/memory_provider_mem0.py` imports `mem0` only inside
+# its lazy resolution boundary, gated on the `[mem0]` production extra.
+[tool.deptry.package_module_name_map]
+mem0ai = "mem0"
+
+[tool.pdm.scripts]
+dev = "uvicorn app.main:app --reload --host 0.0.0.0 --port 8000"
+start = "uvicorn app.main:app --host 0.0.0.0 --port 8000"
+channels-worker = "python -m app.workers.channels"
+migrate = "alembic upgrade head"
+audit-ai-provider-models = "python -m scripts.audit_ai_provider_models"
+lint = "ruff check ."
+format = "ruff format ."
+typecheck = "uv run --extra mem0 python scripts/type_governance.py owned"
+type-inventory = "uv run --extra mem0 python scripts/type_governance.py inventory"
+test = { shell = "../scripts/test.sh backend" }
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+extend-exclude = ["alembic/versions"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "session"
+asyncio_default_test_loop_scope = "session"
+strict_config = true
+strict_markers = true
+testpaths = ["tests"]
+markers = [
+    "committed_db: use real commits for independent-connection or concurrency behavior",
+    "mock_only: contract case that only the in-process mock can set up",
+    "hosted_only: contract case that needs a hosted target (06.2 D-08)",
+]
+filterwarnings = [
+    # asyncpg emits these on some platforms — harmless.
+    "ignore::DeprecationWarning:asyncpg",
+]

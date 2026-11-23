@@ -1,0 +1,606 @@
+import asyncio
+import logging
+import re
+from collections.abc import AsyncGenerator
+from contextlib import asynccontextmanager
+from typing import Literal
+
+from fastapi import Depends, FastAPI, Request, Response, WebSocket, status
+from fastapi.encoders import jsonable_encoder
+from fastapi.exception_handlers import http_exception_handler
+from fastapi.exceptions import RequestValidationError
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel
+from sqlalchemy import text
+from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
+from sqlalchemy.ext.asyncio import AsyncSession
+from starlette.exceptions import HTTPException as StarletteHTTPException
+from starlette.requests import ClientDisconnect
+
+from app.core.auth import AccountSuspendedHTTPException, warm_clerk_jwks
+from app.core.config import settings
+from app.core.database import (
+    ControlLockTimeoutError,
+    control_engine,
+    control_snapshot_engine,
+    engine,
+    finish_cleanup,
+    get_session,
+)
+from app.core.logging_config import configure_application_logging
+from app.core.sentry import init_sentry
+from app.middleware.body_size_limit import BodySizeLimitMiddleware
+from app.middleware.request_id import RequestIDMiddleware
+from app.middleware.request_timing import RequestTimingMiddleware
+from app.middleware.security_headers import SecurityHeadersMiddleware
+from app.middleware.skill_upload_preflight import SkillUploadPreflightMiddleware
+from app.routes.access import router as access_router
+from app.routes.admin import router as admin_router
+from app.routes.admin import whatsapp_pairing_router as admin_whatsapp_pairing_router
+from app.routes.agent_project_bindings import router as agent_project_bindings_router
+from app.routes.agent_skills import router as agent_skills_router
+from app.routes.ai_providers import router as ai_providers_router
+from app.routes.audit import router as audit_router
+from app.routes.auth import router as auth_router
+from app.routes.capabilities import router as capabilities_router
+from app.routes.channels import router as channels_router
+from app.routes.clerk_webhooks import router as clerk_webhooks_router
+from app.routes.cli_auth import router as cli_auth_router
+from app.routes.companions import router as companions_router
+from app.routes.connectors import router as connectors_router
+from app.routes.dashboard import router as dashboard_router
+from app.routes.mcp_bridge import router as mcp_bridge_router
+from app.routes.me import router as me_router
+from app.routes.memories import router as memories_router
+from app.routes.metrics import router as metrics_router
+from app.routes.platform import router as platform_router
+from app.routes.plugin_catalog import router as plugin_catalog_router
+from app.routes.projects import router as projects_router
+from app.routes.public_sessions import (
+    PUBLIC_SESSION_EXPORT_CACHE_CONTROL,
+    is_public_session_export_path,
+)
+from app.routes.public_sessions import (
+    router as public_sessions_router,
+)
+from app.routes.runtime import router as runtime_router
+from app.routes.runtime_observation_v2 import router as runtime_observation_v2_router
+from app.routes.search import router as search_router
+from app.routes.session_content_events import router as session_content_events_router
+from app.routes.session_events import router as session_events_router
+from app.routes.session_shares import router as session_shares_router
+from app.routes.sessions import router as sessions_router
+from app.routes.settings import router as settings_router
+from app.routes.share_redeem import router as share_redeem_router
+from app.routes.sharing import router as sharing_router
+from app.routes.skills import agent_router as skills_agent_router
+from app.routes.skills import legacy_project_upload_router as skills_legacy_project_upload_router
+from app.routes.skills import project_router as skills_project_router
+from app.routes.skills import router as skills_router
+from app.routes.skills import scope_router as skills_scope_router
+from app.routes.sync import router as sync_router
+from app.routes.tenant_exports import router as tenant_exports_router
+from app.routes.vault import router as vault_router
+from app.routes.vault_requests import router as vault_requests_router
+from app.services.ai_provider_auth_transition import OAuthCredentialPayloadCorruptError
+from app.services.channels import close_channel_provider_http_client
+from app.services.composio import close_composio_client, run_tool_router_mcp_session_reaper
+from app.services.discord_advisory_session import DiscordAdvisorySession
+from app.services.embedding import LocalEmbedder, LocalServiceEmbedder
+from app.services.memory_types import MemoryProviderUnavailableError, MemoryProviderUpstreamError
+from app.services.metrics import db_control_lock_timeouts, db_pool_timeouts, observe_event_loop_lag
+from app.services.sync_events import start_postgres_listener, stop_postgres_listener
+from app.services.tenant_export import COMPANION_EXPORT_UPLOAD_MAX_BYTES
+from app.services.whatsapp_sidecar_registry import ConfiguredWhatsAppSidecarClientPool
+
+configure_application_logging()
+log = logging.getLogger(__name__)
+init_sentry()
+
+
+def _validation_errors_for_log(exc: RequestValidationError) -> list[dict[str, object]]:
+    errors: list[dict[str, object]] = []
+    for err in exc.errors():
+        item: dict[str, object] = {
+            "type": err.get("type"),
+            "loc": err.get("loc"),
+            "msg": err.get("msg"),
+        }
+        errors.append(item)
+    return errors
+
+
+class HealthResponse(BaseModel):
+    status: Literal["ok"]
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI) -> AsyncGenerator[None, None]:
+    """ASGI lifespan — warm slow singletons at startup so the first request
+    path isn't the one that pays for them.
+
+    Fastembed downloads ~1GB on first `memory add` otherwise. We kick the
+    load off the main thread so it doesn't block startup itself; if it
+    finishes before the first embedding call, that call is fast.
+    """
+    # Populate FastAPI's schema cache before accepting requests: its default
+    # OpenAPI endpoint otherwise generates the schema on the event loop.
+    await asyncio.to_thread(_app.openapi)
+
+    background: set[asyncio.Task[None]] = set()
+    whatsapp_sidecars = ConfiguredWhatsAppSidecarClientPool(
+        settings.channel_whatsapp_baileys_sidecar_token.get_secret_value(),
+        base_url=settings.channel_whatsapp_baileys_sidecar_url or None,
+    )
+    await start_postgres_listener()
+    try:
+        await whatsapp_sidecars.start()
+    except Exception:
+        await whatsapp_sidecars.stop()
+        await stop_postgres_listener()
+        raise
+
+    await warm_clerk_jwks()
+    lag_monitor = asyncio.create_task(observe_event_loop_lag(), name="event-loop-lag")
+    background.add(lag_monitor)
+    lag_monitor.add_done_callback(background.discard)
+
+    session_reaper = asyncio.create_task(
+        run_tool_router_mcp_session_reaper(), name="composio-session-reaper"
+    )
+    background.add(session_reaper)
+    session_reaper.add_done_callback(background.discard)
+
+    if settings.memory_embedding_mode.lower() == "local":
+
+        async def _warm() -> None:
+            try:
+                await LocalEmbedder.get().initialize()
+                log.info("Local embedder warmed.")
+            except (OSError, RuntimeError, ValueError) as exc:
+                log.warning("Local embedder warmup failed: %s", exc)
+
+        # Hold a strong reference — asyncio.create_task returns a weak-ref'd
+        # Task and the GC can reap it mid-flight otherwise. Python docs
+        # explicitly warn about this pattern.
+        task = asyncio.create_task(_warm(), name="embedder-warm")
+        background.add(task)
+        task.add_done_callback(background.discard)
+
+    discord_locks = DiscordAdvisorySession(
+        engine, liveness_interval_seconds=settings.discord_gateway_poll_interval_seconds
+    )
+    _app.state.discord_gateway_locks = discord_locks
+    try:
+        yield
+    finally:
+        try:
+            await finish_cleanup(discord_locks.close)
+        finally:
+            del _app.state.discord_gateway_locks
+            # On shutdown, cancel anything still running and wait for it so we
+            # don't leak a task into whatever signal handler runs next.
+            for t in background:
+                t.cancel()
+            if background:
+                await asyncio.gather(*background, return_exceptions=True)
+            try:
+                await whatsapp_sidecars.stop()
+            finally:
+                try:
+                    await stop_postgres_listener()
+                finally:
+                    try:
+                        await close_channel_provider_http_client()
+                    finally:
+                        try:
+                            await close_composio_client()
+                        finally:
+                            try:
+                                await LocalServiceEmbedder.close_shared()
+                            finally:
+                                try:
+                                    await control_engine.dispose()
+                                finally:
+                                    await control_snapshot_engine.dispose()
+
+
+app = FastAPI(
+    title=settings.app_name,
+    # Hide interactive docs in production unless explicitly enabled.
+    docs_url="/docs" if settings.environment != "production" else None,
+    redoc_url="/redoc" if settings.environment != "production" else None,
+    lifespan=lifespan,
+)
+
+# Middleware is added in innermost-to-outermost order. Starlette wraps each
+# subsequent `add_middleware` call around the previous stack, so the LAST
+# call becomes the OUTERMOST handler seeing the request first. We want:
+#
+#   request → SecurityHeaders → RequestID → RequestTiming → CORS
+#           → SkillUploadPreflight → BodySizeLimit → route
+#                                                        ↓
+#   response ← SecurityHeaders ← RequestID ← RequestTiming ← CORS
+#            ← SkillUploadPreflight ← BodySizeLimit ← route
+#
+# so security headers are a final response wrapper, a CORS-rejected preflight
+# still carries X-Request-ID on the way back out, RequestTiming can correlate
+# slow logs with that id, and BodySizeLimit fires AFTER CORS preflight
+# (preflight is OPTIONS, which the limiter ignores anyway). The limiter sits
+# inside CORS so legitimate CORS responses still apply when we 413; otherwise
+# a browser upload over the cap would see an opaque network error instead of
+# "Request body too large". SkillUploadPreflight sits in front of the limiter
+# so invalid daemon upload metadata can be rejected before FastAPI's multipart
+# parser spools a doomed file part.
+
+# Global cap on declared body size for body-bearing methods.
+# Sized ABOVE the largest legitimate route-level cap so multipart
+# framing (boundary, form-data Content-Disposition, filename header,
+# trailing CRLF) doesn't push a near-limit upload over the global
+# threshold. The session-upload route caps content at 50 MB and
+# re-checks after streaming; an honest 50 MB multipart body
+# carries ~1-4 KB of framing overhead, but we headroom by a full
+# 1 MB so a generous boundary token + long filename can't trip
+# the global rejection before the route's check fires. Without
+# this headroom, near-limit session files were 413'd by the
+# middleware even though the underlying content fit the per-route
+# cap.
+_MAX_SESSION_CONTENT_BYTES = 50 * 1024 * 1024  # mirror of sessions.py
+_MULTIPART_OVERHEAD_HEADROOM = 1 * 1024 * 1024  # 1 MB
+_MAX_REQUEST_BODY_BYTES = _MAX_SESSION_CONTENT_BYTES + _MULTIPART_OVERHEAD_HEADROOM
+# One route takes more (plan 06-19): a runtime's gzip database dump for a tenant export, which
+# the route itself bounds again while it reads (T-06-19-05).
+_COMPANION_EXPORT_UPLOAD_PATH = re.compile(
+    r"^/v1/runtime/companion-installations/[^/]+/exports/[^/]+$"
+)
+app.add_middleware(
+    BodySizeLimitMiddleware,
+    max_bytes=_MAX_REQUEST_BODY_BYTES,
+    path_limits=((_COMPANION_EXPORT_UPLOAD_PATH, COMPANION_EXPORT_UPLOAD_MAX_BYTES),),
+)
+app.add_middleware(SkillUploadPreflightMiddleware)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=settings.cors_origins,
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "PATCH", "PUT", "DELETE", "OPTIONS"],
+    allow_headers=[
+        "Authorization",
+        "Content-Type",
+        "X-Request-ID",
+        "X-Correlation-ID",
+        "X-Clawdi-Environment-Id",
+        "X-Clawdi-Token",
+        "Idempotency-Key",
+        # The operator console (/admin) authenticates with nothing else — it
+        # sends `X-Admin-Key` on every request (admin-client.ts). Omitting it
+        # here fails the PREFLIGHT, so the browser drops the request before it
+        # is sent and the console reports "We couldn't reach the service",
+        # which reads as the backend being down rather than as a CORS rule.
+        # Only same-origin deployments escape it, because they never preflight;
+        # any split dashboard/API origin — the topology `web_origin` and
+        # `public_api_url` exist to describe — breaks the console completely.
+        "X-Admin-Key",
+        # `If-None-Match` carries the daemon's last seen
+        # `skills_revision` for the conditional GET /v1/skills.
+        # The CLI daemon hits this without going through CORS, so
+        # this is forward-compat for any browser-side caller.
+        "If-None-Match",
+    ],
+    expose_headers=[
+        "X-Request-ID",
+        # `ETag` carries the user's `skills_revision` counter on
+        # /v1/skills responses. Without exposing it, browser JS
+        # gets `null` from `response.headers.get("ETag")` and the
+        # dashboard can't conditional-GET. CLI daemon is unaffected
+        # but the dashboard relies on this once it stops fetching
+        # the full list every render.
+        "ETag",
+        "X-Process-Time-Ms",
+    ],
+    # 10 min production, but in dev the preflight cache outlives endpoint
+    # changes (new routes registered during uvicorn --reload get rejected by
+    # stale cached 404 preflights). Shorten in dev for fast iteration.
+    max_age=30 if settings.environment != "production" else 600,
+)
+app.add_middleware(RequestTimingMiddleware, slow_ms=settings.slow_request_log_ms)
+app.add_middleware(RequestIDMiddleware)
+app.add_middleware(SecurityHeadersMiddleware)
+
+
+def _apply_public_session_export_cache_policy(
+    request: Request,
+    response: Response,
+) -> Response:
+    if is_public_session_export_path(request.url.path):
+        response.headers["Cache-Control"] = PUBLIC_SESSION_EXPORT_CACHE_CONTROL
+    return response
+
+
+def _apply_whatsapp_onboarding_cache_policy(request: Request, response: Response) -> Response:
+    if _is_whatsapp_onboarding_request(request):
+        response.headers["Cache-Control"] = "no-store, private"
+        response.headers["Pragma"] = "no-cache"
+    return response
+
+
+async def request_validation_exception_handler(
+    request: Request,
+    exc: RequestValidationError,
+) -> Response:
+    path = request.url.path
+    if path.endswith(("/admin/platform/workload-clients", "/admin/platform/signing-keys")):
+        # Never echo accidentally submitted private JWK material on schema failures.
+        return JSONResponse(
+            status_code=422, content={"detail": "Invalid public workload key registration"}
+        )
+    if path.startswith(("/v1/vault/requests", "/api/vault/requests")):
+        return JSONResponse(
+            status_code=422,
+            content={"detail": "Invalid secret request"},
+            headers={"Cache-Control": "no-store", "Referrer-Policy": "no-referrer"},
+        )
+    if _is_whatsapp_onboarding_request(request):
+        return _apply_whatsapp_onboarding_cache_policy(
+            request,
+            JSONResponse(
+                status_code=422,
+                content={"detail": "Invalid WhatsApp onboarding request"},
+            ),
+        )
+    # Both bodies carry plaintext secret values; FastAPI's default 422 echoes each error's raw
+    # `input`, so these paths answer with type/loc/msg only.
+    if path.endswith("/runtime-state") or path.endswith("/runtime-secrets/recover"):
+        errors = _validation_errors_for_log(exc)
+        log.warning(
+            "request_validation_failed method=%s path=%s errors=%s",
+            request.method,
+            path,
+            errors,
+        )
+        return JSONResponse(status_code=422, content={"detail": jsonable_encoder(errors)})
+    if path.endswith("/skills/upload") or path.endswith("/sessions/batch"):
+        log.warning(
+            (
+                "request_validation_failed method=%s path=%s user_agent=%r "
+                "content_type=%r content_length=%r errors=%s"
+            ),
+            request.method,
+            path,
+            request.headers.get("user-agent", ""),
+            request.headers.get("content-type", ""),
+            request.headers.get("content-length", ""),
+            _validation_errors_for_log(exc),
+        )
+    return _apply_public_session_export_cache_policy(
+        request,
+        JSONResponse(
+            status_code=422,
+            content={"detail": jsonable_encoder(exc.errors())},
+        ),
+    )
+
+
+# API routers are mounted canonically under /v1 (the only
+# form in the OpenAPI schema — we serve on a dedicated API domain, so
+# versioning sits at the root). Older APIs also retain the legacy /api alias;
+# unlaunched runtime and platform contracts are canonical-only.
+#
+# Note for public_sessions_router: share routes live at
+# /v1/public/sessions/{id}/..., auth is optional (signed-in owners +
+# active link permissions get served; anon hits 401, signed-in
+# non-grantees hit 403). See routes/public_sessions.py.
+_VERSIONED_ROUTERS = (
+    auth_router,
+    admin_router,
+    ai_providers_router,
+    audit_router,
+    channels_router,
+    cli_auth_router,
+    companions_router,
+    session_content_events_router,
+    session_events_router,
+    session_shares_router,
+    sessions_router,
+    public_sessions_router,
+    dashboard_router,
+    access_router,
+    projects_router,
+    runtime_router,
+    skills_router,
+    skills_project_router,
+    skills_agent_router,
+    sync_router,
+    memories_router,
+    settings_router,
+    capabilities_router,
+    platform_router,
+    plugin_catalog_router,
+    agent_skills_router,
+    vault_requests_router,
+    vault_router,
+    connectors_router,
+    mcp_bridge_router,
+    search_router,
+    share_redeem_router,
+    sharing_router,
+    me_router,
+    agent_project_bindings_router,
+    tenant_exports_router,
+)
+# The hidden `/api` alias exists for binaries shipped before `/v1` was canonical. A contract with
+# no released consumers does not get one, because an alias is a surface that has to keep working
+# forever and a second spelling of a security-relevant route is a second thing to audit.
+# `companions_router` (the phase-05 approvals surface) is the newest entry: it ships with this
+# milestone, its only consumer is the dashboard in this repo, and it is the decision surface for
+# authorizing writes inside a tenant's filesystem — the last route in the backend that should
+# acquire an undocumented second path. Canonical-only, alongside the runtime and platform
+# contracts.
+# `tenant_exports_router` (plan 06-19) is new in this milestone too, and its only consumer is
+# the dashboard in this repo: canonical-only.
+_CANONICAL_ONLY_ROUTERS = (
+    runtime_router,
+    platform_router,
+    companions_router,
+    tenant_exports_router,
+)
+# This released /api upload adapter must precede the generic /api project
+# router; it is intentionally absent from /v1 and OpenAPI.
+app.include_router(
+    skills_legacy_project_upload_router,
+    prefix="/api",
+    include_in_schema=False,
+)
+for _router in _VERSIONED_ROUTERS:
+    app.include_router(_router, prefix="/v1")
+    if _router not in _CANONICAL_ONLY_ROUTERS:
+        app.include_router(_router, prefix="/api", include_in_schema=False)
+
+app.include_router(admin_whatsapp_pairing_router, prefix="/v1")
+# Signed provider ingress is canonical-only; it does not inherit the legacy
+# hidden /api aliases used by older dashboard routes.
+app.include_router(clerk_webhooks_router, prefix="/v1")
+# The declarative runtime observation companion is a clean-v2 contract. It is
+# mounted directly and intentionally has neither a /v1 nor a hidden /api alias.
+app.include_router(runtime_observation_v2_router)
+# Scope skill reads predate the Scope -> Project migration and only
+# exist for old binaries; legacy /api alias only.
+app.include_router(skills_scope_router, prefix="/api", include_in_schema=False)
+app.include_router(metrics_router)
+
+
+@app.exception_handler(OAuthCredentialPayloadCorruptError)
+async def oauth_credential_payload_corrupt_exception_handler(
+    request: Request,
+    exc: OAuthCredentialPayloadCorruptError,
+) -> Response:
+    response = JSONResponse(
+        status_code=409,
+        content={"detail": str(exc)},
+    )
+    return _apply_whatsapp_onboarding_cache_policy(
+        request,
+        _apply_public_session_export_cache_policy(request, response),
+    )
+
+
+@app.exception_handler(MemoryProviderUnavailableError)
+async def memory_provider_unavailable_exception_handler(
+    _request: Request,
+    _exc: MemoryProviderUnavailableError,
+) -> JSONResponse:
+    return JSONResponse(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        content={"detail": "Memory provider temporarily unavailable"},
+    )
+
+
+@app.exception_handler(MemoryProviderUpstreamError)
+async def memory_provider_upstream_exception_handler(
+    _request: Request,
+    _exc: MemoryProviderUpstreamError,
+) -> JSONResponse:
+    return JSONResponse(
+        status_code=status.HTTP_502_BAD_GATEWAY,
+        content={"detail": "Memory provider request failed"},
+    )
+
+
+@app.exception_handler(ControlLockTimeoutError)
+async def control_lock_timeout_exception_handler(
+    _request: Request,
+    _exc: ControlLockTimeoutError,
+) -> JSONResponse:
+    db_control_lock_timeouts.inc()
+    log.warning("database_control_lock_timeout")
+    return JSONResponse(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        content={"detail": "Deployment control temporarily unavailable"},
+        headers={"Retry-After": "1", "Cache-Control": "no-store"},
+    )
+
+
+@app.exception_handler(SQLAlchemyTimeoutError)
+async def database_pool_timeout_exception_handler(
+    request: Request | WebSocket,
+    _exc: SQLAlchemyTimeoutError,
+) -> Response | None:
+    db_pool_timeouts.inc()
+    log.warning("database_pool_exhausted")
+    if isinstance(request, WebSocket):
+        # Before accept this rejects the handshake; afterwards it closes with
+        # Try Again Later. Neither path emits an HTTP ASGI response on a socket.
+        await request.close(code=status.WS_1013_TRY_AGAIN_LATER)
+        return None
+    response = JSONResponse(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        content={"detail": "Database capacity temporarily unavailable"},
+        headers={"Retry-After": "1", "Cache-Control": "no-store"},
+    )
+    return _apply_whatsapp_onboarding_cache_policy(
+        request,
+        _apply_public_session_export_cache_policy(request, response),
+    )
+
+
+@app.exception_handler(ClientDisconnect)
+async def client_disconnect_exception_handler(
+    _request: Request,
+    _exc: ClientDisconnect,
+) -> Response:
+    # The client left before its request body arrived. Nobody reads this
+    # response; 499 (Client Closed Request) keeps it out of server-error logs.
+    return Response(status_code=499)
+
+
+@app.exception_handler(StarletteHTTPException)
+async def clawdi_http_exception_handler(
+    request: Request,
+    exc: StarletteHTTPException,
+):
+    if isinstance(exc, AccountSuspendedHTTPException):
+        response = JSONResponse(
+            status_code=exc.status_code,
+            content=exc.problem.model_dump(mode="json"),
+            headers=exc.headers,
+            media_type="application/problem+json",
+        )
+    else:
+        response = await http_exception_handler(request, exc)
+    return _apply_whatsapp_onboarding_cache_policy(
+        request,
+        _apply_public_session_export_cache_policy(request, response),
+    )
+
+
+@app.exception_handler(RequestValidationError)
+async def clawdi_request_validation_exception_handler(
+    request: Request,
+    exc: RequestValidationError,
+):
+    return await request_validation_exception_handler(request, exc)
+
+
+def _is_whatsapp_onboarding_request(request: Request) -> bool:
+    return request.url.path.startswith(
+        (
+            "/api/channels/whatsapp/onboarding/",
+            "/v1/channels/whatsapp/onboarding/",
+            "/v1/admin/channels/whatsapp/pairing-sessions",
+        )
+    )
+
+
+@app.get("/health", response_model=HealthResponse)
+async def health() -> HealthResponse:
+    """Return process liveness without coupling restarts to PostgreSQL."""
+    return HealthResponse(status="ok")
+
+
+@app.get("/ready", response_model=HealthResponse)
+async def ready(db: AsyncSession = Depends(get_session)) -> HealthResponse:
+    """Return whether the API can currently acquire and query PostgreSQL."""
+    await db.execute(text("SELECT 1"))
+    return HealthResponse(status="ok")

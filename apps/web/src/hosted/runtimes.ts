@@ -1,0 +1,117 @@
+import type { AiProviderAuthKind, HostedDeployment } from "@/hosted/billing/contracts";
+
+export const HOSTED_RUNTIMES = ["openclaw", "hermes"] as const;
+export type HostedRuntime = (typeof HOSTED_RUNTIMES)[number];
+
+const RUNTIME_META = {
+	openclaw: {
+		label: "OpenClaw",
+		blurb: "Choose this if you already use OpenClaw and want its Control UI and workflows.",
+	},
+	hermes: {
+		label: "Hermes",
+		blurb: "Recommended for most people. Chat with and manage your agent in the Hermes Dashboard.",
+	},
+} as const satisfies Record<
+	HostedRuntime,
+	{
+		label: string;
+		blurb: string;
+	}
+>;
+
+export function isHostedRuntime(value: string): value is HostedRuntime {
+	return (HOSTED_RUNTIMES as readonly string[]).includes(value);
+}
+
+export function runtimeDisplayName(runtime: HostedRuntime): string {
+	return RUNTIME_META[runtime].label;
+}
+
+export function runtimeBlurb(runtime: HostedRuntime): string {
+	return RUNTIME_META[runtime].blurb;
+}
+
+export function deploymentRuntime(deployment: HostedDeployment): HostedRuntime {
+	return deployment.resource.spec.runtime;
+}
+
+export function observedCloudProjectionId(
+	deployment: HostedDeployment,
+	runtime: HostedRuntime = deploymentRuntime(deployment),
+): string | undefined {
+	return deployment.clawdi_cloud_environments?.[runtime];
+}
+
+export function runtimeConsoleUrl(
+	deployment: HostedDeployment,
+	runtime: HostedRuntime = deploymentRuntime(deployment),
+): string | null {
+	const endpoint = deployment.runtime_ui_endpoint;
+	return endpoint?.runtime === runtime && endpoint.role === "control_ui" ? endpoint.url : null;
+}
+
+/** Browser entry only; credential validation still uses the exact published endpoint. */
+export function runtimeDashboardUrl(url: string, runtime: HostedRuntime): string {
+	if (runtime !== "hermes") return url;
+	try {
+		const target = new URL(url);
+		const path = target.pathname.replace(/\/+$/, "");
+		// Hosted path-based proxy roots end in the Hermes dashboard port.
+		if (path !== "" && !path.endsWith("-9119")) return url;
+		target.pathname = `${path}/chat`;
+		return target.toString();
+	} catch {
+		return url;
+	}
+}
+
+/** Start Hermes OIDC at its own login route so Hermes creates the PKCE/state cookies. */
+export function hermesOidcLoginUrl(url: string): string {
+	try {
+		const dashboard = new URL(runtimeDashboardUrl(url, "hermes"));
+		const dashboardPath = dashboard.pathname.replace(/\/+$/, "");
+		if (!dashboardPath.endsWith("/chat")) return url;
+		dashboard.pathname = `${dashboardPath.slice(0, -"/chat".length)}/auth/login`;
+		dashboard.search = new URLSearchParams({
+			provider: "self-hosted",
+			next: `${dashboardPath}`,
+		}).toString();
+		dashboard.hash = "";
+		return dashboard.toString();
+	} catch {
+		return url;
+	}
+}
+
+export function deploymentFilesUrl(deployment: HostedDeployment): string | null {
+	const value = deployment.files_endpoint?.url;
+	if (!value) return null;
+	try {
+		const url = new URL(value);
+		if (
+			url.protocol !== "https:" ||
+			url.username ||
+			url.password ||
+			url.pathname !== "/" ||
+			url.search ||
+			url.hash
+		) {
+			return null;
+		}
+		return url.toString();
+	} catch {
+		return null;
+	}
+}
+
+export function runtimeAiProviderAuthKind(
+	deployment: HostedDeployment,
+	runtime: HostedRuntime = deploymentRuntime(deployment),
+): AiProviderAuthKind | undefined {
+	return deployment.ai_provider_auth_kinds[runtime];
+}
+
+export function defaultDeploymentRuntime(deployment: HostedDeployment): HostedRuntime {
+	return deploymentRuntime(deployment);
+}

@@ -1,0 +1,169 @@
+"""Canonical AI Provider readiness and runtime compatibility contract."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+from app.schemas.ai_provider import (
+    AiProviderReadiness,
+    AiProviderRuntimeCompatibility,
+    CredentialMaterialState,
+    VerificationState,
+)
+from app.schemas.native_provider import native_provider
+from app.services.url_security import is_public_https_url
+
+_DEFAULT_API_MODES = {
+    "openai": "openai_responses",
+    "anthropic": "anthropic_messages",
+    "openrouter": "openai_chat",
+    "gemini": "google_generate_content",
+    "mistral": "openai_chat",
+}
+_RUNTIME_API_MODES = {
+    "openclaw": frozenset(
+        {
+            "openai_chat",
+            "openai_responses",
+            "anthropic_messages",
+            "google_generate_content",
+        }
+    ),
+    "hermes": frozenset(
+        {
+            "openai_chat",
+            "openai_responses",
+            "anthropic_messages",
+        }
+    ),
+    "codex": frozenset({"openai_responses"}),
+}
+_CANONICAL_OPENAI_BASE_URL = "https://api.openai.com/v1"
+
+
+@dataclass(frozen=True, slots=True)
+class AiProviderCapabilityInput:
+    provider_type: str
+    api_mode: str | None
+    base_url: str
+    auth_type: str
+    auth_source: str | None = None
+    auth_tool: str | None = None
+    auth_ref: str | None = None
+    runtime_env_name: str | None = None
+    configuration_mode: str = "catalog"
+    native_provider: str | None = None
+    native_variant: str | None = None
+
+
+def provider_runtime_compatibility(
+    provider: AiProviderCapabilityInput,
+) -> AiProviderRuntimeCompatibility:
+    """Return runtime projection support from the same fields agents consume."""
+
+    api_mode = effective_provider_api_mode(provider.provider_type, provider.api_mode)
+    if provider.configuration_mode in {"connection", "custom"}:
+        valid = (
+            provider.auth_type == "api_key"
+            and provider.auth_source == "managed"
+            and bool(provider.runtime_env_name)
+        )
+        return AiProviderRuntimeCompatibility(
+            openclaw=valid and api_mode in _RUNTIME_API_MODES["openclaw"],
+            hermes=valid and api_mode in _RUNTIME_API_MODES["hermes"],
+            codex=False,
+        )
+    if provider.configuration_mode == "native":
+        try:
+            routing = native_provider(provider.native_provider, provider.native_variant)
+        except ValueError:
+            return AiProviderRuntimeCompatibility(openclaw=False, hermes=False, codex=False)
+        valid = (
+            provider.base_url == routing.base_url
+            and provider.provider_type == routing.type
+            and api_mode == routing.api_mode
+            and (
+                provider.auth_type in {"api_key", "secret_ref"}
+                if routing.id != "openai-codex"
+                else provider.auth_type == "agent_profile" and provider.auth_tool == "codex"
+            )
+        )
+        return AiProviderRuntimeCompatibility(
+            openclaw=valid, hermes=valid, codex=valid and routing.id in {"openai", "openai-codex"}
+        )
+    native_codex_auth = provider.auth_type == "agent_profile" and provider.auth_tool == "codex"
+    native_codex_shape = (
+        native_codex_auth
+        and provider.provider_type == "openai"
+        and api_mode == "openai_responses"
+        and provider.base_url.rstrip("/") == _CANONICAL_OPENAI_BASE_URL
+    )
+    has_runtime_auth = (
+        provider.auth_type == "none"
+        or native_codex_auth
+        or bool(provider.runtime_env_name)
+        or bool(provider.auth_ref and provider.auth_ref.startswith("env:"))
+    )
+    openclaw = api_mode in _RUNTIME_API_MODES["openclaw"]
+    hermes = api_mode in _RUNTIME_API_MODES["hermes"]
+    codex = api_mode in _RUNTIME_API_MODES["codex"]
+    if provider.auth_type == "oauth_profile":
+        openclaw = hermes = codex = False
+    elif native_codex_auth:
+        openclaw = hermes = codex = native_codex_shape
+    elif not has_runtime_auth:
+        openclaw = hermes = codex = False
+    return AiProviderRuntimeCompatibility(
+        openclaw=openclaw,
+        hermes=hermes,
+        codex=codex,
+    )
+
+
+def effective_provider_api_mode(provider_type: str, api_mode: str | None) -> str | None:
+    """Resolve the protocol a provider uses when no explicit mode is stored."""
+
+    return api_mode or _DEFAULT_API_MODES.get(provider_type)
+
+
+def provider_readiness(
+    provider: AiProviderCapabilityInput,
+    *,
+    credential_material: CredentialMaterialState,
+    endpoint_reachability: VerificationState = "not_tested",
+    inference_verification: VerificationState = "not_tested",
+) -> AiProviderReadiness:
+    compatibility = provider_runtime_compatibility(provider)
+    hosted_auth_delivery = (
+        provider.auth_type == "api_key"
+        and provider.auth_source == "managed"
+        and bool(provider.runtime_env_name)
+    ) or (provider.auth_type == "agent_profile" and provider.auth_tool == "codex")
+    deployable = (
+        credential_material == "available"
+        and hosted_auth_delivery
+        and any((compatibility.openclaw, compatibility.hermes))
+        and is_hosted_deployable_endpoint(provider.base_url)
+    )
+    return AiProviderReadiness(
+        credential_material=credential_material,
+        runtime_compatibility=compatibility,
+        deployable=deployable,
+        endpoint_reachability=endpoint_reachability,
+        inference_verification=inference_verification,
+    )
+
+
+def is_hosted_deployable_endpoint(base_url: str) -> bool:
+    """Return the shared deterministic Hosted URL admission result."""
+
+    return is_public_https_url(base_url)
+
+
+__all__ = [
+    "AiProviderCapabilityInput",
+    "effective_provider_api_mode",
+    "is_hosted_deployable_endpoint",
+    "provider_readiness",
+    "provider_runtime_compatibility",
+]

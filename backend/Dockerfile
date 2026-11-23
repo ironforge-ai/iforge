@@ -1,0 +1,51 @@
+# syntax=docker/dockerfile:1.7
+
+FROM python:3.14-slim AS runtime
+
+ARG APP_UID=1000
+ARG APP_GID=1000
+
+ENV PATH="/app/backend/.venv/bin:/usr/local/bin:${PATH}" \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    UV_LINK_MODE=copy \
+    UV_PROJECT_ENVIRONMENT=/app/backend/.venv
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates curl \
+    && rm -rf /var/lib/apt/lists/*
+
+ARG UV_VERSION=0.12.5
+RUN curl -LsSf "https://astral.sh/uv/${UV_VERSION}/install.sh" | UV_INSTALL_DIR=/usr/local/bin sh
+
+RUN groupadd --gid "${APP_GID}" app \
+    && useradd --uid "${APP_UID}" --gid "${APP_GID}" --create-home --shell /usr/sbin/nologin app
+
+WORKDIR /app/backend
+
+COPY backend/pyproject.toml backend/uv.lock backend/alembic.ini ./
+# Health probes repeatedly start a fresh interpreter. Compile imports
+# at build time because runtime bytecode writes are disabled.
+RUN uv sync --frozen --no-dev --no-install-project --extra mem0 --compile-bytecode \
+    && python -m compileall -q /usr/local/lib/python3.14
+
+COPY --chown=app:app backend/ /app/backend/
+COPY --chown=app:app packages/shared/src/native-ai-providers.json /app/packages/shared/src/native-ai-providers.json
+
+RUN mkdir -p /data/files /home/app/.cache/fastembed /run/iforge-embedding \
+    && chmod 0770 /run/iforge-embedding \
+    && chown -R app:app /data /home/app/.cache /run/iforge-embedding
+
+USER app
+
+# Kamal requires images to carry the service identity label.
+LABEL service="clawdi"
+
+EXPOSE 8000
+
+# Kamal uses Docker health for non-proxied roles. The embedding role overrides
+# this command with its Unix-socket health endpoint in config/deploy.yml.
+HEALTHCHECK --interval=5s --timeout=5s --start-period=30s --retries=8 \
+    CMD ["curl", "--fail", "--silent", "--show-error", "--max-time", "4", "http://127.0.0.1:8000/health"]
+
+CMD ["python", "-m", "app.runtime_entrypoint"]

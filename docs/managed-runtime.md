@@ -1,0 +1,2828 @@
+# Managed Runtime Contract
+
+| Field | Value |
+| --- | --- |
+| Status | Public runtime contract |
+| Last updated | 2026-08-24 |
+| Owner | CLI runtime and cloud-api layers |
+
+This document describes the public iforge CLI and dashboard contract for managed
+runtime environments. It intentionally avoids deployment-specific topology,
+private service details, live service hosts, and internal runtime orchestration.
+
+Related public docs:
+
+- CLI notes: [`plans/managed-runtime-cli.md`](plans/managed-runtime-cli.md)
+- Roadmap: [`plans/managed-runtime-roadmap.md`](plans/managed-runtime-roadmap.md)
+- Projection boundary:
+  [`plans/runtime-projection-boundary.md`](plans/runtime-projection-boundary.md)
+
+## Scope
+
+The open-source CLI owns local runtime convergence, explicit `iforge run`
+env-injection, generic/self-hosted runtime UI bridging, and diagnostics. It does not own
+OpenClaw/Hermes binaries, native update flows, or runtime process behavior.
+The web app owns the hosted deployment dashboard surfaces, including Control UI
+and Terminal tabs. First-party hosted control planes may provide desired state,
+credentials, terminal authorization, rollout policy, and deployment lifecycle,
+but those platform-specific implementations are outside this repository.
+
+The public contract covers:
+
+- validating runtime desired state;
+- installing or verifying supported agent runtimes through their normal
+  installers;
+- writing non-secret local run configuration;
+- projecting runtime secrets only onto their declared runtime surfaces,
+  including the OpenClaw gateway's official config and transient installer
+  environment;
+- running final hosted runtimes from direct process-manager entries that name
+  official Hermes/OpenClaw binaries;
+- running iforge-owned support programs under the runtime process manager;
+- supporting explicit `iforge run -- <command>` when a caller opts into iforge
+  runtime env injection;
+- exposing strict-v2 OpenClaw directly on its native `18789` gateway with
+  official shared-token authentication and no device-pairing step when the
+  typed authorization capability is active;
+- exposing a dashboard Terminal contract for one deployment shell;
+- reporting status and diagnostics through runtime commands.
+
+The public contract does not cover:
+
+- deployment-specific topology;
+- private control-plane endpoints;
+- tenant or billing policy;
+- internal service implementation;
+- image build pipelines or platform rollout details.
+
+## Cloud API Runtime Observation Companion
+
+The declarative v2 runtime adds an observation companion without changing the
+existing v1 daemon heartbeat or observation writer. A deployment-bound runtime
+API key sends credential-authenticated evidence to the direct `/v2` runtime
+router; cloud-api appends evidence and never writes a Hosted deployment status.
+
+Cloud-api reuses these existing runtime primitives:
+
+- `AgentEnvironment.id` as the stable environment identity;
+- managed, environment-bound `ApiKey` authentication with an immutable
+  `runtime_deployment_id` identity binding;
+- the first-party `X-Admin-Key` gate, mutation idempotency, and control-plane
+  audit events for Hosted-facing provisioning and retirement calls;
+- PostgreSQL transactions and `FOR UPDATE` locks for ingestion, retirement,
+  desired-state cleanup, and late-write serialization.
+
+`POST /v1/agents/{agent_id}/sync-heartbeat` remains the frozen v1 liveness and
+latest-observation transport. It neither accepts strict-v2 identity fields nor
+reads or writes companion tables. Strict-v2 ingestion is
+`POST /v2/runtime/environments/{environment_id}/observations`; it writes only
+the companion inbox, fence high-water, and boot-session head.
+
+Four PostgreSQL tables form the additive companion boundary:
+
+| Table | Contract |
+| --- | --- |
+| `v2_runtime_environment_fences` | Permanent environment/owner/deployment binding, active or retired state, replay floor, immutable final retirement receipt/high-waters, and the durable runtime-state cleanup receipt. |
+| `v2_runtime_observation_inbox` | Immutable change evidence with the five-field boot identity, boot-scoped sequence, global event id, timestamps, payload hash, and health. Private diagnostic payloads may be compacted in place after retention eligibility; a fresh active head keeps its current projection readable, while compaction of a stale head forces the next heartbeat to restore change evidence. |
+| `v2_runtime_observation_heads` | One immutable boot-session binding with non-regressing accepted sequence, change-event stream position, last-seen capture time, and freshness. Semantically unchanged heartbeats refresh this row without appending inbox evidence; retirement compacts it to a tombstone. |
+| `v2_runtime_observation_consumer_cursors` | Environment-and-consumer ACK state, replay horizon, and explicit fail-closed expiry/reset boundary used by safe prefix retention. |
+
+Strict-v2 credential provisioning is only available through
+admin-authenticated `POST /v2/runtime/auth/keys`. The admin and platform v1 key
+APIs keep their original wire shape and cannot create a fence or
+deployment-bound credential. The provisioning endpoint represents one
+canonical Hosted Runtime role, so its request does not negotiate scopes. The
+Cloud issuer assigns the auditable bundle `connectors:read`,
+`connectors:invoke`, `runtime-observations:write`, `sessions:read`,
+`sessions:write`, `skills:read`, and `skills:write`. Principal identity comes
+only from the managed environment/deployment binding; each data-plane operation
+separately requires its scope. The database constrains only the identity
+binding, while the issuer and migration own the canonical authorization bundle.
+
+Hosted-facing `/v2` registration, read, acknowledgement, reset, retirement, and
+provisioning calls require the first-party `X-Admin-Key`. Retired runtime-state
+cleanup also accepts a platform workload token with the existing
+`platform:runtime-environments:retire` scope. The server binds
+observation cursors to its fixed Hosted controller identity, and immutable
+owner/deployment authority is resolved from the environment fence rather than
+caller-selected request data, so opaque cursors cannot cross consumers or
+environments. Platform workload OAuth remains separate, default-closed
+infrastructure for the future resale platform surface; it is not on this v2
+data-plane path.
+
+`POST /v2/runtime/environments/drift-summary:batchRead` is an admin-key-only,
+read-only batch using the shared runtime observation RR session dependency.
+Send 1-100 bindings with distinct environment and deployment IDs. Current
+callers include `expectedApplyIdentity` (`generation`, `manifestETag`,
+`applyReceiptId`, and `bootNonce`) so head selection uses the same authority as
+the full observation reader. Intentionally stopped runtimes may omit the field
+when callers need only binding and persisted source instance identity; source
+revision availability and observation heads are not runtime-health evidence
+until the runtime starts again. Observation selection then uses the original
+all-active-head behavior. The field also remains optional for rolling
+compatibility. Invalid or duplicate bindings return 422. `items`
+preserves request order and echoes every requested pair, including missing
+entries; `observedAt` is the server's freshness evaluation time. This endpoint
+never registers consumers, ACKs, resets cursors, renders sources, or repairs
+persisted revisions.
+
+Failure-isolation review (2026-09-11; draft for owner review): malformed persisted
+head evidence produces `observation: {status: "unavailable", head: null}` for that
+binding. Malformed source authority produces `sourceAuthority.status:
+"unavailable"` with no asserted instance/revision/etag. Valid siblings keep their
+ordered evidence. Unavailable is not missing or healthy, and must not itself
+trigger runtime repair. Deploy readers accepting the additive observation status
+before this writer; generated API types include it.
+
+The endpoint sets a transaction-local three-second statement timeout for its two
+bulk SELECTs. SQLSTATE 57014 returns a sanitized 503 and closes the snapshot;
+external cancellation still propagates. No persistent timeout setting is changed.
+Pool checkout and a stalled database network are separate dependencies; this
+limit is not a guarantee beyond the documented
+[database cleanup contract](backend-development.md).
+
+Done: `scripts/test.sh backend tests/test_runtime_drift_summary.py tests/test_ai_provider_connection_ownership.py`
+passes against the hermetic PostgreSQL runner, including invalid inserted JSON
+without bypassing inbox immutability, a malformed stored source revision, and
+statement cancellation followed by a successful request. This is local regression
+evidence, not live fleet health verification.
+
+Each result reports `binding` (`active`, `retired`, `missing`, or
+`binding_mismatch`). A missing fence is `missing`; a fence or available runtime
+state bound to another deployment is `binding_mismatch`. Only active matching
+bindings expose evidence. `sourceAuthority.status` is `present` for a current
+persisted revision/contract, `unavailable` for an unbackfilled or stale contract
+(retaining the known `instanceId`), and `missing` when no owner-matching,
+unarchived environment/runtime state is available. Present authority requires
+all three fields; missing authority requires all three to be null; unavailable
+authority permits only a known instance ID. There is no legacy render fallback.
+
+`observation.head` contains the selected active boot head's apply identity,
+health, `capturedAt`, and `freshnessDeadline`. For current requests, heads must
+match the expected apply identity. One fresh matching boot is selected even when
+stale or unrelated active heads remain; multiple fresh matching boot sessions are
+`ambiguous`; otherwise the most recent expired matching head is returned. Zero
+matching heads is `missing`. Legacy requests remain ambiguous when more than one
+active head exists. Two set-based SELECTs suffice and return at most one row per
+binding. The head's `diagnostics` contains
+only `activeCliVersion`, `applied`, `agentPlugins`, and `userActivity`, strictly
+validated with the existing v2 semantic schemas and plugin/apply identity rules.
+Absent or retention-scrubbed fields are null; raw payloads, logs and secrets are
+never returned. Coalescing advances head timestamps, not diagnostic timestamps.
+Semantic drift compares diagnostics; sequence, cursor and payload hash are not returned.
+Freshness is not health, and activity classification, coverage and
+its own timestamps still require consumer-side idle-reclaim checks. Invalid
+persisted diagnostics and database failures fail the request, not a partial batch.
+
+Verification: `scripts/test.sh backend tests/test_runtime_drift_summary.py`.
+Done: the focused contracts pass against the runner's throwaway PostgreSQL.
+
+Ingestion locks the permanent environment fence and rejects a retired binding
+before it inspects or creates a boot-session head. Retirement uses the same
+fence lock, freezes all session high-waters, persists the final cursor and
+receipt, writes one durable control-plane transition audit, and tombstones all
+heads atomically. Replaying the same retirement ID returns the persisted
+receipt; a different ID or deployment binding conflicts. V1 agent deletion and
+key revocation retain their pre-companion behavior and do not consult the v2
+fence. Trusted Hosted controller ordering obtains the retirement receipt before
+requesting `POST /v2/runtime/environments/{environment_id}/runtime-state/cleanup`
+with the exact environment, deployment, retirement, and stable cleanup
+identities. Cleanup derives owner authority from the permanent fence, removes
+only matching desired state, releases its OAuth claims, and stores an immutable
+versioned absence receipt. Exact retries return that receipt; identity reuse or
+mismatch conflicts. Runtime-state writers lock `User`, then the fence, then
+subordinate state and OAuth rows. A retired fence rejects new writes, including
+legacy admin v2 writers, while old successful platform idempotency replays do
+not execute a write. The permanent fence itself is never deleted.
+
+Retention advances the replay floor only across a contiguous per-environment
+stream prefix. Every row in a normal replay-horizon prefix must be old enough
+and acknowledged by every required active consumer. Hard retention may expire
+lagging consumers explicitly, but it still stops at the first younger stream
+position, preventing a preserved lower id from being silently skipped. Eligible
+rows are compacted in place: private diagnostics are scrubbed and
+`payload_purged_at` records the one-way transition, while event ID,
+environment/session/sequence identity, payload hash, timestamps, and uniqueness
+constraints remain. Replay-floor maintenance may advance monotonically after
+retirement without changing the immutable receipt or final high-water fields.
+When the hard cap expires or advances a consumer boundary, retention writes a
+redacted system audit in the same transaction as the cursor and compaction.
+Active heads must reference their exact inbox stream position, and a retired
+fence's final position must equal its frozen stream high-water at the database
+boundary.
+
+## Core Architecture
+
+The primary hosted runtime model is a Linux-like runtime host. The host image
+provides the OS envelope, a runtime user, a root-only `clawdi` bootstrap path,
+the prerequisites for official Hermes/OpenClaw installers, and a process
+manager. Runtime behavior comes from the manifest and official runtime
+binaries, not from per-agent wrappers. The managed iforge CLI is an
+administrator capability: the runtime user, model tools, and browser terminal
+cannot resolve, read, or execute it.
+
+```mermaid
+flowchart TB
+    CP[Hosted runtime manifest] --> Init[iforge runtime init]
+    Init --> Durable
+    Init --> Ephemeral
+
+    subgraph Configuration["Platform configuration: /etc/iforge"]
+        RunConfigs[run/<runtime>.json]
+        Projections[projections/<runtime>.json]
+    end
+
+    subgraph Durable["Durable non-secret state: /var/lib/iforge"]
+        Inventory[install-inventory/<runtime>.json]
+        CliBin[root-only maintained/clawdi/bin/clawdi]
+    end
+
+    subgraph TenantState["Tenant-UID CLI state: /var/lib/iforge-user"]
+        LiveSync[environments/<agent>.json]
+    end
+
+    Init --> TenantState
+    Init --> UserUnits[$HOME/.config/systemd/user/*.service]
+
+    subgraph Cache["Disposable cache: /var/cache/iforge"]
+        LastGood[manifest and secret last-good fallbacks]
+        NpmCache[managed CLI npm download cache]
+    end
+
+    subgraph Ephemeral["Ephemeral runtime state: $IFORGE_RUN_DIR"]
+        SystemUnits[systemd/system/iforge-*.service or /run/systemd/system]
+        UnitEnv[systemd/env/*.service.env]
+        Secrets[secrets and auth-token files]
+        EgressCA[egress/systemd/ca.pem + sidecar-private key]
+    end
+
+    subgraph Support["iforge support programs"]
+        Watch[iforge runtime watch]
+        Daemon[iforge daemon run]
+        Sidecar[optional iforge runtime sidecar]
+        Egress[egress module]
+    end
+
+    subgraph Runtime["Official runtime programs"]
+        HermesGateway[hermes gateway run]
+        HermesDashboard[hermes dashboard]
+        OpenClaw[openclaw gateway run]
+    end
+
+    Systemd[systemd PID 1] --> Watch
+    Systemd --> Daemon
+    Systemd --> Sidecar
+    Sidecar --> Egress
+    UserSystemd --> HermesGateway
+    UserSystemd --> HermesDashboard
+    UserSystemd --> OpenClaw
+
+    Egress -. proxy URL + CA trust .-> HermesGateway
+    Egress -. proxy URL + CA trust .-> HermesDashboard
+    Egress -. proxy URL + CA trust .-> OpenClaw
+```
+
+The process manager is systemd. The important contract is that each
+long-running program is declared directly with its official command, args, cwd,
+and env. iforge support processes use `iforge-*` service names; OpenClaw and
+Hermes gateway base units use runtime-owned service names generated by official
+service installers, such as `openclaw-gateway.service` and
+`hermes-gateway.service`. Runtime services must not point at `iforge run --
+openclaw`, `iforge run -- hermes`, a generated launch shell, or a PATH shim. If
+iforge must temporarily run an auxiliary process that has no official service
+installer, the unit uses an `iforge-*` name and is documented as compatibility,
+not as a runtime-owned service.
+
+Three system-scope units are hosted-only: `iforge-runtime-watch.service`,
+`iforge-daemon.service` and `iforge-runtime-sidecar.service`. The system unit
+root resolves to `/run/systemd/system` only when the runtime mode is hosted and
+the process runs as root. These three kept the pre-rename prefix under the
+P33-21 carve-out until that carve-out was reversed on 2026-09-11, the same move
+that renamed the file browser's unit, account and group. There is no production
+deployment from before that move, so iforge keeps no alias for the old
+`clawdi-*` naming rule: convergence writes, reads and collects only `iforge-*`
+units (user directive, 2026-09-30). Ownership is decided by the current prefix
+or by iforge's own generated-file header, never by the `clawdi-` prefix —
+upstream claims that prefix on the same machine, so a `clawdi-` entry is another
+product's install and is never reclaimed, disabled or deleted.
+
+The Linux-like host preserves official updater behavior. If a user or an
+official UI runs `openclaw update` or `hermes update`, PATH resolves to the
+official binary. iforge does not intercept that command. After an updater
+replaces files, the process manager may restart the relevant official program,
+but the update transaction remains owned by the runtime.
+
+For Hermes, an existing regular native gateway unit is adopted, not reinstalled
+because its bytes or displayed version changed. Hermes refreshes that unit
+during native gateway startup and updates. Its human-readable `--version`
+includes dependency and remote-update information and is not an installation
+identity. iforge installs only a missing gateway unit or a recognized legacy
+iforge-generated unit. Inspection failures do not authorize replacement;
+systemd activation and runtime readiness still determine whether the adopted
+service works. Service file fingerprints are bookkeeping, not proof of the
+running source version or dependency capabilities.
+
+OpenClaw also adopts existing regular native units without forcing installation
+on fingerprint drift. Its pinned
+[`2026.8.1` source](https://github.com/openclaw/openclaw/blob/ea806575e6450e4d1efdfc72c19f04be982a1b9b/src/entry.version-fast-path.ts)
+prints `OpenClaw <version> (<commit>)` on a local fast path, not a remote-update
+banner. The diagnostic commit can still come from `GIT_COMMIT` or `GIT_SHA`;
+neither that display nor a changed unit proves a broken service. The native
+[updater](https://github.com/openclaw/openclaw/blob/ea806575e6450e4d1efdfc72c19f04be982a1b9b/src/cli/update-cli/update-command-service.ts)
+owns service refresh and restart after an update, subject to its ownership and
+definition-mutation checks. iforge retains missing/generated-unit installation,
+inspection-error handling, failed-unit recovery, and activation proof. It does
+not emulate upstream service repair: stale entrypoint or target errors that
+remain after systemd activation require the native owner workflow
+(`openclaw gateway start/restart` or an intentional `gateway install --force`).
+
+On a retained OpenClaw installation, convergence restores a missing iforge
+service environment file before the official workspace roster and Doctor repair.
+It uses the same current manifest, secret validation, provider digest and egress
+CA environment as final publication. Existing environment files retain normal
+final-phase updates; new units retain installer ordering. This publishes no
+service definitions and performs no service activation. Native Doctor still
+requires its user D-Bus manager to be available and owns its repair lifecycle;
+restoring the environment does not bypass native service or database checks.
+
+The official OpenClaw roster supplies workspace inventory, not proof that every
+startup migration is complete. iforge does not run Doctor or archive an identity
+merely because a legacy `identity/device.json` exists. Normal native startup owns
+valid identity migration and reports or refuses invalid state; final runtime
+readiness remains required. Automatic pre-start identity cleanup and conflict
+archival are no longer provided. Owners must resolve remaining native warnings
+or failures. Explicit config and reported startup-migration error repair remain.
+
+These changes do not repair native Doctor lifecycle bugs or add a user D-Bus
+readiness barrier. In OpenClaw 2026.9.4, explicit repair of a running service can
+fail during native restart verification; the [upstream fix](https://github.com/openclaw/openclaw/commit/f3f3d6b1ed680c364c1ea3b549e7e4fa8fc500b9)
+requires an OpenClaw build containing that change.
+
+When Hermes service installation is necessary, iforge publishes its environment
+and drop-in first and invokes native `gateway install --force --no-start-now`.
+The existing activation phase starts the service after prerequisites are ready.
+This flag does not stop an already running service or disable an enabled unit.
+OpenClaw's separate native install-time validation still requires deferring its
+drop-in until after installation. These Hermes semantics were checked against
+[`1cb3ab6`](https://github.com/NousResearch/hermes-agent/blob/1cb3ab617363ffab9e55239a7d2ab0d6f9c10473/hermes_cli/gateway.py)
+and the pinned systemd fixture's
+[`cc4cab2`](https://github.com/NousResearch/hermes-agent/blob/cc4cab2f592e60a197e796506de9168f74baf3ea/hermes_cli/gateway.py).
+
+OpenClaw's pinned
+[installer](https://github.com/openclaw/openclaw/blob/ea806575e6450e4d1efdfc72c19f04be982a1b9b/src/daemon/systemd-install.ts)
+publishes the native unit, then runs `daemon-reload`, `enable`, and `restart`.
+iforge therefore activates egress and proves tenant CA readability before a
+necessary gateway install, projects native authentication first, and publishes
+the OpenClaw drop-in after installation. Final activation processes system
+roles before user roles; this is not a dependency requiring the sync daemon to
+wait for the gateway. Hermes dashboard dependencies are built before a new
+gateway install. Files has its own readiness probe, and runtime-watch applies
+are serialized by the convergence lock. Both system and user managers are
+reloaded when they report `NeedDaemonReload`, including edits predating the
+current filesystem snapshot. Reused HOME units remain guarded by their
+boot-regenerated environment file, not merely by enablement state.
+
+Installer diagnostics retain the latest attempt as `<installer>.log` and the
+last failed attempt as `<installer>.failed.log` under the private status
+`installer-logs` directory. Both are mode `0600`; successful recovery does not
+overwrite the failure, and repeated failures do not create unbounded history.
+
+The bootstrap boundary is deliberately small: systemd owns `/etc/iforge`,
+`/var/lib/iforge`, `/var/cache/iforge`, and `/run/iforge` through its
+`ConfigurationDirectory=`, `StateDirectory=`, `CacheDirectory=`, and
+`RuntimeDirectory=` directives before invoking the root-owned image bootstrap
+entrypoint by absolute path. The configuration, state, and cache roots are
+root-owned `0700`; `/run/iforge` is root-owned `0711` and uses
+`RuntimeDirectoryPreserve=restart`. Runtime convergence relies on those
+systemd-owned roots instead of recursively hardening their ownership. The run
+root is searchable only for the two explicit platform-to-tenant handoff
+classes: the egress CA and per-unit tenant environment files. All other
+platform files remain private or are exposed only to dedicated system services.
+Tenant-context CLI state has a separate durable root,
+`/var/lib/iforge-user`, owned by `10001:10001` with mode `0750`. Hosted
+convergence sets `CLAWDI_HOME` to that path for every generated tenant user
+unit; `/var/lib/iforge` remains the root-owned platform state root.
+`CLAWDI_HOME` contains durable Skill projection/deletion claims and Project
+materializations (`skills-lock.json`), plus the session sync ledger
+(`sessions-lock.json`), not just disposable upload caches. A control plane
+replacing root filesystems must retain this directory independently of HOME
+and root-private platform state, without changing its sibling-path contract.
+Existing rootfs state must be migrated while all writers are quiescent before
+replacement; creating an empty destination on the new image is insufficient.
+Before directory preparation, lock acquisition, or any external runtime command,
+Hosted convergence requires the explicit process contract
+`IFORGE_RUNTIME_MODE=hosted`, a resolved HOME of exactly `/home/iforge`, and
+`CLAWDI_RUNTIME_USER=iforge` resolving through the host account database to the
+non-root identity `10001:10001`. Optional `IFORGE_RUNTIME_UID` and
+`IFORGE_RUNTIME_GID` values must match that resolved identity. The resolved HOME
+is validated regardless of whether it came from `IFORGE_RUNTIME_HOME` or
+`HOME`; a host-policy file cannot select Hosted mode.
+
+The same precondition gate proves that all four platform roots are real
+directories before convergence starts. Convergence repeats the root proof at
+mutation-group boundaries, and platform child writers are anchored to their
+already-existing root. If a root disappears after preflight, no child writer
+recursively recreates it; convergence fails and leaves root restoration to the
+systemd/image boundary that owns it.
+
+That entrypoint reads the exact managed CLI pin from the authenticated Cloud
+manifest, installs it under a root-only versioned npm prefix, atomically activates
+`/var/lib/iforge/maintained/clawdi/bin/clawdi`, and runs
+`runtime init --non-interactive`. `runtime init` is the local administrator
+convergence step. It invokes official non-interactive service installers for
+desired runtime gateway base units inside the managed apply boundary, writes
+only transparent hosted drop-ins/env files for those official units, and proves
+the rendered systemd state before committing authority. When a later manifest
+removes an official gateway service, the pre-commit phase only stops/disables
+the stale unit; the matching official uninstaller and stale file garbage
+collection run after authority commits. iforge-owned support units keep
+`iforge-*` names.
+
+Official unit ownership follows a strict contract. The official installer owns
+the base unit file; iforge never edits or removes a base unit it did not
+generate. iforge owns exactly two artifacts per official unit: the drop-in
+`$HOME/.config/systemd/user/<unit>.service.d/10-iforge-hosted.conf` and the env
+file `$IFORGE_RUN_DIR/systemd/env/<unit>.service.env`, both marked with the
+generated-file header so convergence can identify them. Failure handling keeps
+that boundary convergent in both directions:
+
+- If an official service install fails and no base unit exists yet, the drop-in
+  is not written; convergence reports the install error and the next cycle
+  retries the official installer. If a base unit already exists from an earlier
+  successful install, the drop-in/env are still refreshed so the running
+  service keeps its current configuration.
+- If a post-commit official service uninstall fails, the committed desired
+  state remains authoritative and the next convergence repeats conservative
+  cleanup.
+- Systemd apply is a commit prerequisite. A rendered unit that cannot reach its
+  required active/enabled state, or a stale unit that cannot reach its required
+  inactive/disabled state, fails the apply.
+
+An official installer failure reports its exit code, terminating signal or
+spawn error, and bounded stdout/stderr tails. Capture is capped at 64 KiB per
+stream and each reported tail at 4,000 characters. Terminal controls are
+removed and known secret values, credentials, URL parameters, and environment
+assignments are redacted. For an installer with a JSON contract, iforge
+allowlists only `error`, `message`, `hints`, and `warnings`; it never projects
+the rest of the installer response, a runtime manifest, or process environment.
+The failure still aborts Apply before authority commits.
+
+Runtime `--version` probes use a 10-second deadline, official service installs
+use 10 minutes, official service uninstalls use 2 minutes, and their preparatory
+user-manager maintenance uses 15 seconds. A deadline expiry is reported as a
+named convergence error rather than leaving first boot or a watch pass blocked
+indefinitely.
+
+Official service installers/uninstallers run only in the hosted systemd apply
+path. Unit tests select installer execution through an explicit in-process test
+option; there is no production environment-variable authority that can replace
+official gateway ownership. When installers are skipped, convergence still
+writes the hosted drop-in/env files. Similarly, systemctl
+apply runs only where the environment owns a live systemd
+(`/run/systemd/system`, overridable with `IFORGE_SYSTEMD_APPLY=1|0`); when unit
+files changed but apply was skipped, init/watch status reports
+`systemdApply.applied=false` instead of hiding the divergence.
+
+Hermes gateway and dashboard are separate official commands in this model. A
+deployment that needs both must use an official service installer for each
+runtime-owned unit. Until Hermes exposes an official dashboard service
+installer, the hosted default does not synthesize `hermes-dashboard.service`; an
+explicit compatibility unit, if required, must use an `iforge-*` name. The
+Hermes dashboard binds directly to `0.0.0.0:9119` and uses Hermes' bundled
+Basic authentication provider.
+
+### Companion Registry
+
+A companion is a server-owned program that runs beside the hosted runtime under its own service
+identity. It is not a user runtime and not an agent. Every companion kind the hosted runtime can
+deploy has exactly one row in `config/companion-registry.txt`, which is the authority for the table
+below; that table is asserted equal to the contract file, and to the backend's embedded registry,
+by `backend/tests/test_iforge_companion_docs_contract.py`. The check is bidirectional: a kind
+documented here and absent from the registry fails that suite, and so does a kind in the registry
+and absent from here.
+
+| Key | Artifact kind | Minimum CLI version | UID | Port | Egress |
+| --- | --- | --- | --- | --- | --- |
+| `filebrowser` | `binary-sha256` | `0.0.0` | `preallocated` | `9120` | `bypass` |
+| `postiz` | `oci-digest` | `0.14.0` | `10101` | `9130` | `bypass` |
+
+**Graceful degradation.** An unrecognised companion key whose value carries a kind identity and a
+digest-pinned artifact is admitted and skipped: the runtime deploys nothing for it and keeps
+parsing the rest of the manifest. A malformed or mis-keyed companion is rejected and fails the
+whole manifest parse, because an entry whose declared kind does not equal its key is not a newer
+kind, it is a corrupt one. A skipped kind is reported in the runtime's observation as unsupported,
+carrying only the key and the CLI version and never any part of the entry's value — a companion
+entry can carry a live HS256 secret.
+
+**Downgrade behaviour.** A running companion whose kind the currently-installed CLI does not
+recognise is left running and reported unmanaged, not withdrawn. A downgrade is not a deprovision,
+and stopping a healthy companion because the client rolled back would be an availability regression
+the operator did not ask for. This narrows the unrecognised case only: a recognised kind that
+becomes ineligible is still withdrawn by normal stale-unit reconciliation.
+
+**Consumer-first emission.** Each kind declares the minimum CLI version that can parse it, and the
+control plane refuses to emit that kind to a runtime reporting an older version. A runtime that has
+not reported a version receives only the ungated legacy set, so the gate fails closed: an absent
+observation is no proof that the installed CLI can parse anything. Every omission is recorded with
+its cause rather than dropped silently. postiz is the first gated kind: its minimum, 0.14.0, is above
+every CLI deployed today, so it is withheld from every runtime until a CLI that carries the container
+kind is released at or above it. That is the gate working, not a defect, and the control plane
+records each withholding against the registry key alone.
+
+**Digest pinning.** Every kind's artifact is pinned by a content digest, and a deploy fails closed
+rather than fetching a floating reference. The artifact kind column says how the pin is located, and
+its vocabulary is closed to two values: `binary-sha256` for a native binary, and `oci-digest` for a
+container image. A container kind is located by an OCI content digest, never by a tag: its manifest
+entry carries the image repository plus the digest, because a tag names whatever a registry serves
+today. The pin's field name is per-kind rather than uniform: `filebrowser` carries its digests under
+its per-architecture assets, an unrecognised kind carries one under its artifact, and a container
+kind's per-image digests are declared by its own manifest schema. The rule is the guarantee, not the
+field name.
+
+**Identity, and the never-reclaim rule.** Each kind runs under its own non-login system UID, never
+the tenant runtime user and never a UID shared with another kind. A retired kind's UID is
+permanently burned and never reclaimed, so leftover files on disk can never be silently inherited
+by a different companion that later lands on the same number. Numeric UIDs come from the reserved
+UID block 10100-10199, which must be confirmed against the provisioning image before the first
+numeric allocation. The first numeric allocation is postiz at UID 10101. When that number was
+written, on 2026-09-23, the owner explicitly deferred that confirmation to host UAT rather than
+confirming it: nobody has yet read the provisioning image's account and subordinate-ID files. postiz
+became reconcilable in the same change that shipped the container kind, so the first converge that
+receives a postiz entry creates its account. That converge fails closed rather than sharing an
+identity: account creation refuses a UID another account already holds, and the container kind
+refuses an overlapping subordinate range by the owning account's name. Host UAT can still refuse the
+number. `filebrowser` is recorded as pre-allocated and exempt from the reserved block, because its
+POSIX account already exists on every provisioned host with a host-allocated UID and owns files on
+disk.
+
+A companion's account, group and state-directory names otherwise derive from its registry key, with
+one named exemption on the same install-history grounds: the filebrowser account, group and state
+directory are named iforge-files rather than a name derived from its registry key. Re-pinning
+either the name or the number would rename a live OS account and strand a live state tree on hosts
+that are already running, which is an operator migration rather than something a CLI may do on a
+running host. A kind added later has no install history and therefore no exemption.
+
+**Container kinds and subordinate UID ranges.** A container kind runs as a rootful Quadlet system
+unit whose container user namespace is a static user-namespace map, never an automatically allocated
+one: an automatic map is not guaranteed stable across container re-creation, and a map that moves
+re-owns the kind's state directory on a redeploy. Each container kind is given a host account at its
+registry UID and a 65536-wide subordinate range starting at 1000000000 + (uid - 10100) * 65536,
+recorded against that account and used as the container's UID and GID map. postiz, at UID 10101,
+owns the range starting at 1000065536. The range is derived from the unique registry UID, so two
+kinds cannot overlap by construction, and a converge refuses to proceed when any other subordinate
+range on the host overlaps the computed one. Like a UID, a subordinate range is never reclaimed.
+Because the container runtime itself runs as root on the host, the shared companion sandbox below
+cannot wrap it; isolation for a container kind rests on the user namespace, in which container root
+is an unprivileged host UID, together with dropped capabilities and no-new-privileges.
+
+**Sandbox baseline.** Companion units carry one shared sandbox directive set, with no per-kind
+opt-out; changing a directive requires a per-kind justification recorded in the registry and here,
+not a parameter a unit can pass. The per-kind variation is a path allow-list defaulting to empty,
+not an opt-out: under `ProtectHome=tmpfs` an empty allow-list yields a read-only empty home, so the
+one kind that needs home access expresses that need as data rather than by weakening the default
+for every kind that does not. The tmpfs value is the strong choice because BindPaths= can re-open a
+path it hides, which the coarser ProtectHome=yes value does not permit.
+
+**Credentials: two properties, stated separately.** Each companion's credential is delivered through
+a per-unit credential directory: read-only, backed by non-swappable memory, and accessible only to
+the unit's own UID and root. For `filebrowser`, that per-UID isolation is provided by the
+`LoadCredential=` directive together with `User=`, and it is the property this contract's
+cross-companion credential rule names. At-rest encryption of the credential file, through
+`LoadCredentialEncrypted=`, is a different property, and it is now split by kind. Container kinds
+use the encrypted form and nothing else, and a host that cannot encrypt refuses their converge (see
+Container Companions below). For `filebrowser`, the encrypted form is a separate property and is not
+yet enabled: its unit keeps the plain form until the switch is confirmed for that unit against a
+provisioned image, which requires the hosted image's systemd to be 247 or newer and either a usable
+TPM2 device or a root-only local credential secret. That switch is tracked as Phase 6 work pending
+its own host confirmation, and it will also re-open the TPM device node in `DeviceAllow=` under
+`PrivateDevices=`. Until it lands, no reader should conclude from this document that the
+`filebrowser` credential is encrypted at rest. Placing credential material inline in the unit file is prohibited in either form, because such data
+is accessible to unprivileged processes over IPC as well as appearing in `systemctl cat` output.
+
+**Egress participation.** The transparent-egress redirect keys on the runtime UID only, so a
+companion UID is outside the transparent-egress redirect and its outbound traffic is neither
+redirected through the managed gateway nor blocked by it. The registry's egress column records each
+kind's participation, and `filebrowser` is `bypass`. That is an accepted residual recorded here
+rather than an unstated gap; bringing companion UIDs inside the redirect is later operational work,
+and the column exists so that change is a column edit with a test behind it. `postiz` is `bypass`
+too, for a different reason: container traffic leaves through podman's network NAT, outside the
+UID-keyed redirect, so no rule keyed on a host UID sees it.
+
+**Ports.** Each kind declares one port, unique across rows; 9119 is the Hermes dashboard, 9120
+is `filebrowser` and 9130 is `postiz`. A companion port carries the socket-exclusivity residual already documented for
+port 9120 below, rather than a new per-companion rule.
+
+### Container Companions
+
+A container kind (today `postiz`) is converged as rootful Quadlet system units, not as a binary under
+the companion sandbox. Its manifest entry names each image by repository and content digest. The
+runtime never builds, layers or patches an image: the upstream image runs unmodified, configured only
+through environment, the flags Quadlet renders, and network.
+
+**Units.** One converge renders four sources under `/etc/containers/systemd/`: a per-installation
+network, the database, a per-installation Redis, and the application. The network has a pinned
+per-kind subnet (`10.213.<n>.0/24`, where `<n>` is the kind's registry UID minus 10100, so
+`10.213.1.0/24` for `postiz`). The database and Redis publish no port. The application publishes
+exactly one port, on loopback only (`127.0.0.1:9130` to the container's own port), so nothing off
+the host reaches it except through the tunnel. On the host itself, a per-kind nftables table
+(`inet iforge_companion_postiz`) refuses every new connection from a non-root local socket to that
+loopback port and to the network's subnet. Only the platform's root-run components (the bootstrap,
+readiness, the tool executor and the export) reach the application, its database or its Redis from
+the host. No other UID is exempt, the agent's included. Container-to-container traffic (the tunnel
+reaching the application, the application reaching its database) is not affected. The ruleset is a
+root-only file beside the receipt. It is loaded twice over: by the converge before anything can
+start, and by every container unit's `ExecStartPre=`, so a unit that systemd starts on boot cannot
+come up without it. `systemctl daemon-reload` runs the Quadlet generator. The converge then starts
+the network, checks that its actual subnet is the pinned one, loads the guard, and only then starts
+the generated application service, which pulls in its dependencies. The host must provide
+`/usr/sbin/nft`. The receipt records the subnet as `networkSubnet` only once the live network
+reported it and the guard loaded. An installation whose receipt does not carry it is never treated
+as unchanged: the next converge re-applies it and checks the network, whatever else changed.
+
+**Network migration.** A network created before the subnet was pinned comes from Podman's default
+pool (`10.89.x.0/24`), which the guard's subnet rule does not cover. The converge moves it
+automatically; no operator step is needed. It stops every unit of the kind except the network
+(tunnel, application, Redis, database), removes the network with `podman network rm` (never
+forced), and restarts the network unit, so Quadlet recreates it with the pinned `Subnet=`. It then
+checks the live subnet again, loads the guard, and only then starts anything. The data directory is
+not touched. An update never runs over an unverified network: the update pass reads the live subnet
+before its backup and waits, changing nothing, until a converge has moved the network. Every
+rollback, including the 30-minute retry of an incomplete one, checks or moves the network after
+rendering the previous units and before it restores or starts anything.
+
+A migration that cannot finish leaves the companion stopped rather than running unguarded. That
+happens when the removal is refused, for example because a container this runtime does not manage
+is still attached, or when the recreated network reports another subnet. The stop survives a
+reboot: the host masks every unit of the kind except the network with `systemctl mask`, and
+records the masked units in a root-only file under the companion's state root. The first converge
+or rollback that verifies the pinned subnet unmasks them before it starts anything, and removing
+the companion unmasks them too. The failure is reported to
+the control plane as `network_subnet_unverified` under the installation's `host_conditions`, with
+the redacted error. It is reported even for an installation that already reported ready, whose
+apply failures are otherwise only logged on the host. Every converge retries the migration, and the
+first one that completes clears the condition. When the condition persists, the operator checks
+what else holds the `iforge-postiz` network: `podman network inspect iforge-postiz` lists the
+containers attached to it. Once nothing else holds it, the next converge completes the migration.
+
+**Edge tunnel.** When the entry names the installation's tunnel (`dependencies.cloudflared` and
+`credentials.tunnelTokenSecretRef`, both or neither; half of one refuses the converge), a fifth
+source runs the tunnel connector as one more digest-pinned container on the same per-installation
+network. It reaches the application by its in-network name, publishes no port and dials out to the
+edge, where TLS terminates, so no inbound port opens on the host. Its token arrives only as its own
+encrypted credential and never appears in a unit file or a command line. It starts after the
+application and restarts on failure. Running the connector routes nothing by itself: the control
+plane publishes the hostname's ingress and DNS record only after the runtime's data-asserted ready
+report, so the platform has already bootstrapped the application when it becomes reachable.
+
+**Backups.** When the entry names a backup repository (`backup` and
+`credentials.backupEnvSecretRef`, both or neither), the database unit carries a second encrypted
+env credential with every pgBackRest setting (the repository key and cipher pass included) and
+starts with continuous WAL archiving (`archive_mode=on`, `archive_command` pushing through
+pgBackRest, `archive_timeout=60`). After the database is up and before the application's
+bootstrap, the runtime creates the stanza and takes a first full backup, and a failure there fails
+the install. Every pgBackRest command runs inside the database container, so no secret reaches a
+command line. The repository key can list, read and write only inside the installation's own
+prefix; it cannot delete, and `expire-auto` is off, so retention expiry is only ever the operator's
+act. Once a day the watch loop writes a rehearsal marker row into the `iforge_rehearsal` schema
+(never `public`) and then takes a differential backup, or a full one weekly. It reports the backup
+with that marker. A failed backup is reported and retried an hour later, and never stops the watch
+loop. The markers are what the operator's weekly point-in-time rehearsal asserts on; see
+[`runbooks/companion-restore-rehearsal.md`](runbooks/companion-restore-rehearsal.md).
+
+**Restore on bootstrap.** Before the database's first start on an install, the runtime checks its
+data directory. If it is empty and the repository's stanza holds a backup, a one-shot container
+from the same pinned image restores the newest backup. That container runs in the same user
+namespace, with the backup credential on tmpfs only for as long as it runs. An empty directory
+with no backup starts fresh, and a populated one is never compared with the repository. A restore
+that fails leaves the directory marked unfinished, so the next converge restores again, over the
+partial data, rather than starting it. Instance replacement therefore brings the data back without
+a durable volume.
+
+**Backups record the schema digest.** The repository is the only record that outlives an
+instance, so it records which Postiz digest wrote the schema. Every backup the runtime takes (the
+first full one, the scheduled ones and the pre-update one) carries the pgBackRest annotation
+`iforge-schema-digest=<digest>`, the schema digest current when it was taken. Before an update
+restarts anything on a new Postiz digest, the runtime annotates its pre-update backup
+`iforge-schema-next=<new digest>`: WAL archived after that backup may hold the new version's
+schema. If that annotation cannot be written, the update is refused at `pre-update` and nothing
+restarts. A completed rollback sets it back to the previous digest. If that reset fails, the
+rollback still counts as completed and its report says the annotation was not reset.
+
+A replacement host reads the newest backup's annotations before it restores or plans anything:
+
+- A swap began after that backup and was never confirmed: the pin went back to the backup's own
+  digest, or the control plane still announces that swap. The host restores that backup to its own
+  consistency point (`--set=<label> --type=immediate`), the point a rollback would have restored.
+  An announced swap is then redone by the update path, behind a fresh backup.
+- Otherwise the host restores to the end of the archive.
+
+In every case it starts the Postiz digest that wrote the restored schema, never another. An
+announced change from that digest to the pin is left to the update path, behind its own backup.
+An unannounced difference keeps the restored digest running and reports `schema_digest_mismatch`.
+A repository written before these annotations existed restores to the end of the archive at the
+pin, as before.
+
+**Digest pulls.** Before any source is written, the runtime pulls each image by its digest reference
+and checks that the image's repository digests contain exactly that reference; a mismatch refuses
+the converge. Every unit carries `Pull=never`, so no unit can fetch anything at start, and an image
+already present at its verified digest is not pulled again.
+
+**User namespace.** The container runtime itself runs as root on the host, so the binary-kind
+sandbox baseline above wraps the generated unit but cannot wrap the container runtime. Isolation for
+a container kind therefore rests on the user namespace: every container gets the kind's static
+`UIDMap`/`GIDMap` from its recorded subordinate range, in which container root is an unprivileged
+host UID, together with `NoNewPrivileges=true`. A converge refuses when another account's
+subordinate range overlaps the kind's, or when the kind's own recorded range differs from the
+computed one, because a map that moves re-owns the kind's state on the next redeploy.
+
+**Encrypted credentials only.** A container kind's environment reaches its containers only through
+an encrypted per-unit credential: `LoadCredentialEncrypted=` in the unit and `EnvironmentFile=%d/<id>`
+in the container, which Quadlet renders as an env-file read from the unit's credential directory. The
+plaintext exists only briefly on the run directory's tmpfs, owner-only, and is removed as soon as
+`systemd-creds encrypt` has produced the ciphertext; the ciphertext is root-only. No secret appears
+in a unit file, an `Environment=` line or a process command line. The host floor is checked on every
+converge: podman's Quadlet generator, nftables (`/usr/sbin/nft`, for the guard above), systemd 250
+or newer, and either a usable TPM2 device or a root-only local credential secret. A host that misses any of them fails the converge by name and
+nothing is rendered. There is no plaintext fallback.
+
+**Idempotence and updates.** A root-only receipt records the applied digests and a hash of the
+rendered sources, the guard's ruleset and the credentials. A converge over an unchanged entry pulls nothing, writes nothing
+and restarts nothing. If an apply fails part-way, every file it wrote is restored.
+
+**Updates are opt-in and backup-gated.** The control plane moves an installation's pinned digest
+only when the tenant accepts that exact offered digest. The converge's own apply never swaps a
+running installation to a new digest, because the application re-applies its database schema at
+every start. A pass after the converge does it instead: it takes a database backup first, then
+counts what must survive, pulls and verifies the new image, re-renders and restarts the unit, and
+asserts on data. Only a backup that same pass took can open the gate. If the backup fails, nothing
+changes. If the data assertion fails, the pass stops the application and database, restores the
+pre-update backup into the stopped database in a one-shot container, and restarts the previous
+digest. Every failure is reported, and the control plane then returns the pin to the previous
+digest. The runtime does not retry a refused digest until the pin has come back.
+
+**Update report identity.** Every update report names the update it belongs to. The host puts the
+app digest the update moves to in the report's `to_digest` field when it makes the report, from
+the swap's own target, never from the entry when the report is sent. A report the host keeps
+through an outage keeps that digest, and so does one kept while the entry is withdrawn and applied
+again. A report naming another update is refused and changes nothing, so a host that was away past
+an update's deadline cannot fail, revert or move the later update the tenant accepted meanwhile. A
+re-sent `ready` of an update the control plane already recorded is still answered as complete,
+whatever update runs by then. The field is optional. A report without it, from an older CLI, is
+applied to the update in flight as before. A report an older CLI queued is sent by a newer one
+with the digest its receipt recorded for that update. A report the host made without a digest,
+because nothing recorded which update an interrupted swap belonged to, is sent without one. It is
+never named from the receipt or the entry. The backend that accepts `to_digest` ships
+before the CLI that sends it. A CLI that meets an older backend anyway gets a 422 naming the field
+and re-sends the report once without it. The report then lands unchecked, as every report did
+before, and never stays queued.
+
+**The schema digest.** The application re-applies its database schema at every start, so the data
+directory records which Postiz digest last wrote its schema. The record is a root-only marker
+beside the database files, and the receipt mirrors it. The host writes the marker before any start
+or restart that can run a new digest on the data, so the record is never older than the schema.
+The converge never changes a data-bearing digest (the app, PostgreSQL or Redis) of an existing
+installation, whether its receipt is applied, withdrawn, missing or unreadable. It re-applies the
+digests the receipt records, with the app at the schema digest. A receipt that is missing or
+unreadable does not lift the hold. It may be absent, corrupt, or written by a newer CLI, and none
+of those says anything about the data, so over populated data the marker alone decides which app
+starts. PostgreSQL and Redis then stay at the digests their generated units on disk name, or at the
+pins when those units are gone. Data written before the marker existed has none. With no readable
+receipt and no marker, the digest the generated app unit on disk names decides instead, and
+PostgreSQL and Redis are held the same way. When populated data has no readable receipt, no marker
+and no app unit on disk, nothing on the host names the digest that wrote it, so the converge starts
+nothing over it and reports `schema_digest_mismatch`. It changes nothing until a marker or a
+readable receipt names that digest. An empty data directory has no schema to protect and takes the
+restore path above: the backup repository decides which app starts, and with nothing to restore the
+pin starts and the marker is rewritten to it. Only the update path changes the data-bearing
+digests of existing data, after a pre-update backup, and for the app only on the transition the
+control plane announced. An announced change
+from the schema digest is carried out by the next update pass, never by the converge. The update
+records itself before it restarts anything. A swap interrupted after that point is rolled back from
+its own pre-update backup by the next pass, never resumed from a new backup. Its `failed` report
+is sent only while the entry announces that swap's own transition, or no update at all. When the
+entry announces a later update instead, the host records the swap as refused and reports nothing,
+so the later update, which it never tried, is not failed. An update report
+still owed when the entry disappears is kept, so a refused `ready` still rolls the host back after
+the entry returns. A host holding a digest other than the pin keeps running it and reports
+`schema_digest_mismatch` under the installation's `host_conditions`. The host clears it once it
+runs the pin.
+
+**Rollback incomplete.** A rollback can stop part-way, for example when the restore cannot reach
+the backup repository. The host then knows nothing about its units or its data: they may be
+stopped, half-restored, or still the new version. It never records that as a rollback to the
+previous version. The receipt keeps the images the update rendered and records the incomplete
+rollback. While that record exists, nothing re-renders, starts, backs up or exports the companion,
+whatever the entry pins. The host retries the same rollback every 30 minutes: the pre-update
+backup that update took, restored into the previous version's units, never the newest backup. The
+control plane records `update_rollback_incomplete` under the installation's `host_conditions`, with
+the redacted failure, and the host clears it once a retry completes. The operator's part is to fix
+what made the restore fail, for example the host's access to the backup repository. The next retry
+then repairs the installation. The data directory is never removed.
+
+**Host conditions.** A host condition is the runtime's report of a condition on one installation
+that the host must be repaired from. It is never a job state: it does not move the installation's
+operation, status, step or error, and the control plane accepts it whatever the installation's
+status is. The control plane records each raised condition under the installation's
+`host_conditions`, with its redacted detail and when it was raised, and removes it when the host
+clears it. Operators read it from the installation row and from the backend log. The update,
+restore and network sections name each condition and say when it is raised. The host keeps the
+conditions it raised and cleared in a root-only record under the companion's state root, and the
+pass after the converge sends each raised and each cleared state once. A report the control plane
+refuses is not retried. A condition it rejects as malformed or unknown (HTTP 400 or 422, for
+example from a backend older than the CLI) counts as refused, and the conditions after it are still
+sent. A 404 means the runtime key reaches no installation right now, for example a key not yet
+bound to its agent or being re-bound. That condition stays due for the next pass, and the
+conditions after it are still sent. Network errors, 5xx, 429, 401 and 403 leave that condition and
+the ones after it for the next pass.
+
+**Withdrawal keeps data.** When the entry disappears from the manifest (including when the manifest
+carries no companions at all), the converge stops the generated services, removes the sources and
+the encrypted credentials, reloads, and rewrites the receipt as a data-retention marker. The guard
+stays loaded, because nothing listens while the units are withdrawn. Withdrawal never touches the
+data directory. Destroying a companion's data is a separate, explicit lifecycle
+instruction, never a side effect of withdrawal.
+
+**Removal is explicit.** Only an entry that carries `lifecycle: "remove"` destroys data. The
+control plane sends it after the tenant confirms an uninstall. The converge first runs the
+withdrawal above. It then lifts any mask a failed network migration left: it unmasks the recorded
+units and every unit of the kind except the network, and deletes the record. Only then does it
+delete the companion's data directory recursively, delete the guard's nftables table and ruleset
+file, and delete the applied receipt. Before the delete it checks the path: it must be exactly the kind's own data
+directory beside the platform state root, written in canonical form, and it must resolve to
+itself. A symlink or any other path is refused rather than followed. A removal whose unmask fails
+deletes nothing further and keeps the receipt, so it does not report `removed`, and the next
+converge tries again. The companion account and its
+`/etc/subuid` and `/etc/subgid` lines are kept, because a UID and its subordinate range are never
+reclaimed. After the converge, the runtime reports `removed` to the control plane, which then tears
+down the companion's platform resources. An installation that is already gone also reports
+`removed`.
+
+### Companion Verb Table
+
+Each companion exposes a **curated** verb-level toolset rather than auto-generated coverage of its
+whole API. Every exposed tool has exactly one `verb|` row in `config/companion-registry.txt`, which
+is the authority for the table below; the table is asserted equal to that file, and to the
+backend's embedded verb table, by `backend/tests/test_iforge_companion_docs_contract.py`. The check
+is bidirectional: a verb documented here and absent from the contract file fails that suite, and so
+does a verb in the contract file and absent from here. The capabilities that were deliberately left
+out are recorded with their reasons in the contract file's verb-table exclusions block, so curation
+is a decision a reader can disagree with rather than an absence they have to notice.
+
+| Tool name | Class | Method | Path template | Read probe | Cap unit | Args in |
+| --- | --- | --- | --- | --- | --- | --- |
+| `filebrowser__create_dir` | `create` | `POST` | `/api/resources` | `list_dir` | `calls` | `query` |
+| `filebrowser__delete_path` | `destroy` | `DELETE` | `/api/resources` | `list_dir` | `records` | `query` |
+| `filebrowser__list_dir` | `read` | `GET` | `/api/resources` | `-` | `calls` | `query` |
+| `filebrowser__move_path` | `mutate` | `PATCH` | `/api/resources` | `list_dir` | `records` | `query` |
+| `filebrowser__read_file` | `read` | `GET` | `/api/raw` | `-` | `bytes` | `query` |
+| `filebrowser__write_file` | `create` | `POST` | `/api/resources` | `list_dir` | `bytes` | `query` |
+| `postiz__create_post` | `create` | `POST` | `/api/public/v1/posts` | `list_posts` | `records` | `body` |
+| `postiz__is_connected` | `read` | `GET` | `/api/public/v1/is-connected` | `-` | `calls` | `query` |
+| `postiz__list_groups` | `read` | `GET` | `/api/public/v1/groups` | `-` | `calls` | `query` |
+| `postiz__list_integrations` | `read` | `GET` | `/api/public/v1/integrations` | `-` | `calls` | `query` |
+| `postiz__list_notifications` | `read` | `GET` | `/api/public/v1/notifications` | `-` | `calls` | `query` |
+| `postiz__list_posts` | `read` | `GET` | `/api/public/v1/posts` | `-` | `calls` | `query` |
+
+**The Postiz verbs.** Postiz verbs reach Postiz's public API over the loopback port through the
+image's `/api` route: the container's web server forwards `/api/` to the Postiz backend, whose
+public controller is mounted at `/public/v1`, so every path above begins `/api/public/v1/` and
+none carries a path parameter. As for every companion verb, every call requires
+`companions:invoke`, and listing the tools requires `companions:read`. `postiz__create_post` counts
+`records` as post items: one call can create one post per listed channel, so its cap is debited by
+the number of post items it would create, and it previews with `postiz__list_posts`. No Postiz verb
+is `destroy` class, so no Postiz tool can delete a post or disconnect a channel. Every Postiz
+capability that was left out, with its reason, is listed in the registry's POSTIZ VERB TABLE
+EXCLUSIONS block, and the Phase 6 coverage matrix records the same decisions.
+
+**Argument placement is declared, not derived.** The `Args in` column says WHERE a verb's
+arguments travel: `query` puts each argument in the request's query string, `body` sends them as
+one JSON object with an empty query string. The vocabulary is closed to those two values and an
+absent or unrecognised value is a parse error in both language readers — there is no default,
+because a default is what this column replaced. Placement used to be derived from the HTTP method
+inside `packages/cli/src/runtime/companion-executor.ts`, so three verbs sent their target path
+somewhere their sibling verbs did not and no reader could see the decision in a diff. All six
+filebrowser rows declare `query` today; that is the declared default pending research assumptions
+A2 and A3, not a statement about what a live filebrowser accepts for POST and PATCH.
+`postiz__create_post` declares `body` because its endpoint takes one JSON object. See the contract
+file's `argsIn` block for the full rationale.
+
+**Class is the gate; the MCP annotations are not.** Every row declares one of `read`, `create`,
+`mutate` or `destroy`, decided at definition time in a reviewable file rather than in code, and a
+row whose class is absent or outside that vocabulary is a parse error in both language readers — so
+a verb cannot ship unclassified. The class is what the façade checks. The MCP `readOnlyHint` /
+`destructiveHint` / `idempotentHint` triple is derived mechanically from it by a pure function and
+is never hand-authored; those hints are advisory client-side UX and are never themselves the
+enforcement.
+
+**Read probes, and why a `mutate` row cannot omit one.** A `mutate` or `destroy` row whose read
+probe column is the empty marker is a malformed row, refused exactly as an unclassified one is, and
+the named probe must be a `read`-class verb of the same kind — a probe that itself writes is a
+second mutation rather than a preview. That is what makes "any mutating tool has a preview path" a
+property of the contract instead of an intention.
+
+**Cap units are declared, not inferred from the class.** Two verbs of one class can have wildly
+different blast radius. `read_file` and `write_file` count `bytes` because their exposure is the
+size of the payload; `delete_path` and `move_path` count `records` because `DELETE /api/resources`
+is bulk-capable, so a per-call cap of one would still permit a single call that removes a tree;
+`list_dir` and `create_dir` count `calls`, where one call is one directory.
+
+**Two things an operator will actually observe.** First, a `destroy`-class verb is absent from
+`tools/list` until the tenant enables it, and it is additionally refused by name at call time even
+when an agent names it from memory — hiding a tool is not the enforcement, and a reader who knows
+only the first half would believe it is. Second, a newly installed companion's tools take up to
+roughly sixty seconds to appear, because the tool list is cached for that long and there is no
+list-changed notification channel in either direction to shorten the wait. That cache TTL is the
+honest staleness bound; uninstall is enforced at call time rather than by a faster list.
+
+### Incus Files Companion
+
+Hosted V2 may declare `companions.filebrowser` only in a trusted Incus apply context.
+The declaration is a server-owned companion program, not a user runtime named
+`files`; systemd planning uses the typed `file-browser` program kind so a real
+user runtime with that name keeps the normal runtime-user unit behavior. The
+manifest object needs no `kind` field because the `filebrowser` key is its
+strict, singular discriminator. The companion is installed after boot by CLI
+reconciliation; it is not installed during image/CVM boot and upstream
+self-update is disabled.
+
+The manifest pins one direct File Browser executable per architecture and
+provides a deployment-specific HS256 secret. Convergence downloads into a
+private `.staging-*` directory, verifies the exact SHA256, then atomically renames it to
+`maintained/filebrowser/candidates/<sha256>/filebrowser`. It rejects staging symlinks
+or non-directories. The service's unit-private bind mount runs the pinned
+version/commit probe in `ExecStartPre=` before executing the content-addressed candidate, and
+garbage-collects older candidates only after applied authority commits. The
+candidate has no separate active/previous link state or hand-built chroot.
+
+`iforge-files.service` runs as the non-root tenant runtime UID/GID so Files has
+native read/write access to tenant-owned home content, including `0600` files,
+`0700` directories, and dotfiles. The entire tenant home, including user units
+and official runtime configuration, belongs to the tenant UID/GID. Candidate
+directories and binaries remain root-owned outside the
+tenant home. The root-authored JWT
+configuration is a `root:<runtime group>` `0440` file below a root-only `0700`
+directory, so other tenant processes cannot traverse to it; systemd publishes
+that file and the verified binary only inside the Files mount namespace through
+`BindReadOnlyPaths=`. Install receipts remain root-only `0600`.
+
+DB/cache state lives in the tenant-owned `0700`
+`StateDirectory=iforge-files` (`/var/lib/iforge-files`). This root must also
+survive a replaceable-rootfs lifecycle. Native StateDirectory mount ordering
+must remain intact; bind it separately rather than exposing root-private
+platform state. FileBrowser Quantum's primary DB uses
+[Storm/Bolt](https://github.com/gtsteffaniak/filebrowser/blob/79552f8adb27c3e29934c4001660eb98f4aab5d6/backend/database/storage/storage.go);
+its SQLite indexes live separately under `cache/sql`. Retention checks should
+read user settings through the Files API, not hash a mutable database during
+concurrent writes. `/run/iforge-files` remains service-scoped and disposable.
+The service environment sets `FILEBROWSER_DATABASE` to the same
+`/var/lib/iforge-files/filebrowser.db` path as YAML `server.database`.
+Upstream [default initialization](https://github.com/gtsteffaniak/filebrowser/blob/79552f8adb27c3e29934c4001660eb98f4aab5d6/backend/common/settings/config.go#L976)
+checks this environment path (otherwise `./database.db`) before loading YAML.
+This avoids a misleading missing-database warning on retained-state boots;
+a genuinely missing database still produces the native warning.
+
+Quantum `v1.5.0-stable` also performs a mandatory startup cache-space check:
+its [20 GiB recommendation is a constant](https://github.com/gtsteffaniak/filebrowser/blob/79552f8adb27c3e29934c4001660eb98f4aab5d6/backend/common/settings/config.go#L231-L240),
+although the message labels binary GiB as `GB`. A 20 GiB filesystem with
+existing data can legitimately fall below it. The supported
+[`cacheDirCleanup` and `maxArchiveSize` settings](https://github.com/gtsteffaniak/filebrowser/blob/79552f8adb27c3e29934c4001660eb98f4aab5d6/backend/common/settings/structs.go#L67-L69)
+do not change that threshold or impose a total cache quota. Keep DB/cache on
+the durable state mount and preserve the warning; do not suppress all warnings,
+move cache to memory, or increase storage just to silence this recommendation.
+
+The tenant can therefore inspect or alter its
+own Files state and can signal the same-UID Files process, but cannot replace
+the root-owned binary or configuration source, write receipts, or control the
+system unit. Systemd restarts a terminated Files process and readiness gates
+activation. The base runtime image remains unchanged and contains no File
+Browser binary, configuration, state, installer, or File Browser-specific
+package. The service reuses the generated system-unit and environment-file
+writer and applies systemd's native
+`ProtectSystem=strict`, `ProtectHome=tmpfs`, `BindPaths`, `ReadWritePaths`,
+`ReadOnlyPaths`, `NoExecPaths`, `PrivatePIDs`, private device/tmp, capability,
+namespace, and task-limit controls. `PrivatePIDs` prevents Files from observing
+or signaling the tenant's other runtime processes. File Browser receives its
+official JWT header configuration with password, signup, passkey, sharing,
+admin, API-token management, realtime, and WebDAV disabled. It accepts only the
+manifest-bound external JWT assertion; no password, pairing code, access code,
+or URL token is part of this runtime
+contract. The non-admin profile settings remain available for safe display and
+file-viewing preferences, with dotfiles visible and the sidebar unpinned by
+default; those settings cannot elevate the separately disabled permissions or
+unlock password auth. Quantum applies those defaults when it first creates the
+external-JWT user and preserves that user's later preferences across config
+changes; reconciliation never rewrites or deletes the service database to force
+new defaults onto an existing account. Files still refuses symlinks rather than
+traversing them.
+
+When a later manifest omits the companion, normal stale-unit
+reconciliation stops and withdraws only `iforge-files.service` while preserving
+the selected Hermes or OpenClaw unit.
+
+The unavoidable workspace boundary is content-level: the tenant owns its whole
+home and can edit or delete its contents, user units, official runtime config,
+and Files state. The tenant can already stop, start, or alter its own user
+services. Hosted convergence restores managed unit and drop-in bytes from
+declarative state and restarts an active unit when those rendered bytes changed;
+it leaves every foreign systemd drop-in untouched. This does not grant the
+tenant control over the root-owned Files binary, configuration secret source,
+receipts, system unit, or listener authority. Port 9120 has normal socket
+exclusivity rather than a separate tenant-slice reservation: the tenant cannot
+displace the running service, but can bind 9120 while it is not listening and
+thereby cause later activation/readiness proof to fail. That remaining
+availability boundary does not let reconciliation adopt the tenant process as
+the managed unit.
+
+The pinned upstream contracts are File Browser's
+[JWT verifier](https://github.com/gtsteffaniak/filebrowser/blob/79552f8adb27c3e29934c4001660eb98f4aab5d6/backend/auth/jwt.go),
+[JWT middleware](https://github.com/gtsteffaniak/filebrowser/blob/79552f8adb27c3e29934c4001660eb98f4aab5d6/backend/http/middleware.go),
+and [authentication settings](https://github.com/gtsteffaniak/filebrowser/blob/79552f8adb27c3e29934c4001660eb98f4aab5d6/backend/common/settings/auth.go),
+the [user-default and permission fields](https://github.com/gtsteffaniak/filebrowser/blob/79552f8adb27c3e29934c4001660eb98f4aab5d6/backend/common/settings/structs.go),
+and the [non-admin profile update boundary](https://github.com/gtsteffaniak/filebrowser/blob/79552f8adb27c3e29934c4001660eb98f4aab5d6/backend/http/users.go),
+plus the documented
+[systemd execution sandbox](https://www.freedesktop.org/software/systemd/man/latest/systemd.exec.html).
+Repository tests verify the manifest and systemd sandbox contracts.
+
+Done: `bash scripts/test.sh cli src/runtime/manifest-reconciliation.test.ts`
+and the focused backend runtime-manifest tests exit 0.
+
+### Runtime Host Contents
+
+| Area | Contains | Must not contain |
+| --- | --- | --- |
+| Host envelope | runtime user, home directory, base packages, process manager, host policy | runtime-specific shell wrappers |
+| iforge | managed `iforge`, runtime-fetched `mitmdump` (mitmproxy) transparent gateway, status/doctor tooling, `iforge-*` support units | per-agent command shims, OpenClaw/Hermes binaries |
+| Hermes | official install and official `hermes` binary | iforge-owned `hermes` wrapper |
+| OpenClaw | official install and official `openclaw` binary | iforge-owned `openclaw` wrapper |
+| Runtime state | `/var/lib/iforge`, `$IFORGE_RUN_DIR`, workspace, short-lived secret files | durable plaintext provider secrets |
+
+The host should not add:
+
+- `/usr/local/bin/openclaw` or `/usr/local/bin/hermes` wrappers owned by
+  iforge;
+- generated launch scripts that call `iforge run -- openclaw` or
+  `iforge run -- hermes`;
+- an iforge process as PID 1 for Hermes or OpenClaw;
+- direct public exposure of `--auth none` runtime ports.
+
+The image must not contain per-agent command wrappers, generated launch scripts,
+or PATH shims for `openclaw`, `hermes`, or future runtime names. Official
+runtime commands still resolve to official binaries, so native commands such as
+`openclaw update` and `hermes update` keep their own updater behavior.
+
+## Support Module Boundaries
+
+The iforge support programs run under the same process manager as the runtime
+programs. `iforge runtime sidecar` is the egress support process and keeps an
+explicit authority boundary:
+
+| Module | Starts when | Direction | Sensitive input | Network exposure | Must not own |
+| --- | --- | --- | --- | --- | --- |
+| manifest/watch | an auth token file exists | control-plane polling | iforge auth token from file | outbound API only | official runtime PID 1 |
+| live-sync daemon | `liveSync.agents` is non-empty | live sync and local daemon APIs | iforge auth token from file | local daemon surface | egress rewrite policy |
+| sidecar egress module | enabled egress profiles exist | runtime outbound proxy | profile bundle, CA cert/key under `$IFORGE_RUN_DIR`, optional secret file | loopback/private proxy | live-sync/API authority |
+| official runtime program | runtime is enabled | normal runtime behavior | runtime-specific env/config only | official runtime ports | iforge auth secrets |
+
+The sidecar is still not a hidden wrapper around Hermes/OpenClaw. It only hosts
+iforge-owned support modules; official runtime programs remain direct process
+manager entries.
+
+The egress module keeps its root CA certificate and private key under the
+ephemeral run directory so a sidecar restart does not change the trust root for
+already-running runtimes. Runtime programs receive only the CA certificate path
+as trust env; the private key path is not projected into runtime env.
+
+The combined system-plus-egress CA bundle is certificate-only trust material,
+but it is consumed by the non-root runtime processes through `NODE_EXTRA_CA_CERTS`,
+`REQUESTS_CA_BUNDLE`, and `SSL_CERT_FILE`. The root-owned sidecar therefore
+publishes it atomically as `root:<runtime primary group>` with mode `0640` on
+both creation and replacement. Making it root-only would break the declared
+runtime-user service model; making it world-readable would unnecessarily expose
+the managed trust projection to unrelated local users. The egress CA private key
+remains separate under the egress identity's private directory and is never
+group-readable by the runtime user.
+
+### Official Container Reference Research
+
+Official runtime images are useful references, but they are not the primary
+hosted architecture while in-place official UI updates are a requirement:
+
+| Image | Useful reference | Update implication |
+| --- | --- | --- |
+| `nousresearch/hermes-agent` | s6 starts `hermes gateway run` and, with `HERMES_DASHBOARD=1`, also starts `hermes dashboard`; ports are `8642` and `9119` | Docker installs update by pulling/recreating the image, so dashboard update cannot be the normal in-place updater path |
+| `ghcr.io/openclaw/openclaw` | `tini` runs the gateway; official container rejects unauthenticated non-loopback binds; `--auth token --bind auto` works for directly exposed ports | Docker installs update by image rollout; in-place `openclaw update` belongs to non-Docker installs |
+
+The Linux-like host can adopt these lessons without switching to container
+rollout updates: use separate official systemd user services when the runtime
+provides service installers for separate surfaces, and require runtime-native
+auth when exposing the official OpenClaw port directly.
+
+## Manifest Shape
+
+The control plane accepts only exact
+`Accept: application/vnd.clawdi.runtime-bundle.v2+json` and returns strict
+`clawdi.hosted-runtime.bundle.v2`. The response contains the hosted manifest,
+sanitized Telegram, Discord, and WhatsApp `channelBindings`, one merged
+`secretValues` map, and deterministic `sourceRevision`. Missing or unsupported
+media types return `406`; the CLI does not fall back to another representation
+or a second `/v1/channels` request.
+
+Bundle responses identify the vendor media type and vary on `Accept` and
+`X-Clawdi-Runtime-Capabilities`.
+Negotiation `406` responses also return `Vary: Accept` and
+`Cache-Control: no-store`, so errors are not reused across media types.
+The v2 strong ETag is `"sha256:<sourceRevision>"`; the immutable renderer and
+the revision's effective public and secret-source identity make it a strong
+validator without decrypting secrets in the health summary.
+
+### Channel reconcile boundary
+
+Telegram, Discord, and WhatsApp `ChannelBotAgentLink` rows are runtime desired
+state. A link create or re-link, link delete, account archive, or link
+credential rotation changes the rendered channel projection and therefore
+`sourceRevision`. Those mutation transactions also enqueue the existing
+signal-only `runtime_manifest_changed` event for the linked Agent. The event is
+delivered only after commit; the runtime refetches the manifest and converges at
+the normal ETag/sourceRevision boundary. ETag polling remains the missed-event
+fallback, so no separate restart or channel-specific reconcile state machine is
+required. Creating a pair code emits this signal only when that request also
+creates an AgentLink or repairs missing WhatsApp credential material.
+
+Hermes WhatsApp withdrawal removes its projected enable flags only when the
+previous committed bundle belongs to the same deployment and instance, its
+projected session path still matches native configuration, and no pairing file
+survives managed credential cleanup. Only unchanged `true` flags are removed;
+native pairing, alternate session paths, explicit local disables, and unrelated
+channel policies are preserved. An empty projection alone never authorizes
+native channel deletion.
+
+CLI 0.14.79–0.14.81 could remove the managed session path and credentials while
+retaining both enable flags. If that empty bundle has already replaced committed
+authority, an upgrade cannot reconstruct historical ownership. Recovery requires
+an authenticated pre-withdrawal application record and a compare-and-swap native
+configuration repair under operator authority; timestamps, missing credentials,
+and repeated gateway restarts are insufficient evidence. Do not restore revoked
+bindings or overwrite current applied authority to manufacture cleanup intent.
+
+Done: `scripts/test.sh cli src/runtime/manifest-reconciliation.test.ts -t 'withdraws archived Hermes'`
+verifies bundle add/update/archive, native config loading, local ownership, and
+idempotent reconciliation in the disposable Docker runner.
+
+Each WhatsApp binding carries Link-scoped agent-token and egress-capability
+secret references plus a credential descriptor containing its id, explicit
+`credsSecretRef`, and public auth-certificate material. The matching serialized
+Baileys credentials are present in `secretValues` only under that declared
+reference. Healthy manifest reads use the repeatable-read snapshot directly;
+missing credential or auth-certificate rows enter a locked, idempotent repair
+path and then render from a fresh snapshot.
+
+`ChannelBinding` rows are provider routing state, not runtime identity. Pairing
+or unpairing a chat updates only the binding and provider-owned per-chat
+projection, including Telegram command scopes and menu state. It does not enter
+`sourceRevision`, emit a runtime-manifest signal, archive the AgentLink, or
+restart/reconfigure the Agent. Telegram bindings currently identify a chat by
+the stored external chat identity; runtime conversation/session threading is a
+separate concern.
+
+The bundle root optionally carries `applyGeneration`, the deployment Apply
+identity. The inner manifest `generation` remains checkpoint/content identity.
+`applyGeneration` is omitted while persisted runtime state is null, preserving
+the legacy bundle bytes and validator; once explicit, it is included in
+`sourceRevision`. It must be positive. Checkpoint and Apply generations are
+independent monotonic sequences, with no ordering relationship between their
+values.
+
+The CLI normalizes these wire contracts into the desired-state shape:
+
+- `clawdi.hosted-runtime.manifest.v1` is the hosted control-plane response
+  shape served only from `/v1/runtime/manifest`. It requires explicit `runtime`
+  and `environmentId` fields and rejects unknown fields instead of accepting
+  compatibility payloads. `system`, `controlPlane`, `clawdiCli`, `runtimes`,
+  `providers`, `liveSync`, and `recovery` are required. `egressProfiles`, `mcp`,
+  `skills`, and `tools` remain explicit optional projections.
+- `clawdi.runtimeDesiredState.v1` is the normalized internal convergence shape
+  consumed by `runtime init`.
+- `clawdi.hosted-runtime.bundle.v2` wraps an inner
+  `clawdi.hosted-runtime.manifest.v1` and is marked locally after validation.
+  Its inner manifest additionally accepts the optional `agentPlugins`
+  projection. OpenClaw requires typed native auth, the exact gateway command,
+  and an environment secret reference for the gateway token.
+
+Normalization maps hosted fields into the internal shape:
+
+| Hosted field | Internal purpose |
+| --- | --- |
+| `deploymentId`, `environmentId`, `instanceId`, `generation` | Deployment/instance identity and checkpoint/content generation for cache and content state |
+| Bundle root `applyGeneration` | Optional deployment Apply identity; legacy bundles resolve it from checkpoint `generation` through one named compatibility rule |
+| `runtime` | Required selected compute runtime; exactly one enabled `openclaw` or `hermes` entry must match it |
+| `locale.language`, `locale.timezone` | Required supported language and valid IANA timezone |
+| `system.openclawControlUiAllowedOrigins` | Strict-v2 OpenClaw public origin allowlist |
+| `system.openclawGatewayAuth` | Strict-v2 OpenClaw token and required native shared-token capability; the token itself is an environment secret reference |
+| `system.hermesDashboardAuth` | Strict-v2 Hermes Clerk OIDC provider settings, deployment binding, public URL, issuer, and trusted proxy contract; no password or dashboard secret is part of the manifest |
+| `controlPlane.cloudApiUrl` | Required and only control-plane field; `appId`, `apiUrl`, and `manifestUrl` are not public manifest fields |
+| `clawdiCli.source` | Required literal `npm:clawdi` for Hosted managed CLI updates |
+| `clawdiCli.packageSpec` | Required exact `clawdi@<semver>` without build metadata, at most 200 characters; remote Hosted manifests never select an npm dist-tag or local path |
+| `clawdiCli.registry` | Required literal `https://registry.npmjs.org`; Hosted does not use npm registry defaults or overrides |
+| `runtimes.<name>.enabled` | Run config and systemd unit state |
+| `runtimes.<name>.install` | Required strict `{source: "official"}` selector; Hosted cannot select a version, channel, commit, digest, or custom installer. Both supported runtimes use the official installer's default latest release. |
+| `runtimes.<name>.run` | Exact official gateway argv; only OpenClaw may carry its single gateway-token secret reference. Hosted rejects custom commands, cwd, env, and PATH projection. |
+| `runtimes.<name>.providerMode` | Required runtime-provider ownership discriminator: `configured` or `unmanaged` |
+| `runtimes.<name>.provider_ids` | Core Hosted configured mode requires one primary provider and permits one additional capability provider; unmanaged mode requires an exact empty list. The capability provider does not participate in chat fallback or ordering. |
+| `runtimes.<name>.primary_model.{provider_id,model}` | Required only in configured mode and its provider must belong to `provider_ids`; absent in unmanaged mode |
+| Hosted filesystem defaults | Derived locally from Hosted `RuntimePaths`: HOME, workspace, persistence root, and installer home use `userHome`; Hosted rejects external path and cwd overrides. |
+| `providers.<id>` | Canonical Hosted provider projection: `kind` is exactly `openai-compatible`; normal entries also require `type` and `baseUrl`, while `provider_not_found` is the only reduced error entry |
+| `runtimes.<name>.services` | Empty for OpenClaw; exactly the fixed official `hermes dashboard` argv for Hermes. Hosted rejects every other runtime-owned process. |
+| `providers` | Required runtime-scoped AI provider projections whose keys exactly match selected `provider_ids`; `{}` in unmanaged mode |
+| `terminalTooling.codex` | Required typed Hosted terminal-tool projection with the selected model plus minimal iforge-managed endpoint/secret metadata; it has no provider model catalog and is independent of runtime providers |
+| `mcp.servers` | Required canonical map for generic named stdio or remote HTTP server declarations; invalid stored MCP state fails closed with `409` |
+| `skills.entries.<id>.{enabled,version}` | Generic bundled-Skill intent; the entry key is the Skill id and `version` is a positive integer |
+| v2 bundle inner manifest `agentPlugins.{schemaVersion,installations}` | Optional iforge-owned runtime-native Agent Plugins desired state, projected only when the client declares `agent-plugins-manifest-v1`; schema version `1` entries are secret-free immutable package intent that pin an exact SemVer, the canonical Agent Plugins 1.0.0 schema URI, a closed immutable source, and a `sha256-tree-v1` content digest; GitHub Release sources additionally require `agent-plugin-github-release-source-v1` and bind the archive SHA-256 |
+| `tools` | Existing unrelated tool projection pass-through; it does not include terminal Codex |
+| `liveSync.{enabled,agents}` | Required explicit daemon sync configuration; Hosted does not infer it from agent metadata |
+| `egressProfiles` | Explicit generic local sidecar profiles; Agent Plugin packages, Store metadata, and public installation APIs cannot declare them |
+| `recovery.{cacheManifest,allowOfflineBoot}` | Required explicit manifest cache and offline-boot behavior |
+
+The outer Hosted selector remains unchanged for reader-first CLI upgrades.
+Hosted v2 normalizes both OpenClaw and Hermes to their official installers
+without a version or channel argument. Convergence runs the installer when the
+runtime executable is absent; it does not resolve, compare, or rewrite upstream
+versions independently.
+
+Because new Hermes Agents always receive upstream `main`, the
+[Hermes Upstream Contract](../.github/workflows/hermes-upstream-contract.yml)
+workflow installs the current official Hermes every three hours as UID 10001
+in a clean Ubuntu container and drives the CLI's own Hermes adapter code
+against it: interpreter resolution, command-line surfaces, config, Skill,
+credential-pool, Codex OAuth, and Agent Plugin helpers, the dashboard cold
+build, OIDC dashboard and gateway readiness, and the managed WhatsApp Baileys
+patch. The installer URL and arguments come from the CLI source. A failure
+names the upstream commit and `displayVersion` in the job summary; scheduled
+and manual runs also keep one open issue labeled `hermes-upstream-contract`
+updated until the contract passes again. Run it locally with:
+
+```bash
+scripts/test-hermes-upstream-contract.sh
+```
+
+Done: the command exits 0 and its report shows `PASS`.
+
+Hosted parsing does not accept camel-case runtime binding aliases, snake-case
+provider transport aliases, or string `primary_model` values. Provider model
+catalog fields such as `models[].api_mode` and ownership metadata such as
+`managed_by` remain canonical snake-case wire fields. Singular provider
+`model` is not a Hosted alias; model selection lives in runtime
+`primary_model`, while provider catalogs use `models[]`. Provider error
+projections require `status: "error"` and `error` together, including a
+non-empty `error.message`. A
+`provider_not_found` entry contains `kind` plus that error pair; other error and
+healthy entries retain the normal `kind`, `type`, and `baseUrl` projection.
+
+This strict typing claim applies only to the Hosted fields modeled in this
+release. `egressEngine` and `egressProfiles` use closed schemas matching the
+Hosted CLI wire and are validated at admin write and manifest read boundaries.
+Invalid stored egress JSON fails closed with `409`. `terminalTooling.codex` is
+the one typed terminal-tool subset in this release. It does not declare MCP and
+does not participate in runtime `provider_ids`, runtime primary-model selection,
+source-level applied provider IDs, or runtime provider health. An `mcp` object
+with an own `servers` field is validated as the generic stdio/remote declaration
+collection; an object without `servers` and unrelated `tools` fields retain
+their released pass-through behavior. The normalized generic
+`clawdi.runtimeDesiredState.v1` shape also retains optional install metadata,
+default install args, and arbitrary provider projection data such as singular
+`model` for non-Hosted inputs.
+
+### Runtime Provider Ownership And Terminal Codex
+
+Agent v2 requires exactly one selected OpenClaw or Hermes runtime. Provider
+intent is also explicit: `configured` means iforge owns the selected runtime
+provider projection, while `unmanaged` means iforge projects no runtime provider
+metadata, secret reference, environment variable, or primary model. Empty
+provider state never implies a mode. Runtime-only deployments therefore render
+`providerMode: "unmanaged"`, `provider_ids: []`, no `primary_model`, and
+`providers: {}`. Health is exact only when the source-level applied provider set
+is also empty.
+
+Hosted Codex is a separate terminal tool plane. Its fixed provider reference is
+materialized under `terminalTooling.codex` from the same repeatable-read batch as
+runtime providers. When both consumers use the same provider, Cloud resolves
+and decrypts that provider auth payload once. The CLI uses the terminal-tool
+reference to own exactly one Hosted Codex default configuration at
+`$CODEX_HOME/config.toml` (default `~/.codex/config.toml`). When Codex is absent
+or damaged, the CLI installs the official npm package `@openai/codex` at its
+npm default tag (`latest` unless the user configures another tag) from
+`https://registry.npmjs.org` into the tenant's standard `~/.local` npm prefix.
+Bootstrap sets both the default and `@openai` scoped registry to the official
+registry; an inherited scoped mirror cannot redirect this installation. Its installed npm metadata retains the actual
+validated semantic version, also bound into the provider impact revision.
+A later reconcile
+does not query the registry for a newer release when the package name and semantic version are valid
+and the command has executable permission. This is an installation-presence check,
+not an execution-health or sandbox qualification. It does not wrap, pin, or roll
+back an existing user-owned Codex install that passes those checks. The Hosted
+instance environment supplies the public egress
+placeholder, standard CA trust variables, and npm prefix to terminal commands.
+Managed, BYOK, Codex OAuth, and unmanaged runtime-provider modes all receive the
+same terminal Codex default. Unmanaged OpenClaw or Hermes units receive no
+provider environment.
+
+For an iforge-managed provider, the CLI gives OpenClaw, Hermes, and terminal
+Codex the same reserved local placeholder name: `CLAWDI_AI_API_KEY`. Each
+consumer sends the fixed placeholder value through that env key; the
+endpoint-scoped egress profile matches the Authorization value and rewrites it
+from the provider secret reference. User-managed provider environment names are
+not remapped.
+
+The new CLI writes no Codex `model` or `model_catalog_json`; it writes only the
+custom provider selection, endpoint, canonical env key, and Responses transport.
+On the normal iforge-provisioned path, the plain `env_key`, fresh managed home,
+and absence of command or Codex-backend auth leave remote refresh disabled, so
+Codex selects its own default from its installed bundled catalog. A manually written or stale ChatGPT backend auth
+file can satisfy Codex's upstream refresh gate. Codex has no native discovery-off
+setting analogous to OpenClaw or Hermes, and iforge does not invent one or
+encode a model choice. Manifest v1 `primary_model` remains required only
+because strict parsing precedes a `clawdiCli.packageSpec` self-upgrade; the new
+CLI validates and ignores it.
+Legacy terminal-Codex `OPENAI_API_KEY` and provider `models` are also read-only
+v1 compatibility inputs; local output always uses `CLAWDI_AI_API_KEY` and
+remains catalog-free. Removing those wire fields needs a new schema after older
+CLIs can reach this compatibility release.
+
+This change is Phase A: publish `clawdi@0.13.69`, which reads both legacy and
+canonical terminal-Codex env names while writing only the canonical local env.
+Phase B keeps backend emission deployment-scoped: terminal Codex receives
+`CLAWDI_AI_API_KEY` only when the desired CLI is `clawdi@0.13.69` or later and
+strict v2 `activeCliVersion` proves the current running CLI is the exact desired
+version, along with the current apply generation and instance. Installed CLI
+diagnostics do not satisfy this gate. Observation generation, ETag, and source
+revision must agree with that applied record. Every missing, invalid, stale, or
+mismatched state retains `OPENAI_API_KEY`, including upgrades and rollbacks.
+Phase B may therefore deploy before the fleet upgrades: each deployment remains
+on the legacy env name until its own CLI and observation have converged.
+The gate does not compare that last applied revision with the revision currently
+being rendered: changing the env name creates a new revision, and the internally
+consistent applied record keeps the canonical projection stable while it catches up.
+
+This mode controls default configuration ownership, not pod-wide network
+isolation. Egress matching is domain based, so another pod process could call a
+tool-plane gateway deliberately; the credential remains deployment-scoped and
+charges that deployment user's wallet.
+
+Platform provider and tool credentials are stored as encrypted provider auth
+payloads and projected through bundle secret references. They are not user
+Vault items, do not use `iforge://` references, and do not depend on Vault
+attach, share, delete, or resolve operations. User Vault participation remains
+explicit through the existing user-facing provider and `iforge run` flows. The
+unmanaged provider discriminator does not reject an independently, explicitly
+selected user Vault-backed run or service secret reference; it only prevents
+provider-plane material from being inferred or projected into the runtime.
+The backend's existing low-level encryption helper and key reuse is legacy
+infrastructure; it is not a runtime Vault contract and this release does not
+change its ciphertext format or key.
+
+Remote Hosted CLI policy is exact-version only. Values such as npm dist-tags,
+bare package names, build-metadata versions such as `clawdi@1.2.3+build.1`, and
+malformed SemVer prereleases are rejected before normalization. Valid
+prereleases follow SemVer identifier rules, including forms such as `beta.51`
+and `rc-1.2`; empty identifiers and numeric identifiers with leading zeroes are
+invalid. Prerelease CLI publication uses the standard npm `beta` dist-tag, but
+that tag is non-authoritative publication metadata. Cloud and Hosted production
+never resolve or persist it: rollout state contains an exact `clawdi@<semver>`
+package spec, and `clawdi@beta` is rejected at both write and manifest-read
+boundaries. A managed bootstrap tgz under
+`/usr/local/share/clawdi/bootstrap/` is accepted only by the explicit
+in-process manifest fixture seam used by paired-image tests. Hosted init/watch
+always fetch from the typed runtime-context `manifestSource`; remote fetches
+cannot use the fixture schema. Generic
+`clawdi.runtimeDesiredState.v1` manifests retain their existing floating package
+support; exact Hosted updates do not call `npm view` and can move to either a
+higher or lower exact version.
+
+The trusted CLI catalog maps each Hosted bundled Skill entry to a package-local
+directory and SHA-256 digest. The private manifest keeps the existing `iforge`
+version `1` compatibility label; installing a newer exact CLI package refreshes
+the managed Skill bytes and catalog digest directly, without a separate Skill
+rollout or public version choice. The asset remains at
+`skills/hosted-versions/1/iforge/SKILL.md`, so the Skill file's direct parent
+matches its frontmatter name. Source paths, content, digests, and package specs
+never cross the runtime wire. Unknown ids or versions, unmanaged targets,
+source digest mismatches, and unsupported source file types fail closed. An
+exact managed marker plus an actual target-content digest match is a filesystem
+no-op; package refreshes, drift, and legacy ownership markers use staged
+replacement.
+
+Managed-bundle integrity does not reuse `computeSkillFolderHash`. That function
+is an established client/server sync protocol over the safe dereferenced
+regular-file archive projection, with upload exclusions and its historical
+unframed `path + content` hash. It does not encode regular-file permission
+modes, so chmod-only projection fidelity is not guaranteed. The managed catalog
+instead uses a private, framed full-file scan over
+relative path, regular-file permission bits, and bytes. It does not hash
+ownership or timestamps, rejects source symlinks, and treats target symlinks as
+drift without following them. The public sync hash remains unchanged for old
+and new clients.
+
+### Library Skill References And Runtime Evidence
+
+For a GitHub Skill whose source path is empty (repository root), OpenClaw
+activation invokes `openclaw skills install git:<repository-url>#<commit>
+--agent main --as <skill-key> --force`. OpenClaw owns Git fetching, install
+policy and native source metadata; `--force` selects replacement and does not
+override its scan policy. iforge verifies the resulting bytes against the
+prepared immutable archive and reads `.openclaw/source-origin.json` to check
+the Git URL, ref and commit. A reserved installation with matching bytes but
+missing or stale native provenance is reinstalled through that same command.
+Native refusal, changed bytes or mismatched provenance fail the operation and
+retain the existing filesystem/reservation rollback; there is no local-path
+retry after a Git install fails. Heartbeat evidence also detects native origin
+changes for these root Git installs. Unmanaged local targets remain protected.
+
+GitHub subdirectories and Project/Library archives use OpenClaw's existing
+native staged-directory install entrance. That entrance runs native install
+policy; its `local-path` transport describes the verified staging directory,
+while Cloud and iforge retain the original immutable source identity. It does
+not mark the content as trusted or builtin. iforge removes only its reserved
+OpenClaw directories on the native filesystem discovery surface; this is
+managed ownership cleanup, not a claim that OpenClaw provides a Hub uninstall.
+No upload RPC or additional source fields are required. These paths were
+checked against OpenClaw commit `cef6e690d5573d06f3feef5fdf103906e842c618`
+([source install](https://github.com/openclaw/openclaw/blob/cef6e690d5573d06f3feef5fdf103906e842c618/src/skills/lifecycle/source-install.ts)).
+
+Hermes sourced Skills use its public `SkillBundle`, `quarantine_bundle`,
+`scan_skill`, `should_allow_install(force=False)` and `install_from_quarantine`
+functions. Prepared file bytes remain intact, including supporting files and
+binary assets. Scanning receives the real source identifier; a refusal or
+confirmation requirement remains a refusal. Native metadata records the
+secret-free GitHub commit or Project content identity. Signed download URLs
+are transport credentials and never enter native metadata. Cloud and iforge
+remain the source and reservation authorities.
+
+Reconciliation verifies both the exact installed tree and native provenance.
+Missing provenance causes a native reinstall, including migration of existing
+iforge-owned local files. Heartbeat checks the same per-Skill native identity,
+without treating unrelated Hub changes as drift. Ambiguous or partial native
+failures retain pending ownership for ordinary retry; a definitive refusal
+before target mutation releases only the newly attempted reservation. iforge
+does not restore directories or snapshot/restore Hub metadata around native
+mutations. An unreadable or torn Hub lock fails before mutation
+so native loading cannot silently discard sibling records. Native removal uses
+`uninstall_skill` for known Hub records; a known legacy local Skill uses the
+public `skill_manage(action="delete")` tool, preserving its pinned protection
+without requiring an installation scan before deleting old content. The
+platform bundled `iforge` bootstrap retains its platform-owned local path.
+These contracts were checked against Hermes fork commit
+[`736fc4d86a1acd8c96473aeb55f9c783e2170dca`](https://github.com/Clawdi-AI/hermes-agent/tree/736fc4d86a1acd8c96473aeb55f9c783e2170dca).
+
+Done: `scripts/test.sh cli src/runtime/hosted-hermes-skill.test.ts src/runtime/hosted-skill-observation.test.ts`
+passes CLI typecheck and the real
+native scan, bytes, provenance, uninstall and retry tests in Docker. The test
+runner provisions the pinned native source and minimal Python dependencies in
+a disposable fixture; none are published with the CLI.
+
+`PUT /v1/agents/{agent_id}/skill-references/{skill_id}` selects one accessible
+Cloud-authority Skill for a Hosted Agent; `DELETE` removes that reference.
+`GET` on the reference returns the existing Skill detail with its real source
+Project. Linked copies make PUT a no-op. Agent-sync projections cannot be
+selected. References share Project Skill composition, signed downloads,
+conflict locks, source updates and access revocation; they never own bytes.
+
+`GET /v1/agents/{agent_id}/skills` combines Hosted GitHub/bundled intent with
+Library and linked Project sources. It distinguishes the runtime `skill_key`
+from `source_skill_key` and returns source authority and read-only metadata.
+Installation evidence requires a unique fresh observation head matching the
+current deployment, instance, generation, source revision and source identity.
+Missing evidence yields `not_observed`. Current absent failures appear only in
+`removal_failures`; they never recreate desired rows.
+
+The existing CLI reconcile records per-Skill bytes/absence verification in its
+private applied-state receipt. The v2 companion heartbeat rechecks ownership and
+installed tree digests and emits optional `skills` diagnostics. Source identity
+is SHA-256 of UTF-8 NUL-joined fields: `github`, local key, repository URL, path,
+commit; or `project`, local key, Project UUID, content hash; or `bundled`, local
+key, version. It excludes transport URLs. Diagnostics share the full applied
+identity, including failed resources. The wire retains at most 2048 entries,
+prioritizes failures deterministically, and explicitly sets `skills.truncated`
+and the existing top-level flag; private applied evidence remains complete.
+The v1 heartbeat shape is unchanged.
+
+Done: `scripts/test.sh backend tests/test_agent_skill_references.py` and
+`scripts/test.sh cli src/runtime/hosted-skill-observation.test.ts` pass in the
+isolated Docker runners (the backend runner provisions and migrates PostgreSQL).
+
+### Skill And MCP Authority Boundaries
+
+Agent Plugins 1.0.0 defines package manifests and Skill/MCP component loading;
+it does not define a registry, marketplace, trust policy, installation source,
+integrity scheme, or portable secret binding. iforge supplies those separate
+control-plane concerns through a strict catalog cache and desired-state rows.
+The asynchronous worker resolves fixed public Store `main`, fetches catalog v2
+at the resolved exact commit, and retains the last-known-good snapshot across
+timeouts, invalid upstream content, and GitHub failures. Runtime and product
+requests read PostgreSQL only.
+
+`GET /v1/plugin-catalog` and its named-entry route expose the public Store
+metadata and closed component summary, including only Skill names and MCP
+server name-to-transport mappings. `PUT` and `DELETE` under
+`/v1/agents/{agent_id}/agent-plugins/{plugin_name}` mutate desired state; the
+desired row, when present, remains authority. List/get/put responses expose only
+`installed`, `failed`, or `not_observed` convergence from a fresh exact-identity
+observation. Unknown receipt evidence maps to `not_observed` with a stable
+`observation_error_code`. `Installing` and `Removing` are not persisted server
+states; they belong only to a future UI mutation-local loading state. Product
+input is only the path plugin name and optional exact catalog version. It cannot
+choose a URL, path, commit, digest, installation id, egress, secret, or
+runtime capability. A stable opaque installation UUID is generated by the backend
+and remains stable across explicit updates. Catalog changes never silently
+upgrade existing Agents.
+
+This release installs only through the existing v2 Hosted bundle. An Agent
+without Hosted v2 runtime state is rejected before persistence. Catalog entries
+Catalog runtime compatibility is checked against the selected known runtime
+before persistence.
+The Platform compatibility input keeps optional `agent_plugins` only as
+omitted/null; non-null input is rejected and Platform no longer persists or
+assigns plugin selection.
+
+Catalog source is a closed union. Authored Store packages use a catalog-relative
+path that iforge binds to the exact Store snapshot commit. Source-built packages
+use a canonical GitHub Release asset URL plus archive SHA-256. The selected
+source object and tree digest are copied into the installation row, so later
+catalog changes never alter an existing desired installation.
+
+The `agentPlugins` projection is supported only in the v2 Hosted bundle. Each
+installation key is the Agent Plugins name and must equal `plugin.json.name`;
+`installationId` is an opaque iforge lifecycle identity rather than a native
+runtime plugin id. Before touching the runtime, the CLI downloads either the
+exact GitHub commit or the exact Release asset. Release bytes must first match
+their archive SHA-256. The CLI then safely extracts the declared package root,
+validates the Agent Plugins 1.0.0 schema/name/version identity, and verifies the
+canonical `sha256-tree-v1` regular-file tree digest. Symlinks, non-regular
+entries, unsafe or colliding paths, and bounded-size violations fail closed.
+
+`X-Clawdi-Runtime-Capabilities: agent-plugins-manifest-v1` negotiates only the
+generic third-party desired-state projection. Clients without it receive no
+`agentPlugins` field. `agent-plugin-github-release-source-v1` independently
+proves parsing and download support for the Release source variant; without it,
+only installations using the already-supported commit source are projected.
+Neither token is a version gate. There is no package-specific proof header or
+migration variant. The built-in `clawdi` MCP and Skill remain projected through
+their existing first-party paths for every client and are never removed in
+response to Agent Plugin state.
+
+The plugin name `iforge` is reserved. New catalog installations return
+`agent_plugin_name_reserved`; catalog responses expose `reserved_name` and are
+not installable. Historical rows are not deleted: list, get, and explicit
+delete remain available, they do not consume the third-party installation
+limit, and runtime projection filters them out. A Store catalog cleanup may be
+done separately, but no database migration is required for safety.
+
+iforge remains a lifecycle and ownership driver. It gives the complete,
+already-verified package to the selected runtime's native plugin commands and
+does not flatten Skills or MCP declarations into separately managed resources.
+OpenClaw installs from a task-scoped local directory. Hermes accepts only Git,
+so iforge creates a task-scoped local `file://` Git transport from the verified
+bytes and removes it after the native command completes; the Hosted repository
+URL is never passed to Hermes for another download. Packages containing Git
+control directories or attributes that could change verified checkout bytes
+fail closed instead of weakening that transport boundary.
+
+Runtime support is fixed by the versions pinned in the Hosted manifest. After
+the official runtime binary is installed and observed, the CLI uses the native
+plugin lifecycle against the real runtime HOME. It validates the installed
+identity, package bytes, component inventory, enabled state, and install source
+before advancing the receipt. An unavailable command, unsupported or nonzero
+lifecycle operation, malformed report, ambiguous component inventory,
+package-byte drift, or unexpected install source fails the resource Apply and
+restores its snapshot. There is no separate package rehearsal or remote canary.
+
+The canonical Agent Plugins 1.0.0 schemas were rechecked on 2026-08-16 at
+[`agentplugins/agent-plugins-spec` HEAD `bd383552`](https://github.com/agentplugins/agent-plugins-spec/tree/bd383552095128f6effe895b9257cfd580a6d179).
+`plugin.json` has no auth declaration; it explicitly allows client-specific
+objects only under `extensions`. The closed Store `ai.clawdi` extension is
+therefore valid client policy, but runtime validation accepts only
+`schemaVersion`, `display`, and optional `compatibility`. It rechecks icon
+containment, selected-runtime inclusion, and declarations for bare stdio
+executables because installation rows do not persist those package fields.
+
+Agent Plugin `mcp.json` remote entries are anonymous package declarations.
+iforge does not infer OAuth, add an `auth` property, mutate package files,
+create an owner override, or connect to the declared endpoint while preparing
+the package. Public remote MCP therefore remains unchanged. Credential-bearing
+headers and environment values fail closed; API-key or custom-header auth is
+not portable in Agent Plugins 1.0.0 and belongs on the ordinary managed MCP
+path. MITM and egress profiles remain generic internal runtime mechanisms and
+are not Store, package, or public installation protocol fields.
+
+Protected remote authorization is an explicit owner/client action after
+installation. OpenClaw main was checked at
+[`ca849506`](https://github.com/openclaw/openclaw/commit/ca849506f38807d929cf85b6a196312ad6aa8414):
+its owner `mcp.servers` map overrides bundle servers by name, and an owner entry
+with `auth: "oauth"` uses the native MCP SDK flow, protected-resource metadata,
+PKCE verifier, token persistence, and refresh. The existing headless surface is
+`openclaw mcp login <name>`; it prints the authorization URL, accepts a
+loopback callback when available, and supports `--code` completion. iforge has
+no hosted product authorization UI for OpenClaw, so this remains an operator
+runtime-owner workflow rather than automatic or tenant-facing installation.
+
+Hermes main was checked at
+[`460d3456`](https://github.com/NousResearch/hermes-agent/commit/460d345642ee3d143a3e461abe39fd42b86a7e54):
+native `mcp_servers` entries win same-name conflicts with portable package
+servers. An owner entry with `auth: oauth` uses Hermes' native OAuth manager and
+token storage/refresh. The official authenticated Dashboard exposes
+`POST /api/mcp/servers/{name}/auth`, flow status/cancel, and callback endpoints,
+which is the hosted browser surface. Background discovery fails fast instead
+of starting an unusable interactive flow. These source commits document the
+support bound into the manifest-pinned runtime versions; the live Apply still
+validates the native installation result.
+
+| Agent Plugin surface | Hosted support |
+| --- | --- |
+| Remote query and public literal headers | Supported |
+| Public stdio env, including native `PLUGIN_ROOT`/`PLUGIN_DATA` expansion and literal `${OTHER}` | Supported |
+| Protected remote OAuth | Owner-managed same-name native override only; OpenClaw operator CLI or Hermes authenticated Dashboard |
+| API-key or credential-bearing custom headers | Not portable; use managed MCP |
+| Store `ai.clawdi` extension | Closed display and compatibility policy only; no auth or credential fields |
+| Portable SSE | OpenClaw requires native inspect validation; Hermes rejects |
+
+A private last-applied receipt binds each managed name to `installationId`,
+version, schema, immutable source tuple, content digest, and native id. The
+native id comes from the real install result; collisions are then checked
+across desired packages and against the pre-Apply install targets, so an
+OpenClaw slug collision cannot authorize `--force`. A same-name or
+same-native-id plugin without that receipt is unmanaged and is never replaced
+or removed. Repeat convergence is a no-op only after native JSON observation
+confirms the installed version and enabled state and the controlled install
+directory hashes to the receipt digest; Hermes hashing ignores only its
+top-level generated `.git` metadata. Removal disables and uninstalls only a
+receipt-owned plugin.
+
+Online preparation stores verified archives in private ownership-keyed cache
+entries. Failed preparation removes entries first created by that attempt.
+Recoverable projection failure retains the verified desired and rollback
+archives for retry; after native state and receipt converge, GC keeps only
+receipt-owned archives and ignores unknown or symlink entries. Offline
+convergence never fetches: it revalidates the retained archive and reports the
+resource unavailable when that cache is missing or corrupt.
+
+The bundled `iforge` Skill is platform infrastructure. Hosted constructs its
+private `skills.entries` runtime state internally, and capable CLIs reconcile
+enabled and disabled lifecycle state from that wire. The public deployment
+spec and update request deliberately have no `skills` field, and the dashboard
+does not render, edit, or delete the bundle. Existing runtime-observed summary
+fields remain compatibility/convergence evidence only; they are not user Skill
+inventory or mutation intent.
+
+Agent filesystem Skills have a separate one-way lifecycle. The guarded adapter
+target is authoritative and Cloud stores an `agent_sync` projection. A
+versioned local ledger records the exact Agent and Agent Project that
+successfully claimed each projection. Local absence may delete only that exact
+claim; remote listing failures never infer deletion. A Project reassignment
+first deletes the Agent-owned projection under the old Project fence and then
+projects current local state to the new Project. Legacy hash-only state may be
+an upload baseline but cannot authorize deletion. The current CLI uses only
+the dedicated Agent sync boundary. A 404 from that boundary is ambiguous
+between a backend without the route and an identity the caller cannot prove,
+so both cases fail closed: the durable operation and exact claim remain, and
+no generic Project mutation is attempted. Dashboard writes and orphan projects
+also fail closed. Compatibility writes still prove CLI Agent and Agent Project
+identity; slug-only delete additionally requires an environment-bound API key.
+
+The CLI declares `X-Clawdi-Skill-Sync-Protocol: agent-authoritative-v1` on
+Agent-Project listing, SSE, and writes. A missing header or explicit
+`agent-authoritative-v0` selects the supported legacy behavior, including
+Agent Project downloads; malformed and unknown values return 400. Explicit v1
+keeps the one-way boundary and rejects Agent Project downloads. A current CLI
+receives a dedicated 404 from an old backend and leaves its filesystem and
+durable projection state intact. Additive
+`agent_skill_changed`/`agent_skill_deleted` events protect only mutations
+created by current backend workers from released parsers on older connections;
+current daemons treat both event families only as local-rescan hints. Workspace
+and personal Project events keep their released Cloud-owned behavior.
+
+An enabled private bundled-Skill entry reserves its key ahead of managed target
+installation. Conforming CLI/daemon uploads fail closed at that reservation
+boundary. If reservation wins after a user-authored Skill was deleted or
+renamed, the durable exact claim still queues removal of the old Cloud
+projection while the managed target is never uploaded or removed by live sync.
+Failed managed installation rolls back the reservation transaction; private
+disable releases its ownership without importing or resurrecting a stale
+projection. No reservation or managed target is projected into user Skill
+inventory.
+
+Hosted Skill recovery, ownership validation, native delivery, target trees,
+Hermes `.hub` state, and the reservation ledger form one bounded resource
+transaction. Preparation failure skips that transaction. The first live
+failure stops later Skill commands and restores its exact preimage; a failed
+restore is promoted to a core Apply failure.
+
+MCP remains independent of Skills and has no user declaration or mutation
+contract in this release. The dashboard therefore exposes no MCP page. The safe
+inventory API treats a valid empty or platform-only runtime state as an
+available empty inventory; a missing projection is unavailable, and unknown
+server entries without explicit user provenance fail closed. The preinstalled
+`clawdi` aggregate is private infrastructure, and Composio is a dynamic tool
+source behind `POST /v1/mcp/clawdi`; neither appears
+as a separate MCP row. No URL, header, secret reference, command, argument, or
+environment value is projected to the browser.
+
+Manifest `generation` is the checkpoint/content identity and is part of the
+remote manifest ETag. The CLI applies any
+non-304 manifest without monotonic generation gating, while treating generation
+as the desired intent sequence and the ETag as effective content identity. A
+generation-only control-plane bump therefore produces a new ETag so `runtime
+watch` converges immediately.
+
+Core reconciliation validates and plans its projections before live mutation,
+completes required installers before Apply, and commits last-good, remote ETags, and
+root-owned `0600` `status/runtime-applied.json` only after managed files and
+systemd state apply successfully. A recoverable Apply failure restores the
+previous iforge-owned files and systemd declaration and leaves those authority
+records unchanged.
+
+Skill and Agent Plugin delivery are retryable resource projections outside that
+core commit gate. A resource-only failure leaves no partial resource state,
+does not roll back a successful CLI upgrade, and does not reject the manifest
+generation. `runtime watch` reports `healthImpact=resource_projection` and
+retries with bounded backoff while runtime readiness continues to use the
+committed core authority.
+OpenClaw external channel plugins follow the same rule per channel. A plugin
+that cannot be installed or verified is reported for that channel only; the
+other channels and the generation still commit. The channel stays projected,
+because OpenClaw validates a configured channel whose referenced plugin is
+missing as a warning, so a transient failure does not withdraw a working
+channel. Managed WhatsApp on OpenClaw is the exception: if its Baileys
+compatibility patch, or the WhatsApp plugin that locates it, cannot be verified,
+only the committed managed WhatsApp accounts and their auth state are withdrawn
+until a later convergence proves the patched socket. Hermes managed WhatsApp
+compatibility remains part of the core gate.
+The last-good manifest and scoped secret cache are each replaced atomically,
+then `runtime-applied.json` is replaced atomically as the final commit record.
+After a crash, strict-v2 offline load requires that final record to match the
+cached checkpoint generation, resolved Apply generation, instance, manifest,
+and canonical secret union exactly, so
+a partially advanced cache fails closed instead of becoming mixed authority.
+Last-good remains an offline recovery cache; `runtime-applied.json` is the
+online record of the applied instance, checkpoint generation, optional Apply
+generation, content identity,
+source manifest provider IDs, and the target-specific projected provider ID map
+needed for stale deletion. The record is committed only after Apply succeeds.
+
+Manifest validation is defensive. A Hosted manifest selects exactly one enabled
+`openclaw` or `hermes` compute runtime; top-level `runtime` must match the sole
+entry in `runtimes`. Codex remains a live-sync agent type and is not a selectable
+Hosted compute runtime. The selected runtime must provide exactly
+`install: {source: "official"}`. Hosted cannot select an installer channel, URL,
+or arguments; the CLI unconditionally owns the official URL and argument vector
+for the selected runtime. Cloud-owned `controlPlane` contains only
+`cloudApiUrl`; `appId`, `apiUrl`, and `manifestUrl` are not emitted. Generic
+desired-state manifests keep their existing optional installer, channel, and
+argument behavior. Unknown generic runtime names require `run.command`;
+otherwise the manifest is rejected so the image does not need to know every
+future agent.
+
+## Managed CLI privilege boundary
+
+The active managed CLI lives at
+`/var/lib/iforge/maintained/clawdi/bin/clawdi`. Its version-specific package
+prefixes live under `/var/lib/iforge/maintained/clawdi/npm`; the npm download
+cache is disposable data under `/var/cache/iforge/npm`. The custom prefix is
+load-bearing: each exact version is installed separately, verified, and then
+activated by an atomic symlink switch, while the durable transaction journal
+can restore the prior target. An in-place npm global install would remove that
+activation and rollback boundary.
+
+Root system services use the absolute managed CLI path for watch, daemon, and
+sidecar commands. OpenClaw and Hermes user services execute their official
+binaries and do not add any platform install directory to `PATH`. Tenant tools
+use their normal home locations and inherited npm/XDG location overrides are
+cleared before official installers run. When a root process runs a command as
+the tenant user, it strips platform credentials (cloud auth token, daemon RPC
+token, egress secret file) from that command's environment and removes the
+tenant-writable `~/.local/bin` and `~/.openclaw/bin` directories from its
+`PATH`, so a tenant-planted binary cannot shadow a system command or capture a
+platform secret. Unlike the root-owned, exactly managed
+iforge CLI above, Hosted Codex is user-version-owned: iforge bootstraps Codex
+into the standard tenant-owned `~/.local` npm prefix only when its package
+metadata or executable is missing or damaged. A healthy installed Codex version
+is owned by the user and is never rolled back by iforge. During migration,
+iforge removes only its byte-for-byte legacy `~/.local/bin/codex` shim before
+npm installs the package-owned executable; an unrecognized file at that path is
+never overwritten. The hosted execution environment provides the public egress
+placeholder, standard per-tool CA trust variables, and user npm prefix without
+exposing the real provider credential; the shared npm prefix remains outside
+iforge snapshot, ownership, and rollback targets.
+
+The hosted image's bootstrap package may expose
+`/usr/local/bin/clawdi -> ../lib/node_modules/clawdi/bin/clawdi.mjs` while root
+convergence starts. Reconciliation removes only that exact system-npm symlink
+and rejects any unexpected entry or target at the same path. All continuing
+platform invocations use `/var/lib/iforge/maintained/clawdi/bin/clawdi`
+directly, so a tenant shell cannot discover `clawdi` through `PATH`.
+
+CLI self-upgrade verifies a new exact package before atomically switching the
+active link inside the root-only managed directory. There is no shared
+`/var/lib/iforge/bin` compatibility path and no migration or dual-path read.
+
+An apply-stage exception, including a failed systemd preflight, rolls back a
+pending CLI upgrade through the existing verified previous-target mechanism.
+The original error and any rollback diagnostics remain visible. Successful
+rollback signals `selfReexec`: `runtime init` preserves error status and exits
+75 with `handoff=cli_reexec`, while a running `runtime watch` exits its current
+loop so supervision restarts the managed target. A one-shot watch still exits
+nonzero for the failed apply. With no pending upgrade, the ordinary error/retry
+path is unchanged. A pending systemd Job or uncertain command outcome remains
+deferred and never authorizes CLI rollback; manifest fetch/auth failures retain
+their existing loader recovery policy.
+
+The `clawdi.cliNpmBootstrapStatus.v1` reader supports the exact initial
+bootstrap field set written by released images (without `verification`,
+`previous`, or `bad`) as well as the complete CLI-authored receipt. It never
+fills in a partial verification record. Adoption validates receipt/path
+identity and service ownership, runs the existing exact-version and isolated
+`runtime verify --json` probes, then writes the full v1 receipt without an
+invalid-status warning. Invalid or unreadable receipts stop mutation instead
+of being treated as missing. A stale device/inode/size/mtime invalidates the
+verification cache and revalidates the existing target; a failed probe does
+not permit reinstalling over it. The CLI retains its verified rollback path.
+
+Released image verifiers may reject stale metadata before this CLI runs, so
+that bootstrap reuse fix also requires a compatible image. Ship this additive
+reader before qualifying the new image/CLI pair. No new receipt version or
+runtime verification command is required.
+
+Done: `bash scripts/test.sh cli tests/runtime.test.ts src/runtime/observed-v2.test.ts`
+passes bootstrap adoption without warnings, stale-metadata revalidation,
+invalid-state preservation, and the existing activation/rollback contracts.
+
+The image bootstrap and CLI self-upgrade are independent atomic activation
+owners. If the image bootstrap replaces the active CLI while an older activated
+self-upgrade transaction remains, the transaction controller compares the full
+old transaction as its fence, verifies that bootstrap status exactly matches
+the active managed link, and atomically replaces the journal with an activated,
+non-rollbackable transaction owned by that verified identity. Replay is
+idempotent, and ordinary post-convergence completion retires the handoff
+journal. `badVersions` is preserved. Missing, stale, tampered, or mismatched
+bootstrap identity continues through verified rollback and otherwise fails
+closed; version ordering is not an ownership signal.
+
+The exact package selection and handoff are also the compatibility boundary.
+The manifest carries no independent minimum CLI version: an old process either
+installs and hands off to the selected package or fails before applying the new
+desired state.
+
+When only the exact CLI package changes and the capability image remains
+compatible, the runtime context and workload stay unchanged. The fetched
+manifest is the desired CLI authority. The running watcher installs and verifies
+that exact package, atomically activates it, and exits before manifest or systemd
+convergence. The `Restart=always` systemd unit then starts the watcher from the
+absolute managed CLI path. The new CLI completes convergence without restarting
+the daemon, sidecar, or runtime gateway; their independent program and secret
+revisions remain unchanged. The old applied authority remains current until the
+new watcher commits the manifest. A failed first convergence rolls back to the
+previously verified CLI. This is a watcher process handoff inside the existing
+workload: systemd launches the watcher's new `ExecStart` after its clean exit,
+without an explicit `systemctl restart`, an unrelated service restart, or a
+workload replacement.
+
+## Commands
+
+Root runtime operators can use these commands in controlled environments:
+
+```bash
+iforge runtime init --non-interactive --json
+iforge runtime watch --once --json
+iforge runtime verify --json
+iforge runtime sidecar
+iforge runtime status --json
+iforge runtime doctor --json
+iforge run -- <command>
+```
+
+Normal local onboarding still uses `iforge setup`. Runtime commands are for
+managed Hosted environments where configuration is supplied by policy and
+controller desired state, not by an interactive user setup flow or user file.
+
+`runtime watch` is the long-running reconciliation loop. It refreshes remote
+manifest state using ETags, applies changes, records status, and falls back to
+last-good cached manifests only when recovery policy allows it. `runtime
+sidecar` runs outbound egress handling when explicit egress profiles are
+enabled.
+
+## Runtime UI Authentication
+
+Strict-v2 OpenClaw does not render a gateway `ExecStart`. The manifest's
+canonical `["gateway", "run"]` argv identifies the official gateway service;
+the official installer resolves the configured port and writes its own Node
+entrypoint argv. Before that installer runs, iforge uses the official
+`openclaw config patch --stdin` flow to persist the managed token at
+`gateway.auth.token`, and passes
+that same value to the installer through its `OPENCLAW_GATEWAY_TOKEN`
+environment. The token never appears in installer argv. OpenClaw's installer
+resolves configured tokens before its environment fallback and only persists a
+token itself when it generated the token, so the preceding official config
+patch is required for caller-selected tokens:
+[`gateway-install-token.ts` lines 169-205](https://github.com/openclaw/openclaw/blob/2d2ddc43d0dcf71f31283d780f9fe9ff4cc04fe4/src/commands/gateway-install-token.ts#L169-L205),
+[`auth-token-resolution.ts` lines 38-60](https://github.com/openclaw/openclaw/blob/2d2ddc43d0dcf71f31283d780f9fe9ff4cc04fe4/src/gateway/auth-token-resolution.ts#L38-L60),
+and the official [`config patch --stdin` contract](https://github.com/openclaw/openclaw/blob/2d2ddc43d0dcf71f31283d780f9fe9ff4cc04fe4/docs/cli/config.md#L249-L263).
+
+The local config patch also sets official shared-token auth, disables insecure
+and Host-header fallback modes, derives `gateway.controlUi.basePath` from the
+clean public URL, and includes that URL's origin in `allowedOrigins`. iforge
+probes the installed official `device-bootstrap` export before applying the
+patch. Legacy OpenClaw receives `dangerouslyDisableDeviceAuth: true` so its
+shared-token launch does not require device pairing. A version that supports
+the owner browser-bootstrap profile receives a JSON merge-patch `null` for that
+legacy field and keeps device authentication enabled for the official
+single-use bootstrap flow. A failed capability probe aborts convergence.
+The managed backend value, transient installer environment, and
+`openclaw.json` token must remain identical. The gateway unit does not receive
+an `OPENCLAW_GATEWAY_TOKEN` environment entry because runtime auth resolves the
+persisted config first, making `openclaw.json` the gateway's only at-rest token
+store. A config-patch failure aborts convergence before service installation or
+systemd activation. A changed token updates the official config and restarts the
+gateway; an unchanged token does not rewrite the config or restart the gateway.
+
+Direct OpenClaw exposure remains fail closed behind the typed
+`openclaw-native-auth-v1` capability and an available
+managed gateway token. Hosted returns a clean endpoint plus an explicit token
+and `handoff_url` through an owner-checked, no-store credential endpoint. The
+backend first executes the fixed official `openclaw dashboard --json` command
+in the currently receipted runtime instance. When supported, it returns the
+single-use, ten-minute `browserUrl` after binding it to the deployment's clean
+HTTPS endpoint. The browser consumes the official `bootstrapToken` and
+`bootstrapProfile=owner` fragment, creates its signed device identity, and
+receives the durable owner credential without a manual pairing step. OpenClaw
+removes the handoff fragment before authentication, so the visible address
+remains the clean endpoint. If the installed binary explicitly lacks
+`dashboard --json`, or returns the validated legacy JSON shape, Hosted preserves
+the exact `#token=` launch while the CLI's legacy patch disables device
+authentication. Other command, JSON, and handoff errors fail closed with no
+bare-URL fallback. iforge implements no parallel device-auth or device-approval
+protocol.
+
+OpenClaw persists the issued device credential in its own browser origin.
+Entering a ready OpenClaw agent mounts its official Control UI in the persistent
+agent layout and starts the native handoff in the background. Other sections
+hide the surface and make it inert; opening Console reveals the same iframe,
+document, and connection without changing its launch URL or requesting access
+again. Initial deployment readiness uses the same automatic path.
+Before credentials are established, a new resource version permits one background
+attempt after any pending request settles; unchanged versions do not retry
+automatically. An established iframe survives resource-version-only changes.
+Leaving the agent, losing/changing the auth identity, losing readiness, or
+changing the generation or endpoint retires the iframe. A versioned, non-secret
+native-handoff-loaded marker is scoped to the iforge auth session, deployment,
+generation, and endpoint. Later visits and browser reloads use the clean endpoint
+and let OpenClaw reuse its own persisted device credential, without requesting
+or replaying a bootstrap token. This requires a new native connection after
+the old iframe is retired; it is distinct from retaining the already-authenticated
+connection across sections. The marker does not acknowledge authentication.
+When Hosted advertises an applied `browser_session_url`, iforge first establishes
+its independent runtime-origin owner grant and verifies cookie delivery with a
+HEAD request. The first launch still uses the official handoff fragment. On a
+later clean-URL visit, a supporting official UI can recover a missing device
+credential through its same-origin browser-bootstrap endpoint. The official UI
+performs the real owner handshake in that same document; the parent does not
+create a parallel device or infer authentication from load. Endpoints without
+the advertised route retain the existing handoff and Reconnect behavior.
+The tested official UI does not automatically recover an expired/consumed
+initial bootstrap or a revoked device token in the current document; those
+errors still require Reconnect.
+Storage failure falls back to requesting a handoff; Reconnect clears the hint.
+New-window access stays disabled until the current iframe loads; it then opens
+the clean endpoint for native access or the exact reusable legacy `#token=` URL.
+It never requests another handoff. `Reconnect` intentionally replaces the iframe
+with one fresh handoff. The load event is only a document boundary, not evidence
+of authentication success; OpenClaw owns authentication and its rendered errors.
+Hermes remains on demand, including its dashboard credentials.
+
+Verify native browser authentication in isolated Docker:
+
+```bash
+scripts/test-openclaw-native.sh
+```
+
+Done: the actual iforge page and official `openclaw@2026.9.4`
+(`3a9d69db306cd7f081e06254cb89c4bcc14a7107`) report a hidden-frame
+`hello-ok` with owner scopes before Console opens, retain that connection across
+sections, reuse the native device credential across agent visits and browser
+reload, and issue a fresh bootstrap only for Reconnect. The fixture stubs Hosted
+inventory/credential transport and uses a local TLS ingress that permits iframe
+embedding; it does not replace official UI code or native WebSocket auth.
+This verifies application behavior, not a deployed ingress configuration or
+authentication readiness from an iframe load event.
+
+For the paired protected issuer and same-site browser cookie path, point the
+same harness at the matching Hosted source checkout:
+
+```bash
+IFORGE_OPENCLAW_HOSTED_SOURCE=/path/to/hosted-source scripts/test-openclaw-native.sh
+```
+
+Done: real Traefik, the Hosted grant handler, Chromium, and official OpenClaw
+recover a missing native credential before Console reveal, retain the recovered
+connection across the reveal, and reuse the device credential on reload. Clerk
+identity and persistence seams are synthetic; no live tenant is involved.
+
+Hermes direct exposure uses the official self-hosted OIDC provider at the fixed
+`0.0.0.0:9119` dashboard endpoint. The manifest carries the exact deployment
+binding, access revision, issuer, public URL, and trusted proxy contract. The
+CLI reconciler removes any legacy `dashboard.basic_auth` configuration,
+disables `dashboard_auth/basic` and `dashboard_auth/nous`, and enables only
+`dashboard_auth/self_hosted`. No Hermes password or dashboard session secret is
+created or injected.
+
+The dashboard consumes generated discriminated deployment metadata. Hermes
+browser sessions are owner checked by Cloud and then use the Clerk OIDC
+authorization-code flow with PKCE; the runtime UI credential endpoint never
+returns a Hermes password. Both runtimes declare
+`browser_mode: embedded_and_top_level` and remain embedded in the Console.
+Public endpoint URLs contain no secret.
+
+Both runtimes use the same Runtime UI Access dialog and declarative reset. Reset
+rotates the existing encrypted gateway credential and advances the durable
+access revision through the ordinary generation, manifest, reconcile, and LRO
+completion path; restart and ordinary updates do not rotate it.
+
+The Hermes contract was verified against Hermes Agent 0.20.4 commit
+[`a72c9ca248a051b8c7e8a69ff422c7be5066cdc4`](https://github.com/NousResearch/hermes-agent/tree/a72c9ca248a051b8c7e8a69ff422c7be5066cdc4),
+specifically `hermes_cli/subcommands/dashboard.py`,
+`plugins/dashboard_auth/self_hosted/__init__.py`,
+`hermes_cli/dashboard_auth/prefix.py`, `hermes_cli/web_server.py`, and
+`hermes_cli/gateway.py`.
+
+### Official OpenClaw evidence
+
+Gateway/source research was refreshed on 2026-08-20. The official `main`
+commit at that time was
+[`916eef4e996008d387207c53044afd8cf02dcc30`](https://github.com/openclaw/openclaw/commit/916eef4e996008d387207c53044afd8cf02dcc30).
+The stable release tag
+[`v2026.7.1`](https://github.com/openclaw/openclaw/releases/tag/v2026.7.1),
+resolves to release commit
+[`2d2ddc43d0dcf71f31283d780f9fe9ff4cc04fe4`](https://github.com/openclaw/openclaw/commit/2d2ddc43d0dcf71f31283d780f9fe9ff4cc04fe4).
+Official installer behavior was revalidated on 2026-08-20. Hosted v2 passes no
+`--version`; the installer defaults `OPENCLAW_VERSION` to npm's `latest`
+dist-tag. At verification time `latest` resolved to stable
+`openclaw@2026.7.1-2`, while beta remained a separate dist-tag. That resolved
+package is observed runtime state, not desired state owned by an iforge release.
+
+The `2026.7.1-2` service-integration audit is anchored
+to source commit `0790d9f`; it verifies the gateway transaction used by iforge,
+not the current Hosted package identity:
+
+| Stage | Official line evidence | Diagnostic consequence |
+| --- | --- | --- |
+| Gateway install preparation | [`install.ts` lines 141-298](https://github.com/openclaw/openclaw/blob/0790d9f593ad30c940ed93b5872a8cf6d6f3cf8c/src/cli/daemon-cli/install.ts#L141-L298) | Config initialization, service inspection, token resolution, and plan construction all precede the platform service install. |
+| JSON failure response | [`response.ts` lines 49-50](https://github.com/openclaw/openclaw/blob/0790d9f593ad30c940ed93b5872a8cf6d6f3cf8c/src/cli/daemon-cli/response.ts#L49-L50) and [109-177](https://github.com/openclaw/openclaw/blob/0790d9f593ad30c940ed93b5872a8cf6d6f3cf8c/src/cli/daemon-cli/response.ts#L109-L177) | `--json` emits the structured failure through the JSON writer and exits with code 1. iforge must inspect stdout as well as stderr. |
+| Systemd staging | [`systemd.ts` lines 831-950](https://github.com/openclaw/openclaw/blob/0790d9f593ad30c940ed93b5872a8cf6d6f3cf8c/src/daemon/systemd.ts#L831-L950) | User-manager validation and environment/unit writes happen before activation. |
+| Systemd activation | [`systemd.ts` lines 1101-1147](https://github.com/openclaw/openclaw/blob/0790d9f593ad30c940ed93b5872a8cf6d6f3cf8c/src/daemon/systemd.ts#L1101-L1147) | `daemon-reload`, enable, and restart are separate failure points after staging. |
+
+Consequently, the absence of gateway process journal entries does not identify
+which installer stage failed. The isolated regression test runs that audited
+package's real `gateway install --force --json` path under a live systemd user
+manager as the hosted `iforge` tenant (UID/GID 10001, `/home/iforge`), forces an
+immutable pre-activation `EISDIR` failure,
+and proves exit/stdout propagation plus exact transaction rollback without
+inventing a success path:
+
+```bash
+scripts/test-runtime-official-installer-systemd.sh
+```
+
+Done: the command exits 0 and reports `11 pass`.
+
+The Runtime UI behavior evidence below was refreshed against the same-version
+official source commit
+[`8f382a202ff1e15833394b481615dcdda99b04d7`](https://github.com/openclaw/openclaw/commit/8f382a202ff1e15833394b481615dcdda99b04d7).
+
+| Requirement | Official line evidence | Contract consequence |
+| --- | --- | --- |
+| Gateway bind, port, auth, and token | [`docs/cli/gateway.md`](https://github.com/openclaw/openclaw/blob/8f382a202ff1e15833394b481615dcdda99b04d7/docs/cli/gateway.md), [`configuration-reference.md`](https://github.com/openclaw/openclaw/blob/8f382a202ff1e15833394b481615dcdda99b04d7/docs/gateway/configuration-reference.md) | Use native `18789`, container-reachable `lan`, required token auth, and explicit public `allowedOrigins`. |
+| Browser handoff command | [`docs/cli/dashboard.md`](https://github.com/openclaw/openclaw/blob/8f382a202ff1e15833394b481615dcdda99b04d7/docs/cli/dashboard.md), [`src/commands/dashboard.ts`](https://github.com/openclaw/openclaw/blob/8f382a202ff1e15833394b481615dcdda99b04d7/src/commands/dashboard.ts) | `dashboard --json` is the official machine-readable integration surface. Against a running gateway it returns `browserUrl` plus its expiry without opening a browser. |
+| Owner bootstrap contract | [`control-ui-handoff.ts`](https://github.com/openclaw/openclaw/blob/8f382a202ff1e15833394b481615dcdda99b04d7/src/commands/control-ui-handoff.ts), [`control-ui-contract.ts`](https://github.com/openclaw/openclaw/blob/8f382a202ff1e15833394b481615dcdda99b04d7/src/gateway/control-ui-contract.ts), [`device-bootstrap-profile.ts`](https://github.com/openclaw/openclaw/blob/8f382a202ff1e15833394b481615dcdda99b04d7/src/shared/device-bootstrap-profile.ts) | The fragment contains a single-use `bootstrapToken` and the closed `bootstrapProfile=owner` hint; the host-issued profile grants the browser owner credential through OpenClaw's native device flow. |
+| Gateway health surfaces | [`server-http-probes.ts`](https://github.com/openclaw/openclaw/blob/8f382a202ff1e15833394b481615dcdda99b04d7/src/gateway/server-http-probes.ts), [`server-control-ui-root.ts`](https://github.com/openclaw/openclaw/blob/8f382a202ff1e15833394b481615dcdda99b04d7/src/gateway/server-control-ui-root.ts), startup admission in [`2026.7.1-2`](https://github.com/openclaw/openclaw/blob/0790d9f593ad30c940ed93b5872a8cf6d6f3cf8c/src/gateway/server/ws-connection/message-handler.ts#L797) and [`2026.9.3`](https://github.com/openclaw/openclaw/blob/1391f7cd2d40ab5bbcf2f5f831d3a64f520e72d7/src/gateway/server/ws-connection/connect-admission.ts#L229), [`native status probe`](https://github.com/openclaw/openclaw/blob/0790d9f593ad30c940ed93b5872a8cf6d6f3cf8c/src/cli/daemon-cli/probe.ts#L83) | CLI apply completion proves required systemd units are active/enabled. The [observer](../packages/cli/src/runtime/observed.ts) checks serving readiness asynchronously, using the applied receipt to retain required services even when their unit files are missing. It requires HTTP 200 for the active OpenClaw gateway's native-configured Control UI root, plus either HTTP 200 with `ready: true` from loopback `/readyz`, or a successful local native handshake when aggregate readiness returns HTTP 503 with a valid `ready: false` and nonempty string `failing` list. The fallback runs `openclaw gateway status --json --timeout 3000` and requires `rpc.ok: true` with `rpc.url` matching that loopback gateway; operator scopes are not required. Native startup admission rejects ordinary clients before startup completes, and `gateway-draining` always vetoes readiness. Downstream channel failures alone therefore do not revoke a serving gateway and UI. Malformed responses, failed handshakes, or unavailable UI leave readiness unknown. The active Hermes dashboard must serve `/api/status` with `gateway_running: true`, `gateway_state: running`, and `auth_required` with provider `basic`. Readiness uses all observed units before diagnostic truncation and does not depend on the optional manifest cache. OpenClaw includes are resolved by its native `config get gateway --json` command. |
+| Base path/prefix | [`docs/web/control-ui.md`](https://github.com/openclaw/openclaw/blob/8f382a202ff1e15833394b481615dcdda99b04d7/docs/web/control-ui.md) | Configure official `gateway.controlUi.basePath`; rebind only the verified origin while preserving the official path and fragment. |
+| Service lifecycle | [`docs/cli/daemon.md`](https://github.com/openclaw/openclaw/blob/8f382a202ff1e15833394b481615dcdda99b04d7/docs/cli/daemon.md) | Use official gateway install/start/stop/restart/status lifecycle and keep iforge ownership limited to its hosted drop-in/env. |
+
+## Desired State Boundary
+
+The CLI consumes a desired-state document plus optional secret values. The
+desired state should contain only non-secret configuration such as enabled
+runtimes, command launch settings, channel projections, and provider routing
+metadata. Secret values are delivered separately and must not be embedded in
+the manifest or general runtime config. When offline recovery is explicitly
+enabled, the CLI retains a root-owned, reference-scoped `0600` cache containing
+only the active `secret://` values required to reproduce the applied state. It
+never persists the complete transport bundle or inactive secret values as one
+document. Secret references are exact canonical `secret://` values; aliases and
+other reference schemes are rejected at the datasource boundary before
+manifest validation or projection.
+
+At the boundary:
+
+- the control plane owns desired config generation, deterministic source
+  rendering, and secret resolution;
+- the CLI owns local validation, projection, diagnostics, and command launch;
+- the runtime process owns normal agent behavior after launch.
+
+For Agent v2, `generation` remains the Hosted checkpoint/content intent and CAS
+sequence. Optional bundle-root `applyGeneration` is the deployment Apply
+identity. The only compatibility resolution is `applyGeneration` when explicit,
+otherwise legacy `generation`; cache, applied-state, offline, observation, and
+health paths all use that named boundary rule rather than inferring one identity
+from the other.
+The canonical `/v1/agents/{agent_id}/runtime-observed` response intentionally
+keeps `desired.desired_config_generation` as the checkpoint and
+`observed.observed_config_generation` as the Apply identity; only its health
+comparison resolves the explicit Apply generation or named legacy fallback.
+The deprecated `/v1/environments/{environment_id}/runtime-observed` v1 route
+retains its byte-frozen checkpoint comparison and is not changed by this
+amendment.
+`sourceRevision` is a deterministic SHA-256 identity of the effective public
+descriptor and the selected encrypted secret-source identities, keyed by
+secret reference. For the immutable v2 renderer, the strong ETag is derived as
+`"sha256:<sourceRevision>"`. The endpoint and summary paths use the same batch
+loader and pure materializer inside a read-only repeatable-read snapshot; the
+summary path does not decrypt secrets.
+
+The inner manifest wire field remains `generation`, but it is specifically the
+desired checkpoint/content generation. Cloud API records daemon convergence separately as
+`observed_at`, `observed_config_generation`, and `observed_manifest_etag`, plus
+validated diagnostics JSONB. Agent v2 diagnostics report applied ETag,
+`sourceRevision`, and the source-level applied provider ID set only from
+`runtime-applied.json`; its observation tuple reports resolved Apply generation,
+not checkpoint generation. Target-specific projected IDs remain local stale-deletion
+state. Health compares observed config generation to explicit Apply generation,
+with the same named checkpoint fallback for legacy state, and compares the v2 ETag with the validator derived from current
+`sourceRevision` and requires exact provider-set equality, reporting missing and
+extra sets separately. Legacy provider-set authority remains unknown.
+`observed_at` is the server receipt time for the accepted heartbeat; the
+client-reported timestamp remains diagnostics only. The ETag cannot be inferred
+from the generation, and the generation cannot be inferred from the ETag. These
+CONFIG convergence fields are separate from hosted provider COMPUTE convergence
+fields such as desired or observed replica generation.
+
+Strict-v2 workloads provide their bootstrap and apply authority through the
+single fixed file `/etc/iforge/runtime-context.json`. The file
+is a strict `clawdi.runtimeContext.v3` object containing an `apply` tuple
+(`generation`, `manifestETag`, `applyReceiptId`, and `bootNonce`), an exact
+`backend: "incus"` attestation, and a typed HTTP
+`manifestSource` with bearer auth. `backend` is required for every Hosted v2
+context and is validated by the common precondition gate before convergence.
+Business secrets are not bootstrap context: the fetched bundle's `secretValues`
+map is the sole authority for exact manifest `secret://` references. API URLs
+that are already in the manifest, auth selectors, paths, mode, runtime user, and
+process environment are not duplicated in the context. A missing or malformed
+context
+fails closed, and no field falls back to ambient process environment. The
+applied generation must match the fetched manifest before CLI installation,
+systemd mutation, or applied-authority commit can occur. The CLI package is
+selected only by manifest `clawdiCli.packageSpec`. RuntimeContext v2 remains a
+read-only compatibility input; its legacy `cliPackageSpec` is ignored and new
+contexts never write it. The paired-image local tarball exception exists only
+in manifest fixtures when the explicit test-installer gate is enabled.
+`manifestETag` names the
+Hosted control-plane snapshot and is persisted separately from the fetched
+bundle's HTTP ETag, which remains the strong validator derived from
+`sourceRevision`; the two values are intentionally independent. This lets one
+atomic context-file replacement advance bootstrap and apply identity;
+bundle ETag/generation changes carry desired config and business-secret
+rotation. `bootNonce` remains a workload-boot identity rather than a
+config-generation identity.
+
+Manifest fields such as provider `runtimeEnvName` only name the environment
+variable delivered to the target process. They never identify, transport, or
+resolve secret material; the corresponding exact `secret://` reference does.
+
+The runtime context is a substrate-neutral filesystem ABI. Every substrate
+atomically delivers the root-owned `0400` `/etc/iforge/runtime-context.json`.
+The CLI always reads the same fixed path on every convergence and does not
+branch on substrate. The retired wrapper-directory shape accommodated historical
+Kubernetes projected-Secret delivery and directory bind mounts; a single-file
+bind mount would have pinned the old inode across replacement. The current Incus
+substrate pushes the file through the Incus file API, so neither constraint
+applies: the delivery contract atomically replaces that one file. This contract
+does not itself implement Docker/Compose or VPS provisioner products. The
+`runtime init`, `runtime watch`, and `runtime sidecar` commands reject non-Hosted
+execution, and manifest convergence or bundle-channel projection invoked as a
+library requires an explicit apply context. Process environment is not an Apply
+identity or secret authority.
+
+The CLI separates root-owned configuration, durable state, disposable cache,
+and ephemeral runtime handoffs. Important outputs include:
+
+| Output | Purpose |
+| --- | --- |
+| `/etc/iforge/iforge.json` | Redacted managed runtime config |
+| `/run/iforge/files/` | Root-only `0700` per-boot Files config source directory |
+| `/run/iforge/files/filebrowser.yaml` | `root:<runtime group>` `0440` Files config published only through the unit-private bind mount |
+| `/etc/iforge/projections/*` and `/etc/iforge/run/*` | Managed projections and `iforge run` launch config |
+| `/var/lib/iforge/sync/runtimes.json` | Runtime sync state |
+| `/var/lib/iforge/status/*` | Boot, apply, upgrade, provider, egress, watch, and receipt status/result files |
+| `/var/lib/iforge/install-inventory/<runtime>.json` | Install/verify observation |
+| `/var/lib/iforge/managed-resources/*.json` | Durable managed Skill and MCP ownership ledgers |
+| `/var/lib/iforge/maintained/filebrowser/candidates/<sha256>/filebrowser` | Root-owned, verified Files executable |
+| `/var/lib/iforge/maintained/clawdi/` | Root-only managed CLI activation and versioned package prefixes |
+| `/var/lib/iforge-user/` | Tenant-owned `0750` hosted CLI state selected by `CLAWDI_HOME` |
+| `/var/lib/iforge-files/` | Tenant-owned `0700` Files DB and component cache state |
+| `/var/lib/iforge/committed-runtime/<content-sha256>.json` | Atomic manifest + secret snapshot selected by runtime-applied |
+| `/var/lib/iforge/committed-runtime/manifest.last-good.json` | Manifest compatibility mirror |
+| `/var/lib/iforge/committed-runtime/runtime-secrets.last-good.json` | Root-only secret compatibility mirror |
+| `/var/cache/iforge/npm/` | Managed CLI npm download cache |
+| `/run/iforge/secrets/*` | Short-lived root/egress service secret files |
+| `/run/iforge/systemd/env/*.service.env` | Root-owned system-service env files or tenant-owned `0600` user-service env handoffs |
+| `/run/iforge/egress/systemd/ca.pem` | Deliberately published root:tenant-group `0640` transparent-egress CA bundle |
+| `$IFORGE_RUN_DIR/systemd/system/*.service` or `/run/systemd/system/*.service` | Generated system units for root-owned iforge support programs |
+| `$HOME/.config/systemd/user/*.service` | Tenant-owned official runtime gateway base units and direct runtime-user programs |
+| `$HOME/.config/systemd/user/*.service.d/10-iforge-hosted.conf` | Tenant-owned hosted drop-ins for official runtime units; foreign drop-ins are preserved |
+
+The Hosted committed snapshot directory is root-owned `0700`; its files are
+`0600`. Download, npm, and archive caches remain disposable. Local mode keeps
+its existing cache paths and pair format. Strict `runtimeAppliedState.v2` is
+unchanged. Its content SHA selects one atomic file containing the exact source
+bundle and recoverable secrets. The previous committed content is retained
+while the next content and compatibility mirrors are written and synced;
+only the subsequent applied-record commit promotes the next content. Successful
+commits remove obsolete content files. An interrupted write cannot promote a
+mixed pair or uncommitted snapshot.
+
+Pure readers try the SHA-selected snapshot, then the durable compatibility
+pair, checking the same applied content hash, generation, apply generation and
+instance. Hosted mode has no reader for a pair under `/var/cache/iforge`, where
+upstream CLIs through 0.14.82 kept it: no iforge host ever ran one of them. Only
+a private, platform-owned exact pair can be recovered into a missing snapshot.
+Convergence migrates it under its existing lock, including conditional watch
+304 responses; migration write failures are errors. Without exact history,
+watch fetches the full desired bundle to resolve cache policy and converge;
+it never claims to have migrated missing history.
+
+`iforge runtime verify --json` reports the selected snapshot in `manifestCache.path`
+and marks its `storage` as `durable` or `local` (`null` without a verified
+candidate). Verification is read-only. Every Hosted candidate must satisfy the
+same private ownership, mode, and non-symlink checks as well as the content SHA.
+Public boot/watch status retains the non-secret logical path; use verification
+to inspect the selected physical snapshot path.
+
+Deploy the new reader and verify its durable snapshot **before** discarding a
+rootfs/cache. A recorded next-start CLI target alone does not migrate files.
+Missing old bytes (including already-stopped instances) cannot be recovered
+from native configuration or reconstructed from the current desired manifest.
+A successful new commit does not update the old disposable paths: an older CLI
+cannot read the durable location after cache loss, and may use surviving legacy
+files only when they still match its applied record. Keep the new reader for
+replacement/recovery; do not downgrade and assume channel ownership survived.
+
+`recovery.cacheManifest: false` commits the new authority before removing all
+snapshots and both pair locations. Deletion failure is reported and retried by
+subsequent convergence; retained old bytes no longer match the applied hash.
+`allowOfflineBoot` and exact current boot/apply identity still gate
+offline startup. Internal committed replay can recover previous channel
+ownership across generations without granting offline startup permission.
+
+Done: `bash scripts/test.sh cli src/runtime/committed-runtime-snapshot.test.ts
+src/runtime/manifest-reconciliation.test.ts` passes, including cache-loss
+withdrawal and native pairing/override preservation.
+
+Hosted convergence never writes `~/.iforge`. Before launch it removes
+`~/.iforge/environments/*.json` files only when their `managedBy` value is
+exactly `iforge runtime init`, then removes the directories only if empty.
+Unmarked files, non-regular files, and symlinks are never adopted or removed.
+
+Directory trust checks remain mandatory: every root-managed directory must be
+a real, root-owned directory without group/world write permission before Apply
+begins.
+
+Generic MCP reconciliation compares desired servers, the previous managed
+server-name ownership ledger, and the current native map. The ledger never
+stores desired or native config values. A retained v1 ledger is migrated by
+strictly validating its schema, runtime keys, server-map boundaries, and server
+names, then discarding every legacy config value; all desired native config is
+derived from the current manifest. OpenClaw current state is the
+canonical `mcp.servers` object in `~/.openclaw/openclaw.json`; Hermes uses
+`mcp_servers` in `~/.hermes/config.yaml`. A desired name that already exists
+without ledger ownership fails closed. Native absence already satisfies a
+managed deletion. The convergence transaction snapshots both complete native
+configs and the ledger, preserves unrelated entries, writes the ledger last,
+and restores the exact previous files and metadata if any later mutation fails.
+Hermes' `mcp add` and `mcp remove` flows are interactive and perform live
+discovery, while `mcp list` has no machine-readable output and does not expose
+the complete native map. Hosted therefore resolves the official config path
+with `hermes config path` and atomically reconciles only `mcp_servers`; it does
+not scrape CLI output or inject answers into interactive prompts.
+These paths and transports are pinned to official fixed-commit sources:
+OpenClaw's
+[`mcp-config.ts` read path](https://github.com/openclaw/openclaw/blob/2d2ddc43d0dcf71f31283d780f9fe9ff4cc04fe4/src/config/mcp-config.ts#L51-L65),
+its
+[`setConfiguredMcpServer` write path](https://github.com/openclaw/openclaw/blob/2d2ddc43d0dcf71f31283d780f9fe9ff4cc04fe4/src/config/mcp-config.ts#L162-L184),
+and
+[`docs/cli/mcp.md` lines 661-767](https://github.com/openclaw/openclaw/blob/2d2ddc43d0dcf71f31283d780f9fe9ff4cc04fe4/docs/cli/mcp.md#L661-L767),
+plus Hermes'
+[`tools/mcp_tool.py` lines 1-64](https://github.com/NousResearch/hermes-agent/blob/8208fc52701332f213e6c51ebc0b610be00300de/tools/mcp_tool.py#L1-L64),
+which defines `mcp_servers` URL, header, transport, and SSE handling.
+
+Short-lived consumer projections belong under the runtime run directory, not
+in durable config. The runtime-user aggregate continues to exclude refs used
+only by the egress sidecar; the egress identity receives those refs through its
+separate ephemeral `0600` file. Offline recovery uses the root-only persistent
+cache to reconstruct both projections exactly. The applied content identity is
+computed from the same canonical recoverable union, and any missing or changed
+cached value fails closed. The complete transport bundle is never cached.
+Status and diagnostic output must redact secrets.
+
+The recoverability content identity hashes the canonical secret union and is
+therefore private verifier material, not a public integrity checksum. In hosted
+operation only root-side init/apply and the root system services
+`iforge-runtime-watch` and `iforge-daemon` consume that file; runtime-user units
+and the ordinary `runtime status`/`runtime doctor` paths do not. Readers repair
+a legacy world-readable mode (and, when root, legacy ownership) only when it is
+not already secure, and fail closed if the file cannot be secured. Status and
+observation payloads omit the private identity; when a non-v2 fixture has no
+transport ETag or source revision, its public fallback revision hashes only the
+manifest.
+
+## Command And Launch Model
+
+The tenant terminal runs official runtime commands directly. For OpenClaw, the
+product path is `openclaw agent`; OpenClaw resolves managed runtime credentials
+through its official config-first behavior and native config/credential stores.
+There is no iforge wrapper in that credential path.
+
+`iforge run -- <command>` remains an explicit local vault-injection command. It
+is not the hosted tenant terminal boundary and does not mediate hosted managed
+credentials. When a caller opts into it, an enabled generated runtime run config
+can supply that command's configured args, cwd, env, PATH, secret refs, and
+optional sidecar profile. A disabled matching config is rejected.
+
+Interactive tenant shell commands are not intercepted. `openclaw`, `hermes`,
+and future runtime names resolve to official binaries on PATH; `iforge` does
+not. The platform invokes its root-only CLI by absolute path when it projects
+manifest-selected config.
+
+Hosted daemon startup avoids `iforge run`. For OpenClaw/Hermes gateways,
+`runtime init` invokes the official service installer to create the base user
+unit, then writes a hosted drop-in with the minimum local environment needed by
+the Linux-like container. Service environment that is still required at runtime
+lives under `$IFORGE_RUN_DIR/systemd/env` instead of durable unit files; the
+OpenClaw gateway token is not part of that environment:
+
+```ini
+# $HOME/.config/systemd/user/openclaw-gateway.service.d/10-iforge-hosted.conf
+# Generated by iforge runtime init. Do not edit inside hosted runtime.
+# The base unit is generated by the runtime's official service installer.
+[Unit]
+# The environment file is regenerated by convergence each boot; this unit must not start before it exists.
+ConditionPathExists=/run/iforge/systemd/env/openclaw-gateway.service.env
+
+[Service]
+UnsetEnvironment=CLAWDI_AUTH_TOKEN IFORGE_AUTH_TOKEN
+EnvironmentFile=/run/iforge/systemd/env/openclaw-gateway.service.env
+```
+
+The real file also carries two machine-read marker comments (the drop-in format
+version and the environment revision), omitted here. `ExecStart` and
+`WorkingDirectory` remain solely in the official base unit and are deliberately
+absent from the iforge-owned drop-in.
+
+The gateway environment file contains only desired runtime/provider
+environment and any required CA trust variables. It does not add `HOME`,
+`PATH`, `TZ`, `CLAWDI_HOME`, or the Cloud bearer token in either spelling
+(`IFORGE_AUTH_TOKEN` or its internal register), and the drop-in unsets both; the
+OpenClaw gateway token is also absent because the official config and installer
+own it.
+
+When egress profiles are enabled, systemd runs the iforge sidecar. Egress
+interception uses a runtime-fetched `mitmdump` (mitmproxy) transparent gateway
+running under the explicit non-root `IFORGE_EGRESS_UID` and
+`IFORGE_EGRESS_GID` numeric identity
+(both default to `10002`). The CLI owns its paths, permissions, and privilege
+drop; the image does not need a named egress account. Engagement is a minimal
+nft redirect of the runtime UID's
+outbound :80/:443 to the local mitmproxy port (default-allow: non-profiled hosts
+pass through end-to-end against the real upstream CA); no forward-proxy env is
+injected. Egress profile/CA/secret config stays inside the sidecar. Runtime
+programs therefore receive only CA-trust env such as `NODE_EXTRA_CA_CERTS`,
+`REQUESTS_CA_BUNDLE`, and `SSL_CERT_FILE`; sidecar control env and secret-file
+paths stay out of the official runtime process.
+
+Generated managed-provider profiles match the configured origin, base-URL path,
+and public authorization placeholder before replacing the header. The sidecar
+validates every secret reference in enabled profiles at load time and refuses to
+start when material is missing. A channel that is feature-gated off contributes
+neither runtime configuration, egress profiles, nor channel secret material.
+
+This ownership boundary is codified in
+[ADR-0002](adr/0002-runtime-image-is-a-stable-capability-envelope.md).
+
+Hermes has multiple long-running surfaces, but its dashboard has no official
+service installer. The gateway uses the official lifecycle that Hermes
+actually provides; the dashboard remains the existing
+`iforge-hermes-dashboard` compatibility unit. iforge must not invent an
+official dashboard installer or claim the compatibility unit is upstream-owned.
+
+Strict-v2 OpenClaw uses the official gateway directly on native port `18789`.
+iforge patches `gateway.port=18789`, `gateway.bind=lan`, and
+`gateway.auth.mode=token` with the managed token. The service receives no token
+environment entry, and the launch command carries no Hosted-owned network or
+authentication overrides. The manifest identity is:
+
+```json
+{"args": ["gateway", "run"]}
+```
+
+The reader still accepts the previous producer argv containing
+`--allow-unconfigured --port 18789 --bind lan --force` long enough for an old
+CLI to self-upgrade, then normalizes it before matching the official service.
+The official OpenClaw installer currently writes an absolute Node/CLI
+entrypoint with `gateway --port 18789`; that upstream argv is deliberately not
+duplicated or overridden by iforge.
+
+The strict manifest references the token only as
+`secret://runtime/openclaw/gateway-token`; its value comes only from the fetched
+bundle's `secretValues` map. It is absent from manifest config and iforge's
+general managed config, but is deliberately persisted by the official config
+writer to the owner-only OpenClaw config. The installer receives the same value
+only through its transient subprocess environment. Missing token, native-auth
+capability, deployment policy, public origin or exact command rejects the
+strict-v2 configuration before exposure.
+
+## Official Update Compatibility
+
+Systemd is compatible with official updater behavior when the runtime container
+boots a real `systemd --user` manager for the runtime user:
+
+- runtime-owned units name official binaries directly;
+- install roots are writable by the runtime user expected by the official
+  installer;
+- `openclaw`, `hermes`, and their update subcommands are not shadowed by
+  iforge wrappers or PATH shims;
+- `iforge run` is used only when explicitly requested by a caller;
+- OpenClaw's official base unit provides
+  `OPENCLAW_SYSTEMD_UNIT=openclaw-gateway.service` for managed update handoff;
+- after an updater replaces files, the process manager restarts the relevant
+  official programs, or autorestart picks them up when they exit.
+
+The update transaction belongs to Hermes/OpenClaw. iforge may observe status,
+surface diagnostics, and restart programs, but it must not emulate or wrap
+`hermes update` or `openclaw update`.
+
+Runtime-owned services use the same generated run-config and systemd model, but
+they are not user commands and do not receive command shims. Gateway units must
+come from official service installers. A manifest entry such as
+`runtimes.hermes.services.dashboard` may still write
+`/etc/iforge/run/hermes+dashboard.json`; until Hermes exposes an official dashboard
+service installer, systemd must run it only as an explicit `iforge-*`
+compatibility unit:
+
+```ini
+ExecStart="hermes" "dashboard" "--host" "0.0.0.0" "--port" "9119" "--no-open"
+```
+
+This covers browser helper processes such as a runtime dashboard while keeping
+the user's shell PATH clean: typing `hermes` enters the managed Hermes runtime,
+not a dashboard alias. It must not be represented as
+`hermes-dashboard.service` unless Hermes itself generates that unit.
+
+## Provider And Channel Routing
+
+Provider configuration uses standard iforge AI Provider modes:
+
+- `openai_chat`;
+- `openai_responses`;
+- `anthropic_messages`;
+- `google_generate_content`.
+
+Agent-specific transport details belong to the target runtime projection layer.
+For example, if a runtime needs a target-native transport name, the CLI maps the
+standard provider contract into that runtime's configuration format at launch
+time. The iforge provider model itself should stay provider-oriented, not
+runtime-transport-oriented.
+
+Channel configuration follows the same rule: the open-source contract describes
+the local projection shape and validation rules, while service-specific channel
+control planes remain outside this repository.
+
+Telegram Bot API clients construct method and file URLs as
+`/bot<token>/...` and `/file/bot<token>/...`. Managed runtimes therefore give
+the client a Bot API-shaped, non-secret routing placeholder. The egress sidecar
+preserves that placeholder in the Cloud URL and injects the real agent-link
+credential as a redacted Bearer header; cloud-api authenticates the header and
+binds it to the placeholder before routing either request class. This boundary
+is expressed by the strict managed-channel and egress manifest schemas, not by
+comparing the selected product version to a semver floor.
+
+## Runtime UI And Terminal
+
+Versioned [component activation proof](plans/component-activation-proof.md) lets
+readers admit a healthy Files or Runtime UI component while aggregate Ready is
+false. It retains the exact apply/boot/configuration and credential authority;
+legacy or unavailable proof retains the complete-runtime admission gate.
+
+Hosted deployment pages expose two live surfaces:
+
+- **Control UI** opens runtime-native authentication in a top-level window. The
+  surface is runtime-specific and labelled as `<Runtime> Control UI`.
+- **Terminal** opens a shell for the deployment. It is not split per agent; a
+  deployment has one Terminal surface.
+
+```mermaid
+flowchart LR
+    Dashboard[Dashboard] -->|Control UI URL| Ingress[Platform ingress]
+    Ingress --> RuntimeUI[Official runtime UI port]
+    Dashboard -->|Terminal WebSocket| HostedAPI[Hosted API]
+    HostedAPI --> Shell[Deployment shell<br/>default runtime user]
+```
+
+The browser Terminal contract is:
+
+1. The dashboard calls `POST /v2/deployments/{deployment_id}/terminal`.
+2. The API returns a short-lived `websocket_url`.
+3. The frontend removes any fragment token from the URL and sends it as a
+   WebSocket subprotocol named `clawdi-terminal.<token>` when possible.
+4. The frontend also sends the `tty` subprotocol and uses tty-style frames:
+   `0` for terminal input/output and `1` for resize.
+5. The terminal uses xterm, auto-fits to the panel, focuses on pointer down, and
+   switches theme when the dashboard switches light/dark mode.
+
+The service-side implementation is outside this repository. It must
+authenticate the user, require the deployment to be running, bind the terminal
+token to the deployment, and bridge the WebSocket to a shell as the default
+runtime user. Query-param token transport is kept only as a compatibility
+fallback for environments that reject custom WebSocket subprotocols.
+
+## Security Rules
+
+- Do not persist auth tokens, private keys, provider secrets, or resolved vault
+  values in iforge-owned durable runtime config. The managed OpenClaw gateway
+  token is deliberately persisted only through OpenClaw's official owner-only
+  config writer.
+- Keep non-secret desired state separate from secret values.
+- Treat runtime policy as an input to the CLI, not as hardcoded private logic.
+- Prefer official runtime configuration and installers before proxying or
+  request rewriting.
+- Expose strict-v2 official runtime ports only when native auth and the typed
+  deployment-authorization capability are active; otherwise fail closed.
+- Keep defensive validation at every boundary: manifests, provider references,
+  channel descriptors, filesystem paths, and process launch arguments.
+- Remove `IFORGE_AUTH_TOKEN` from agent child process environments unless that
+  process is explicitly the iforge daemon or runtime reconciler.
+- Keep OpenClaw device auth at its native default and use the official owner
+  bootstrap when available. Older hosted deployments may temporarily retain
+  their existing shared-token launch until their runtime and CLI are upgraded
+  together; do not project the retired device-auth disable setting into new
+  desired state, and never enable insecure or Host-header fallback modes.
+- Prefer WebSocket subprotocol auth for Terminal sessions so bearer tokens do
+  not normally appear in URLs or proxy access logs.
+
+## Recovery Rules
+
+- Cache only manifests that validate and converge without core install or
+  projection errors. A retryable Skill or Agent Plugin error may cache the
+  committed core desired state.
+- Use ETags for remote refreshes where the datasource supports them.
+- Offline boot is allowed only when `recovery.allowOfflineBoot` is true and the
+  cached manifest does not require missing secret values. Its root-only secret
+  cache must reproduce the applied canonical secret union exactly, including
+  active egress-only refs; missing or stale values enter repair instead.
+- `runtime status --json` and `runtime doctor --json` should surface enough
+  state to distinguish manifest fetch failures, manifest rejection, degraded
+  offline boot, install failures, and disabled runtimes.
+
+## Cloud Hosted Authority
+
+iforge OSS does not authenticate the Hosted product session. Hosted authorizes
+the owner before returning deployment credentials; Hermes and OpenClaw then own
+their official browser sessions. Missing deployment secret material prevents
+runtime activation and credential delivery.
+
+The exact-only Hosted package, fixture-only bootstrap tgz, strict
+provider/install fields, and preserved generic desired-state behavior described
+above are the CLI boundary. Hosted selects `cli_package_spec` from its
+database-backed setting and persists it with the deployment; Cloud validates,
+persists, and projects that exact value into the public manifest. Cloud fixes
+`clawdiCli.source` to `npm:clawdi` and `clawdiCli.registry` to
+`https://registry.npmjs.org`. Stored package state is revalidated on every read
+and fails closed with `409` when invalid. There is no independent version floor,
+default, nullable fallback, floating tag, local path, or forward compatibility
+use of the historical `clawdi_cli` column.
+
+The security boundary is delivered as a paired artifact rollout: the Hosted
+runtime image supplies the root-only bootstrap entrypoint and replaces the
+workload, while the manifest pins the matching exact CLI. Updating only the
+manifest or reconciling an existing container is insufficient when the old
+image root filesystem is read-only.
+
+Runtime-state writes use generation compare-and-swap while locking the
+corresponding `AgentEnvironment` before the optional `HostedRuntimeState`.
+Lower generations return structured `stale_generation` conflicts; equal
+generations with material differences return structured `generation_conflict`
+responses. Both include `current_generation`. Equal identical state is an
+idempotent `200`, while higher generations apply. Rejected and idempotent writes
+do not create duplicate state, audit events, or manifest invalidation.
+
+`apply_generation` is a separate nullable persistence/API field constrained to
+positive values. Omission preserves the current value;
+explicit null is rejected so null remains legacy/gated state only. An unbound
+row may bind a positive value once, and Apply generation may advance at an
+unchanged checkpoint when no other material field changes. Apply-generation
+regression, explicit clear, and any same-checkpoint material change are
+rejected. Checkpoint-only model, Skill, MCP, or CLI pin changes preserve the
+existing Apply generation. Each sequence is monotonic on its own; neither is
+ordered relative to the other, and no cross-sequence upper bound applies.
+
+Additive manifest capabilities roll out consumer first: publish and select a
+CLI version that understands the new fields, then advance existing deployments
+through ordinary higher-generation runtime-state reconciliation. Database
+migrations backfill stored authority where required; operators do not patch
+individual production rows to advance deployments.
+
+WhatsApp bindings and `applyGeneration` followed this consumer-first rollout
+order before their producers were enabled. They are now part of the released
+manifest contract; later changes must use the same additive sequencing and
+must not depend on producer-version detection, a fallback datasource, or
+direct mutation of Cloud state or tenant filesystems.
+
+Bundled-Skill versioning follows expand, migrate, contract ordering. During
+expand, the CLI accepts the prior enabled-only Skill entry and canonicalizes
+only that missing value to pinned integer `1`; explicit versions must be
+positive integers, and no value resolves as a moving version. Runtime-state
+writers require and persist explicit `version: 1` for new desired state.
+Existing enabled-only rows continue to emit their stored enabled-only payload
+at their existing generation. A controlled backfill or normal reconcile may
+add explicit v1 only with a higher generation; the compare-and-swap contract
+rejects the same material change at an equal generation. Future Skill upgrades
+likewise require an explicit desired-state write and new generation, so a CLI
+upgrade cannot change Skill bytes implicitly. After every consumer is upgraded
+and stored rows are migrated, a later contract release removes the CLI's
+missing-version parser branch and requires the field at read time.
+
+Committed manifest changes emit a signal-only `runtime_manifest_changed` event
+through `/v1/sync/events`. The payload contains only `type` and
+`environment_id`; clients refetch through the public manifest and ETag contract.
+PostgreSQL LISTEN/NOTIFY carries the signal across API workers, bound deploy keys
+receive only their environment, and ETag polling remains the missed-event
+fallback.
+
+## Implementation Notes
+
+The CLI implementation should remain portable and testable:
+
+- runtime commands must support JSON output for automation;
+- local fixture manifests may be used for tests;
+- generated provider and channel projections should be deterministic;
+- diagnostics should report actionable local state without exposing secrets;
+- operator-only behavior should not change normal laptop onboarding.
+
+Primary implementation files:
+
+| Area | Files |
+| --- | --- |
+| Manifest schema | `packages/cli/src/runtime/manifest-contract.ts` |
+| Manifest fetch/normalize/validate | `packages/cli/src/runtime/manifest-source.ts` |
+| Runtime convergence | `packages/cli/src/runtime/manifest.ts` |
+| Runtime paths | `packages/cli/src/runtime/paths.ts` |
+| Host policy | `packages/cli/src/runtime/host-policy.ts` |
+| Run config | `packages/cli/src/runtime/run-config.ts` |
+| Command execution | `packages/cli/src/commands/run.ts` |
+| CLI update policy | `packages/cli/src/runtime/cli-update.ts` |
+| Dashboard terminal | `apps/web/src/hosted/agents/hosted-terminal-panel.tsx` |
+| Dashboard hosted detail page | `apps/web/src/hosted/agents/hosted-agent-detail.tsx` |
+
+## Runtime Vault files
+
+The existing runtime watch delivers a complete authenticated `GET /v1/runtime/vaults`
+metadata snapshot independently of manifest convergence, including manifest 304 passes. This adds
+one conditional request per watch pass, using the same SSE connection and jittered
+7.5–22.5 second fallback. `runtime_vaults_changed` is an Agent-scoped commit notification;
+older clients ignore it. Changed inventories use one additional `POST /v1/runtime/vaults/material` batch request,
+fenced to the metadata ETag. Only Vaults whose per-Vault revision changed are read/decrypted;
+unchanged files and metadata are retained from the private receipt. A concurrent graph
+change returns 409 and retries on the next watch pass, never applying mixed inventories.
+Value writes increment only the affected Vault revision and queue
+signals without rendering consumer manifests. Commit delivery batches PostgreSQL
+notifications into one SQL round trip rather than one query per receiving Agent;
+Vault SSE bursts coalesce to at most four wakeups per second. Project binding/removal signals continue
+through existing manifest notifications. The snapshot rechecks current permissions every
+request and hashes Vault metadata/revisions; unchanged snapshots do not query/decrypt
+items or download/rewrite plaintext. Changed snapshots batch-read at most 10,000 fields
+and 8 MiB ciphertext; over-limit/error responses are never interpreted as empty inventories.
+
+Strict runtime deployment credentials may read the bound Agent's private Workspace and
+explicitly linked, readable user Projects. Legacy Agent-bound keys remain limited to their
+own Workspace, including on the batch material endpoint. Vault IDs deduplicate multiple attachments. Each Vault/section gets a
+JSON object preserving exact field names; section identity is SHA-256 of its name because
+the database has no section ID. Renaming a section replaces its file. `index.json` contains
+only metadata: IDs, names, references, filenames, opaque `revision`, and required
+`content_version` from the existing Vault content counter. After a supplied request, match
+Vault/section/fields and require local `content_version >= status.content_version`. Network snapshots without a valid counter
+are rejected. Incomplete owned cache metadata refreshes from the current API, reusing
+intact sections without rewriting secret JSON. Invalid environment names have a null `env_name`,
+not normalized colliding names. Pending supply requests are not items.
+
+The native workspace's `.iforge/vaults` directory is 0700 and its files 0600, owned by the runtime
+user. Hosted runtime pins directory ancestors without following symlinks and performs IO
+with tenant filesystem credentials. Connected native-user IO is described below. A private
+receipt binds generated directory identity and filenames; existing unrelated directories, symlinks, hardlinks, tracked targets,
+and unsafe permissions fail closed. Hosted workspaces must be beneath the tenant home;
+connected targets remain explicitly configured. Changing the recorded directory identity
+requires operator reconciliation. Writes are atomic per file, not a multi-file transaction.
+An existing legitimate `.iforge` directory and unrelated children are preserved without
+chmod or adoption; only `vaults` is managed. Symlink or unsafe writable ancestors are refused.
+The receipt records the fixed `.iforge/vaults` target and private expected content digests.
+Each pass hashes the bounded generated files before accepting a 304; local edits force a
+fresh value fetch and restoration, while unchanged bytes keep their original mtimes.
+The receipt reserves filenames before writes so interrupted delivery can catch up safely.
+A crash after creating `vaults` but before the first receipt requires operator repair:
+without that private proof the runtime refuses even an empty existing directory. This
+bootstrap window does not self-heal by adopting user content.
+No values enter manifest caches, receipts, index metadata, logs or synchronization tool results.
+Authorized tenant programs can still read the files; they must reload already-loaded keys.
+
+Offline/timeouts/5xx preserve last good files. A complete authenticated metadata inventory
+removes revoked/detached Vault files even if subsequent changed-value delivery fails. An
+explicit API 401/403 removes only receipt-owned files
+(fail closed, including expired credentials); 404 during a server-first rollout preserves
+last good files and retries. Filesystem conflicts defer cleanup and are reported without
+secret values. Sync failures back off from one to five minutes independently of native
+agent installation/restarts. Deploy the additive backend/migration before the updated CLI.
+
+Done: `bash scripts/test.sh runtime-vaults` passes in the bounded Docker runner.
+Its real HTTP/PostgreSQL fixture exercises runtime watch with manifest 304 responses,
+real SSE and disabled-SSE fallback; native installations/systemd are fixtures.
+Timing and SQL counts are printed for those isolated parameters, not a production SLA.
+On 2026-09-11, one Agent/one Vault/one field in the 3-CPU runner measured 260 ms with SSE
+(15-second fallback configured), and 344 ms with SSE disabled and a 200 ms test fallback.
+Five metadata requests executed 20 SQL statements; three material requests executed 15;
+two saves executed 21. Counts include authentication and permission checks. Native service
+operations were fixtures; no production change latency or high-fanout throughput was measured.
+
+### Connected Agent delivery
+
+Connected macOS/Linux Agents reuse their existing daemon, SSE connection and heartbeat fallback
+(45–75 seconds). Session-only adapters open that same engine-owned event connection only
+when Vault delivery is configured. If that Vault-only stream lacks SSE permission, the
+snapshot rechecks Vault access and heartbeat fallback continues without stopping Sessions.
+Hosted daemon workers never start a second Vault writer.
+Vault-only notifications do not trigger Skill installs or native Agent restarts. Transient
+failures retain last good files and back off independently; confirmed access removal clears
+only receipt-owned files. Authentication, machine, API-origin and registration changes fence
+in-flight responses and remove the old binding's generated files. An obsolete worker cannot
+clear a replacement worker's files.
+
+Configure an existing directory explicitly; no default is inferred from CWD, HOME or sessions:
+
+```bash
+iforge setup --agent codex --vault-workspace /absolute/project
+```
+
+`--vault-workspace` requires `--agent` and a normal CLI login with a stored account identity.
+Environment-only tokens without that local account fence do not enable connected delivery. An explicit path needs no second approval; `--yes`
+alone never selects one. Interactive setup can offer official OpenClaw roster workspaces or
+an absolute, unambiguous Hermes `terminal.cwd`. `--vault-native-agent <id>` selects an
+OpenClaw roster entry; if a path is also provided they must agree. The binding captures that
+path and never follows later native-directory changes automatically. Rerun setup to rebind.
+The configured directory may be outside HOME; it must satisfy the same safe-ancestor checks.
+
+The existing per-adapter registration stores optional `vaultWorkspace` path, API origin and
+native-agent ID alongside its cloud Agent/user/machine identity. No separate registry exists.
+The registration lock rejects another registered Agent using the same real workspace,
+including symlink aliases. Repeated setup preserves a binding only for the same identity;
+reconnect/account/API/machine changes clear it unless deliberately configured again. A binding
+change restarts an existing sync daemon after normal setup installation; `--no-daemon`
+requires the operator to restart it later. Native Agent services are unaffected.
+
+The snapshot API requires an explicit owned, registered non-Hosted `agent_id` and matching
+`X-Clawdi-Machine-Id` for unbound CLI/OAuth credentials; missing/stale identity is rejected on
+both metadata and material reads. No target only disables Vault delivery with setup guidance;
+ordinary session/skill synchronization continues.
+
+Connected macOS and Linux/WSL use the native user's filesystem APIs. Native Windows daemon
+supervision remains unsupported; WSL filesystems must enforce Unix permissions. Shared
+network, permission, revision and JSON rendering logic stays the same on both platforms.
+
+Hosted Linux retains descriptor-anchored access under the tenant UID. Connected writes use
+the existing private-file/trusted-directory helpers and a cooperating per-receipt lock in a
+verified 0700 state subdirectory. The lock covers snapshot reconciliation and receipt/file
+updates; revocation waits for an active reconciliation to settle rather than blocking its
+event loop. Existing `.iforge` parents and unrelated state directories are never chmodded.
+Existing symlinks, hardlinks, unsafe modes, wrong owners and replaced directory identities
+fail closed. This protects the normal private-directory/cooperating-writer boundary. It is
+not absolute race isolation against hostile code with the same UID: that code can read the
+files and can change paths between checks. Path-based APIs are not used for Hosted's
+root-to-tenant writes. No `/dev/fd` substitution, native addon, helper process or package is
+introduced.
+
+The existing Desktop Platform Packages macOS runner executes the actual connected file,
+restart, edit restoration, permission, replacement and identity tests in temporary HOME,
+state and workspace directories. These GitHub runners are disposable native test isolation;
+they do not fake `process.platform`. Linux Docker tests exercise both implementations.
+The macOS CI gate must pass on the reviewed commit before claiming native qualification.
+
+Done: `bash scripts/test.sh runtime-vaults` includes the connected daemon over real isolated
+HTTP/PostgreSQL, using a 15-second test heartbeat to isolate SSE wakeups and a 200 ms
+heartbeat for deliberately missed events,
+offline retention and confirmed detach. The fixture is not a production latency promise.
+
+In the 2026-09-11 connected fixture (one Agent/Vault/field, 3-CPU Docker runner), SSE
+save-to-file measured 249 ms with a 15-second test heartbeat; denied/missed SSE recovery
+measured 460 ms with a 200 ms test heartbeat. Ten metadata requests executed 60 SQL
+statements and four material requests executed 22, including account/machine fences.
+These isolated timings do not describe the normal 45–75 second fallback or production latency.

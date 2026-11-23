@@ -1,0 +1,853 @@
+import { execFile, spawnSync } from "node:child_process";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
+import { promisify } from "node:util";
+import type { components } from "@clawdi/shared/api";
+import JSON5 from "json5";
+import { parse as parseYaml } from "yaml";
+import { safeTruncate, sanitizeMetadata } from "../lib/sanitize";
+import { getCliVersion } from "../lib/version";
+import { toErrorMessage } from "../serve/log";
+import {
+	type RuntimeAppliedState,
+	readRuntimeAppliedState,
+	runtimeContentSha256,
+} from "./applied-state";
+import { resolveRuntimeApplyGeneration } from "./apply-identity";
+import { type RuntimeCliBootstrapStatus, readRuntimeCliBootstrapStatus } from "./cli-update";
+import { UNSUPPORTED_COMPANIONS_MAX } from "./companion-registry";
+import { type ComponentServiceState, observeComponents } from "./component-observation";
+import { readHostedAgentPluginsObservation } from "./hosted-agent-plugin-observation";
+import { installedOpenClawCommandPath } from "./hosted-openclaw-context";
+import { readHostedSkillsObservation } from "./hosted-skill-observation";
+import { providerHealthReasons } from "./manifest-providers";
+import { hostedRuntimeBundleV2Schema, loadCommittedRuntimeManifest } from "./manifest-source";
+import { getRuntimePaths, type RuntimePaths } from "./paths";
+import { execRuntimeUserCommand, spawnRuntimeUserCommand } from "./runtime-user-command";
+import { runtimeSecretValue } from "./secret-values";
+import { type RuntimeBootStatus, readRuntimeBootStatus } from "./state";
+import { managedRuntimeSystemdUnitEntries, parseSystemctlShow, systemctlPath } from "./systemd";
+import {
+	RUNTIME_SYSTEM_UNIT_WATCH,
+	RUNTIME_SYSTEMD_OWNED_NAME_PREFIX,
+	runtimeUserName,
+} from "./systemd-user";
+import { readRuntimeUserActivityState, runtimeUserActivityStatePath } from "./user-activity-state";
+
+// The Hermes dashboard is a product-owned user unit, so its name derives from the owned prefix
+// (iforge names only) rather than restating upstream's `clawdi-` spelling.
+const HERMES_DASHBOARD_SERVICE_UNIT = `${RUNTIME_SYSTEMD_OWNED_NAME_PREFIX}hermes-dashboard.service`;
+
+type JsonRecord = Record<string, unknown>;
+type ObservedStatus = "ok" | "error" | "unknown";
+export type HostedRuntimeObserved = components["schemas"]["HostedRuntimeObservedV2"] &
+	Pick<
+		components["schemas"]["RuntimeObservationEventV2"],
+		| "agentPlugins"
+		| "userActivity"
+		| "skills"
+		| "components"
+		| "providerConflicts"
+		| "serviceWithdrawals"
+	>;
+type HostedRuntimeObservedBoot = components["schemas"]["HostedRuntimeObservedBootV1"];
+type HostedRuntimeObservedCli = components["schemas"]["HostedRuntimeObservedCliV1"];
+type HostedRuntimeObservedProviderPayload =
+	components["schemas"]["HostedRuntimeObservedProviderPayload"];
+type HostedRuntimeObservedProviders = Record<string, HostedRuntimeObservedProviderPayload>;
+type HostedRuntimeObservedSystemd = components["schemas"]["HostedRuntimeObservedSystemdV1"];
+type HostedRuntimeObservedSystemdUnit = components["schemas"]["HostedRuntimeObservedSystemdUnitV1"];
+export type UnsupportedCompanionRecord =
+	components["schemas"]["HostedRuntimeUnsupportedCompanionV1"];
+
+export { UNSUPPORTED_COMPANIONS_MAX } from "./companion-registry";
+
+const SYSTEMD_STATUS_TIMEOUT_MS = 1_000;
+const RUNTIME_READINESS_TIMEOUT_MS = 3_000;
+const execFileAsync = promisify(execFile);
+const SYSTEMD_FAILURE_EVIDENCE_MAX_LENGTH = 500;
+const SYSTEMD_OBSERVED_UNIT_LIMIT = 30;
+const SENSITIVE_FAILURE_EVIDENCE =
+	/(?:^|[^a-z0-9])(?:api[_-]?key|key|token|secret|password|passwd|credential|authorization|bearer)(?:[^a-z0-9]|$)|(?:^|\s)[A-Z][A-Z0-9_]{1,}=|(?:^|[^a-z0-9])(?:sk-|gh[pousr]_|clawdi_)[a-z0-9_-]+/i;
+
+/**
+ * Build the observation's unsupported-companion records from the SKIPPED REGISTRY KEYS.
+ *
+ * The parameter is a collection of strings and NOT a companion-entry type, and that is a security
+ * control rather than a style preference (T-4-07). The filebrowser companion entry carries a live
+ * 43-128 character HS256 secret at `auth.secret`; a builder that accepted entries could ship that
+ * secret into the observation POST with one careless spread, where it would land in the control
+ * plane's `hosted_runtime_config_observations.diagnostics` JSONB column, be queryable there, and
+ * outlive the converge that produced it. Taking keys makes the entry structurally unavailable to
+ * this function, so the property holds without depending on the next editor remembering it.
+ *
+ * Sorted, so two converges over one manifest serialize identically. Truncated to
+ * `UNSUPPORTED_COMPANIONS_MAX` rather than exceeding it, because the backend rejects an over-long
+ * array WHOLE — losing the convergence report as well as the diagnostic.
+ */
+export function collectUnsupportedCompanions(
+	kinds: Iterable<string>,
+	cliVersion: string | null,
+): UnsupportedCompanionRecord[] {
+	return [...new Set(kinds)]
+		.sort()
+		.slice(0, UNSUPPORTED_COMPANIONS_MAX)
+		.map((kind) => ({ kind, cliVersion }));
+}
+
+export async function readHostedRuntimeObserved(
+	paths: RuntimePaths = getRuntimePaths(),
+	options: {
+		reportedAt?: string;
+		appliedState?: RuntimeAppliedState | null;
+		includeAgentPlugins?: boolean;
+		includeSkills?: boolean;
+		includeUserActivity?: boolean;
+		includeComponents?: boolean;
+		includeProviderConflicts?: boolean;
+		includeServiceWithdrawals?: boolean;
+	} = {},
+): Promise<HostedRuntimeObserved | null> {
+	if (paths.mode !== "hosted") return null;
+	const boot = readRuntimeBootStatus(paths);
+	const appliedState =
+		options.appliedState === undefined ? readRuntimeAppliedState(paths) : options.appliedState;
+	const watchStatus = readJsonRecord(paths.runtimeWatchStatus);
+	const activeCliVersion = getCliVersion();
+	const cliBootstrap = readRuntimeCliBootstrapStatus(paths);
+	const systemd = await readSystemdObserved(
+		paths,
+		appliedState,
+		boot.status?.enabledRuntimes ?? [],
+	);
+	const providers = readProviderObserved(paths);
+	const appliedAuthority = appliedState
+		? {
+				etag: appliedState.etag,
+				sourceRevision: appliedState.sourceRevision,
+				generation: resolveRuntimeApplyGeneration(appliedState),
+				instanceId: appliedState.instanceId,
+				appliedProviderIds: [...appliedState.providerIds],
+			}
+		: null;
+
+	const observed: HostedRuntimeObserved = {
+		schemaVersion: "clawdi.hostedRuntimeObserved.v2",
+		reportedAt: options.reportedAt ?? new Date().toISOString(),
+		runtimeMode: paths.mode,
+		status: observedStatus(boot.status, watchStatus, systemd, providers, appliedAuthority !== null),
+		activeCliVersion,
+		applied: appliedAuthority,
+		boot: boot.status ? summarizeBootStatus(boot.status) : null,
+		cli: observedCli(cliBootstrap),
+	};
+	if (systemd) {
+		observed.systemd = {
+			...systemd,
+			units: representativeSystemdUnits(
+				systemd.units.filter((unit) => unit.scope === "system"),
+				systemd.units.filter((unit) => unit.scope === "user"),
+			),
+		};
+		if (systemd.unitCount > observed.systemd.units.length) observed.truncated = true;
+	}
+	if (providers) observed.providers = providers;
+	// Omitted when empty, following the `if (x) observed.x = x;` arm above. Two things depend on
+	// the omission rather than on an empty array: an older backend validating with
+	// `extra="forbid"` would reject the whole observation on an unexpected key, and the backend's
+	// `exclude_unset=True` serialization means an unset field is dropped entirely — so every
+	// converge that meets no unknown kind keeps storing a byte-identical diagnostics object.
+	const unsupportedCompanions = collectUnsupportedCompanions(
+		appliedState?.unsupportedCompanionKinds ?? [],
+		getCliVersion(),
+	);
+	if (unsupportedCompanions.length > 0) observed.unsupportedCompanions = unsupportedCompanions;
+	if (appliedState && options.includeAgentPlugins) {
+		const agentPlugins = readHostedAgentPluginsObservation({
+			paths,
+			applied: appliedState,
+			watchStatus,
+		});
+		if (agentPlugins) observed.agentPlugins = agentPlugins;
+	}
+	if (appliedState && options.includeSkills) {
+		const skills = readHostedSkillsObservation(appliedState);
+		if (skills) {
+			observed.skills = skills;
+			if (skills.truncated) observed.truncated = true;
+		}
+	}
+	// Skipped providers are committed state, not health: native configuration kept ownership.
+	if (appliedState?.providerConflicts && options.includeProviderConflicts)
+		observed.providerConflicts = { schemaVersion: 1, entries: appliedState.providerConflicts };
+	// Withdrawn optional services belong to the committed generation that is actually running.
+	if (appliedState?.serviceWithdrawals && options.includeServiceWithdrawals)
+		observed.serviceWithdrawals = { schemaVersion: 1, entries: appliedState.serviceWithdrawals };
+	if (options.includeUserActivity) {
+		const userActivity = observedUserActivity(boot.status, observed.reportedAt);
+		if (userActivity) observed.userActivity = userActivity;
+	}
+	if (appliedState && options.includeComponents) {
+		const proof = await observeComponents(
+			paths,
+			appliedState,
+			(scope, unit) => readComponentServiceState(paths, scope, unit),
+			(component) => runtimeComponentIsReady(component, paths),
+		);
+		if (proof) {
+			observed.components = proof;
+			if (observed.status === "ok" && proof.entries.some((entry) => entry.status !== "ok"))
+				observed.status = "unknown";
+		}
+	}
+
+	// Reject the whole snapshot when its parent authority or health changed while
+	// any asynchronous probe ran. Dropping only component proof leaves a stale
+	// aggregate success available to legacy admission readers.
+	if (
+		runtimeContentSha256(readRuntimeAppliedState(paths)) !== runtimeContentSha256(appliedState) ||
+		runtimeContentSha256(readRuntimeBootStatus(paths)) !== runtimeContentSha256(boot) ||
+		watchStatusRevision(readJsonRecord(paths.runtimeWatchStatus)) !==
+			watchStatusRevision(watchStatus)
+	)
+		return null;
+
+	if (boot.error) observed.error = boot.error;
+	const convergeError = runtimeConvergeError(watchStatus);
+	if (convergeError) observed.convergeError = convergeError;
+	return observed;
+}
+
+function watchStatusRevision(value: JsonRecord | null): string {
+	if (value === null) return runtimeContentSha256(null);
+	const { timestamp: _timestamp, ...semantic } = value;
+	return runtimeContentSha256(semantic);
+}
+
+function observedUserActivity(
+	bootStatus: RuntimeBootStatus | undefined,
+	reportedAt: string,
+): components["schemas"]["HostedRuntimeObservedUserActivityV1"] | null {
+	const enabledRuntimes = [...new Set(bootStatus?.enabledRuntimes ?? [])]
+		.filter(
+			(runtime): runtime is "hermes" | "openclaw" => runtime === "hermes" || runtime === "openclaw",
+		)
+		.sort();
+	if (enabledRuntimes.length === 0) return null;
+	const states = enabledRuntimes.map((runtime) => {
+		const state = readRuntimeUserActivityState(runtimeUserActivityStatePath(runtime));
+		return state?.agentType === runtime ? state : null;
+	});
+	const missing = states.includes(null);
+	const unknown = states.find((state) => state?.classification === "unknown");
+	const known = !missing && unknown === undefined;
+	const lastUserInputAt = maxIso(states.map((state) => state?.lastUserInputAt ?? null));
+	const observedAt = maxIso(states.map((state) => state?.observedAt ?? reportedAt)) ?? reportedAt;
+	const completeAt = minIso(states.map((state) => state?.completeAt ?? null));
+	const classification = known
+		? lastUserInputAt
+			? "known_last_user_input"
+			: "known_no_user_input"
+		: "unknown";
+	const error = known
+		? undefined
+		: (unknown?.error ?? (missing ? "activity_cache_missing" : "activity_scan_incomplete"));
+	return {
+		schemaVersion: 1,
+		classifierVersion: 1,
+		classification,
+		lastUserInputAt,
+		observedAt,
+		completeAt,
+		enabledRuntimes,
+		...(error ? { error } : {}),
+	};
+}
+
+function maxIso(values: readonly (string | null)[]): string | null {
+	return extremeIso(values, (candidate, current) => candidate > current);
+}
+
+function minIso(values: readonly (string | null)[]): string | null {
+	return extremeIso(values, (candidate, current) => candidate < current);
+}
+
+function extremeIso(
+	values: readonly (string | null)[],
+	prefer: (candidate: number, current: number) => boolean,
+): string | null {
+	let selected: number | null = null;
+	for (const value of values) {
+		if (!value) continue;
+		const candidate = new Date(value).getTime();
+		if (!Number.isNaN(candidate) && (selected === null || prefer(candidate, selected))) {
+			selected = candidate;
+		}
+	}
+	return selected === null ? null : new Date(selected).toISOString();
+}
+
+function readJsonRecord(path: string): JsonRecord | null {
+	try {
+		const parsed = JSON.parse(readFileSync(path, "utf-8")) as unknown;
+		if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+		return parsed as JsonRecord;
+	} catch {
+		return null;
+	}
+}
+
+function observedStatus(
+	bootStatus: { status: string; errors?: string[] } | undefined,
+	watchStatus: JsonRecord | null,
+	systemd: HostedRuntimeObservedSystemd | null,
+	providers: HostedRuntimeObservedProviders | null,
+	hasAppliedAuthority: boolean,
+): ObservedStatus {
+	const watchEvent = recordValue(watchStatus?.event);
+	if (bootStatus?.status === "error") return "error";
+	if (systemd?.status === "error") return "error";
+	if (providers && Object.values(providers).some((provider) => provider.status === "error")) {
+		return "error";
+	}
+	if (
+		watchEvent?.status === "error" &&
+		(!hasAppliedAuthority || watchEvent.healthImpact !== "resource_projection")
+	) {
+		return "error";
+	}
+	if (!hasAppliedAuthority) return "unknown";
+	if (systemd && systemdReadinessStatus(systemd.units) === "unknown") return "unknown";
+	if (watchEvent?.status === "applied" || watchEvent?.status === "not_modified") return "ok";
+	if (bootStatus?.status === "ok") return "ok";
+	return "unknown";
+}
+
+function summarizeBootStatus(status: RuntimeBootStatus): HostedRuntimeObservedBoot {
+	return {
+		status: status.status,
+		mode: status.mode,
+		stage: status.stage,
+		timestamp: status.timestamp,
+		activeGeneration: status.activeGeneration,
+		instanceId: status.instanceId ?? null,
+		enabledRuntimes: status.enabledRuntimes,
+		errors: status.errors,
+	};
+}
+
+function runtimeConvergeError(watchStatus: JsonRecord | null): string | null {
+	const event = recordValue(watchStatus?.event);
+	if (event?.status !== "error") return null;
+	return (
+		stringValue(event.error) ?? arrayValue(event.errors)[0]?.toString() ?? "runtime watch failed"
+	);
+}
+
+function observedCli(value: RuntimeCliBootstrapStatus | null): HostedRuntimeObservedCli | null {
+	if (!value) return null;
+	return {
+		status: value.status,
+		source: value.source,
+		packageSpec: value.packageSpec,
+		registry: value.registry,
+		activePath: value.activePath,
+		activeTarget: value.activeTarget,
+		version: value.version,
+	};
+}
+
+function readProviderObserved(paths: RuntimePaths): HostedRuntimeObservedProviders | null {
+	const committed = loadCommittedRuntimeManifest(paths);
+	// Provider diagnostics also describe an incomplete candidate; only `applied`
+	// carries authority. Prefer the exact committed snapshot when it is available.
+	const candidate = hostedRuntimeBundleV2Schema.safeParse(readJsonRecord(paths.manifestLastGood));
+	const providers = recordValue(
+		"manifest" in committed
+			? committed.manifest.projection?.providers
+			: candidate.success
+				? candidate.data.manifest.projection?.providers
+				: null,
+	);
+	if (!providers || Object.keys(providers).length === 0) return null;
+	const secrets = {
+		...("manifest" in committed
+			? committed.secretValues
+			: (readJsonRecord(paths.managedSecretCacheFile) ?? {})),
+		...(readJsonRecord(join(paths.managedSecretRoot, "egress-secrets.json")) ?? {}),
+	};
+	const observed: HostedRuntimeObservedProviders = {};
+	for (const providerId of Object.keys(providers).sort()) {
+		const provider = recordValue(providers[providerId]);
+		if (!provider) continue;
+		const apiKeySecretRef = stringValue(provider.apiKeySecretRef);
+		const secretAvailable =
+			apiKeySecretRef === null ? null : providerSecretAvailable(secrets, apiKeySecretRef);
+		const reasons = providerHealthReasons(provider, secretAvailable);
+		observed[providerId] = {
+			status: reasons.length > 0 ? "error" : "ok",
+			configured: true,
+			kind: stringValue(provider.kind),
+			baseUrl: stringValue(provider.baseUrl),
+			model: stringValue(provider.model),
+			models: Array.isArray(provider.models) ? provider.models : undefined,
+			apiKeySecretRef,
+			secretAvailable,
+			reasons,
+		};
+	}
+	return Object.keys(observed).length > 0 ? observed : null;
+}
+
+function providerSecretAvailable(secrets: JsonRecord, ref: string): boolean {
+	return runtimeSecretValue(secrets, ref) !== null;
+}
+
+async function readSystemdObserved(
+	paths: RuntimePaths,
+	appliedState: RuntimeAppliedState | null,
+	enabledRuntimes: readonly string[],
+): Promise<HostedRuntimeObservedSystemd | null> {
+	const systemUnits = managedSystemdUnitNames(paths.systemdSystemRoot).map((unit) =>
+		systemdUnitStatus("system", unit, paths),
+	);
+	// The applied receipt survives missing unit files; directory discovery alone fails open.
+	const requiredUserUnits = Object.keys(appliedState?.activated ?? {}).filter((unit) =>
+		["openclaw-gateway.service", "hermes-gateway.service", HERMES_DASHBOARD_SERVICE_UNIT].includes(
+			unit,
+		),
+	);
+	// Older receipts may lack activation inventory. Boot selection still requires native services.
+	if (requiredUserUnits.length === 0) {
+		if (enabledRuntimes.includes("openclaw")) requiredUserUnits.push("openclaw-gateway.service");
+		if (enabledRuntimes.includes("hermes"))
+			requiredUserUnits.push("hermes-gateway.service", HERMES_DASHBOARD_SERVICE_UNIT);
+	}
+
+	const userUnits = [
+		...new Set([...managedSystemdUnitNames(paths.systemdUserRoot), ...requiredUserUnits]),
+	]
+		.sort()
+		.map((unit) => systemdUnitStatus("user", unit, paths));
+	await Promise.all(
+		userUnits.map(async (unit) => {
+			if (unit.status === "ok" && !(await runtimeServiceIsReady(unit.name, paths))) {
+				unit.status = "unknown";
+				unit.error = "Runtime service readiness is not established";
+			}
+		}),
+	);
+	const allUnits = [...systemUnits, ...userUnits];
+	if (allUnits.length === 0) return null;
+	return {
+		status: systemdUnitsStatus(allUnits),
+		unitCount: allUnits.length,
+		units: allUnits,
+	};
+}
+
+function representativeSystemdUnits(
+	systemUnits: HostedRuntimeObservedSystemdUnit[],
+	userUnits: HostedRuntimeObservedSystemdUnit[],
+): HostedRuntimeObservedSystemdUnit[] {
+	const reservedForUser = Math.min(userUnits.length, SYSTEMD_OBSERVED_UNIT_LIMIT / 2);
+	const systemLimit = Math.min(systemUnits.length, SYSTEMD_OBSERVED_UNIT_LIMIT - reservedForUser);
+	const userLimit = Math.min(userUnits.length, SYSTEMD_OBSERVED_UNIT_LIMIT - systemLimit);
+	return [...systemUnits.slice(0, systemLimit), ...userUnits.slice(0, userLimit)];
+}
+
+function managedSystemdUnitNames(root: string): string[] {
+	return [...new Set(managedRuntimeSystemdUnitEntries(root).map((entry) => entry.unitName))].sort();
+}
+
+export function readComponentServiceState(
+	paths: RuntimePaths,
+	scope: "system" | "user",
+	unit: string,
+): ComponentServiceState | null {
+	const invocationId = readComponentInvocation(paths, scope, unit);
+	if (!invocationId) return null;
+	const args = ["cat", "--no-pager", unit];
+	const config = scope === "system" ? runSystemctl(args) : runRuntimeUserSystemctl(paths, args);
+	if (
+		config.exitCode !== 0 ||
+		!config.output ||
+		readComponentInvocation(paths, scope, unit) !== invocationId
+	)
+		return null;
+	// systemctl owns effective fragment/drop-in precedence. Its cat output has no
+	// per-process timestamps and includes overrides outside iforge's unit root.
+	return { invocationId, configurationRevision: runtimeContentSha256(config.output) };
+}
+
+/** A component receipt is bound to one fully loaded, idle service invocation. */
+export function readComponentInvocation(
+	paths: RuntimePaths,
+	scope: "system" | "user",
+	unit: string,
+): string | null {
+	const args = [
+		"show",
+		"--all",
+		unit,
+		"--property=InvocationID",
+		"--property=LoadState",
+		"--property=ActiveState",
+		"--property=NeedDaemonReload",
+		"--property=Job",
+	];
+	const result = scope === "system" ? runSystemctl(args) : runRuntimeUserSystemctl(paths, args);
+	const fields = parseSystemctlShow(result.output);
+	return result.exitCode === 0 &&
+		fields.LoadState === "loaded" &&
+		fields.ActiveState === "active" &&
+		fields.NeedDaemonReload === "no" &&
+		fields.Job === "" &&
+		/^[a-f0-9]{32}$/.test(fields.InvocationID ?? "") &&
+		fields.InvocationID !== "0".repeat(32)
+		? fields.InvocationID
+		: null;
+}
+
+function systemdUnitStatus(
+	scope: "system" | "user",
+	unit: string,
+	paths: RuntimePaths,
+): HostedRuntimeObservedSystemdUnit {
+	const result =
+		scope === "system"
+			? runSystemctl([
+					"show",
+					unit,
+					"--property=ActiveState",
+					"--property=SubState",
+					"--property=Result",
+					"--property=ExecMainCode",
+					"--property=ExecMainStatus",
+				])
+			: runRuntimeUserSystemctl(paths, [
+					"show",
+					unit,
+					"--property=ActiveState",
+					"--property=SubState",
+					"--property=Result",
+					"--property=ExecMainCode",
+					"--property=ExecMainStatus",
+				]);
+	const parsed = parseSystemctlShow(result.output);
+	const status = systemdUnitObservedStatus(parsed.ActiveState, result.exitCode);
+	return {
+		scope,
+		name: unit,
+		activeState: parsed.ActiveState ?? "unknown",
+		subState: parsed.SubState ?? "unknown",
+		status,
+		error:
+			status === "error"
+				? systemdFailureEvidence(scope, unit, parsed)
+				: result.exitCode === 0
+					? null
+					: (nonSensitiveFailureEvidence(result.output) ?? "systemctl show failed"),
+	};
+}
+
+export async function runtimeComponentIsReady(
+	component: components["schemas"]["HostedRuntimeObservedComponentV1"]["component"],
+	paths: RuntimePaths,
+): Promise<boolean> {
+	try {
+		if (component === "files")
+			return (await runtimeReadinessProbe("http://127.0.0.1:9120/health")).status === 200;
+		if (component === "hermes-ui") {
+			const status: unknown = JSON.parse(
+				(await runtimeReadinessProbe("http://127.0.0.1:9119/api/status")).body,
+			);
+			const expectedProvider = hermesUiExpectedAuthProvider(paths);
+			if (!expectedProvider || !hermesUiAuthenticationIsReady(status, expectedProvider))
+				return false;
+			const page = await runtimeReadinessProbe("http://127.0.0.1:9119/login");
+			return /<!doctype html|<html[\s>]/i.test(page.body);
+		}
+		return runtimeServiceIsReady("openclaw-gateway.service", paths);
+	} catch {
+		return false;
+	}
+}
+
+function hermesUiExpectedAuthProvider(paths: RuntimePaths): "self-hosted" | null {
+	try {
+		const config = recordValue(
+			parseYaml(readFileSync(join(paths.userHome, ".hermes", "config.yaml"), "utf8")),
+		);
+		const dashboard = recordValue(config?.dashboard);
+		const selfHosted = recordValue(recordValue(dashboard?.oauth)?.self_hosted);
+		return selfHosted ? "self-hosted" : null;
+	} catch {
+		return null;
+	}
+}
+
+function hermesUiAuthenticationIsReady(status: unknown, expectedProvider: "self-hosted"): boolean {
+	const value = recordValue(status);
+	const providers = arrayValue(value?.auth_providers);
+	return (
+		value?.auth_required === true && providers.length === 1 && providers[0] === expectedProvider
+	);
+}
+
+/** Native service activation precedes application startup; heartbeat health needs both. */
+export async function runtimeServiceIsReady(unit: string, paths: RuntimePaths): Promise<boolean> {
+	if (unit !== "openclaw-gateway.service" && unit !== HERMES_DASHBOARD_SERVICE_UNIT) return true;
+	try {
+		if (unit === "openclaw-gateway.service") {
+			// Read the native configuration, not the optional desired-manifest cache.
+			const config = recordValue(
+				JSON5.parse(readFileSync(join(paths.userHome, ".openclaw", "openclaw.json"), "utf8")),
+			);
+			let gateway = recordValue(config?.gateway);
+			if (
+				[config, gateway, recordValue(gateway?.controlUi)].some(
+					(value) => value && Object.hasOwn(value, "$include"),
+				)
+			) {
+				// Let the installed native CLI resolve includes; do not implement its config semantics here.
+				const command = installedOpenClawCommandPath(paths.userHome);
+				if (!command) return false;
+				const result = await execRuntimeUserCommand(
+					command,
+					["config", "get", "gateway", "--json"],
+					paths.userHome,
+					paths.userHome,
+					{
+						runtimeUser: runtimeUserName(),
+						timeoutMs: 15_000,
+						maxBufferBytes: 64 * 1024,
+					},
+				);
+				gateway = recordValue(JSON.parse(result.stdout));
+			}
+			if (!gateway) return false;
+			const port = gateway.port ?? 18789;
+			if (typeof port !== "number" || !Number.isInteger(port) || port < 1 || port > 65535)
+				return false;
+			const controlUi = recordValue(gateway.controlUi);
+			if (controlUi?.enabled === false) return false;
+			const basePath = controlUi?.basePath ?? "";
+			if (typeof basePath !== "string") return false;
+			const origin = `http://127.0.0.1:${port}`;
+			const probe = await runtimeReadinessProbe(`${origin}/readyz`, false, [200, 503]);
+			const status = recordValue(JSON.parse(probe.body));
+			if (status?.ready === true && probe.status !== 200) return false;
+			if (status?.ready !== true) {
+				if (
+					probe.status !== 503 ||
+					status?.ready !== false ||
+					!Array.isArray(status.failing) ||
+					status.failing.length === 0 ||
+					!status.failing.every((failure) => typeof failure === "string") ||
+					status.failing.includes("gateway-draining")
+				)
+					return false;
+				// Older gateways aggregate downstream channel health into /readyz.
+				// Their native handshake rejects startup but needs no operator scopes.
+				const command = installedOpenClawCommandPath(paths.userHome);
+				if (!command) return false;
+				const result = await execRuntimeUserCommand(
+					command,
+					["gateway", "status", "--json", "--timeout", String(RUNTIME_READINESS_TIMEOUT_MS)],
+					paths.userHome,
+					paths.userHome,
+					{ runtimeUser: runtimeUserName(), timeoutMs: 15_000, maxBufferBytes: 64 * 1024 },
+				);
+				const rpc = recordValue(recordValue(JSON.parse(result.stdout))?.rpc);
+				if (rpc?.ok !== true || rpc.url !== `ws://127.0.0.1:${port}`) return false;
+			}
+			// Control UI assets are prepared asynchronously after HTTP startup.
+			const uiUrl = new URL(origin);
+			uiUrl.pathname = `${basePath.replace(/\/+$/, "")}/`;
+			return (await runtimeReadinessProbe(uiUrl.href, true)).status === 200;
+		}
+		// The managed Hermes dashboard command binds the native port 9119.
+		const status = recordValue(
+			JSON.parse((await runtimeReadinessProbe("http://127.0.0.1:9119/api/status")).body),
+		);
+		const expectedProvider = hermesUiExpectedAuthProvider(paths);
+		return (
+			expectedProvider !== null &&
+			status?.gateway_running === true &&
+			status.gateway_state === "running" &&
+			hermesUiAuthenticationIsReady(status, expectedProvider)
+		);
+	} catch {
+		return false;
+	}
+}
+
+async function runtimeReadinessProbe(
+	url: string,
+	headersOnly = false,
+	acceptedStatuses: readonly number[] = [200],
+): Promise<{ status: number; body: string }> {
+	const { stdout } = await execFileAsync(
+		"curl",
+		[
+			"--disable",
+			"--noproxy",
+			"*",
+			"--silent",
+			"--max-time",
+			String(RUNTIME_READINESS_TIMEOUT_MS / 1_000),
+			...(headersOnly ? ["--head", "--output", "/dev/null"] : []),
+			"--write-out",
+			"\n%{http_code}",
+			url,
+		],
+		{ encoding: "utf8", maxBuffer: 64 * 1024, timeout: RUNTIME_READINESS_TIMEOUT_MS + 500 },
+	);
+	const separator = stdout.lastIndexOf("\n");
+	const status = Number(stdout.slice(separator + 1));
+	if (!acceptedStatuses.includes(status)) throw new Error("Runtime probe HTTP failure");
+	return { status, body: stdout.slice(0, separator) };
+}
+
+function systemdFailureEvidence(
+	scope: "system" | "user",
+	unit: string,
+	properties: Record<string, string>,
+): string {
+	const journal = runJournalctl([
+		"--quiet",
+		"--no-pager",
+		"--output=cat",
+		"--boot=0",
+		"--priority=err",
+		"--lines=20",
+		scope === "system" ? "--unit" : "--user-unit",
+		unit,
+	]);
+	if (journal.exitCode === 0) {
+		const firstLine = journal.output.split(/\r?\n/).find((line) => line.trim());
+		const evidence = firstLine ? nonSensitiveFailureEvidence(firstLine) : null;
+		if (evidence) return evidence;
+	}
+	return (
+		safeFailureEvidence(
+			[
+				`Result=${properties.Result || "unknown"}`,
+				`ExecMainCode=${properties.ExecMainCode || "unknown"}`,
+				`ExecMainStatus=${properties.ExecMainStatus || "unknown"}`,
+			].join("; "),
+		) ?? "Result=unknown; ExecMainCode=unknown; ExecMainStatus=unknown"
+	);
+}
+
+function safeFailureEvidence(value: string): string | null {
+	const line = sanitizeMetadata(value).replace(/\s+/g, " ").trim();
+	return line ? safeTruncate(line, SYSTEMD_FAILURE_EVIDENCE_MAX_LENGTH) : null;
+}
+
+function nonSensitiveFailureEvidence(value: string): string | null {
+	const evidence = safeFailureEvidence(value);
+	return evidence && !SENSITIVE_FAILURE_EVIDENCE.test(evidence) ? evidence : null;
+}
+
+function runSystemctl(args: string[]): { exitCode: number | null; output: string } {
+	const result = spawnSync(systemctlPath(), args, {
+		encoding: "utf8",
+		maxBuffer: 64 * 1024,
+		timeout: SYSTEMD_STATUS_TIMEOUT_MS,
+	});
+	return {
+		exitCode: result.status,
+		output: [result.stdout, result.stderr, result.error?.message].filter(Boolean).join("\n").trim(),
+	};
+}
+
+function runJournalctl(args: string[]): { exitCode: number | null; output: string } {
+	const result = spawnSync("journalctl", args, {
+		encoding: "utf8",
+		env: process.env,
+		maxBuffer: 64 * 1024,
+		timeout: SYSTEMD_STATUS_TIMEOUT_MS,
+	});
+	return {
+		exitCode: result.status,
+		output: [result.stdout, result.stderr, result.error?.message].filter(Boolean).join("\n").trim(),
+	};
+}
+
+function runRuntimeUserSystemctl(
+	paths: RuntimePaths,
+	args: string[],
+): { exitCode: number | null; output: string } {
+	const runtimeUser = runtimeUserName();
+	try {
+		const result = spawnRuntimeUserCommand(
+			systemctlPath(),
+			["--user", ...args],
+			paths.userHome,
+			paths.userHome,
+			{
+				runtimeUser,
+				maxBufferBytes: 64 * 1024,
+				timeoutMs: SYSTEMD_STATUS_TIMEOUT_MS,
+			},
+		);
+		return {
+			exitCode: result.status,
+			output: [result.stdout, result.stderr, result.error?.message]
+				.filter(Boolean)
+				.join("\n")
+				.trim(),
+		};
+	} catch (error) {
+		return {
+			exitCode: 1,
+			output: toErrorMessage(error),
+		};
+	}
+}
+
+function systemdUnitsStatus(units: HostedRuntimeObservedSystemdUnit[]): ObservedStatus {
+	if (units.some((unit) => unit.status === "error")) return "error";
+	if (units.some((unit) => unit.status === "unknown")) return "unknown";
+	return "ok";
+}
+
+function systemdReadinessStatus(units: HostedRuntimeObservedSystemdUnit[]): ObservedStatus {
+	return systemdUnitsStatus(units.filter((unit) => !isRuntimeWatchRestartTransition(unit)));
+}
+
+function isRuntimeWatchRestartTransition(unit: HostedRuntimeObservedSystemdUnit): boolean {
+	return (
+		unit.scope === "system" &&
+		unit.name === `${RUNTIME_SYSTEM_UNIT_WATCH}.service` &&
+		unit.activeState === "activating" &&
+		unit.subState === "auto-restart" &&
+		unit.status === "unknown" &&
+		unit.error === null
+	);
+}
+
+function systemdUnitObservedStatus(
+	activeState: string | undefined,
+	exitCode: number | null,
+): ObservedStatus {
+	if (activeState === "failed" || activeState === "deactivating") return "error";
+	if (exitCode !== 0) return "unknown";
+	if (activeState === "active") return "ok";
+	return "unknown";
+}
+
+function recordValue(value: unknown): JsonRecord | null {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+	return value as JsonRecord;
+}
+
+function stringValue(value: unknown): string | null {
+	return typeof value === "string" ? value : null;
+}
+
+function arrayValue(value: unknown): unknown[] {
+	return Array.isArray(value) ? value : [];
+}

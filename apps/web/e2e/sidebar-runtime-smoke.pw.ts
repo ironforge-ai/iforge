@@ -1,0 +1,2332 @@
+import { expect, type Page, type Route, test } from "@playwright/test";
+
+const now = new Date("2026-07-04T12:00:00.000Z");
+
+const agents = [
+	{
+		id: "11111111-1111-4111-8111-111111111111",
+		name: "smoke-codex",
+		default_name: "Smoke Codex",
+		machine_name: "smoke-machine.local",
+		display_name: "Smoke Codex",
+		avatar_url: null,
+		sort_order: 0,
+		agent_type: "codex",
+		agent_version: "1.0.0",
+		os: "linux",
+		last_seen_at: now.toISOString(),
+		last_sync_at: now.toISOString(),
+		last_sync_error: null,
+		last_revision_seen: 12,
+		queue_depth_high_water: 0,
+		dropped_count: 0,
+		sync_enabled: true,
+		explicit_identity: true,
+		default_project_id: "project-smoke",
+	},
+	{
+		id: "22222222-2222-4222-8222-222222222222",
+		name: "smoke-hermes",
+		default_name: "Smoke Hermes",
+		machine_name: "smoke-hermes.local",
+		display_name: "Smoke Hermes",
+		avatar_url: null,
+		sort_order: 1,
+		agent_type: "hermes",
+		agent_version: "1.0.0",
+		os: "linux",
+		last_seen_at: now.toISOString(),
+		last_sync_at: now.toISOString(),
+		last_sync_error: null,
+		last_revision_seen: 8,
+		queue_depth_high_water: 0,
+		dropped_count: 0,
+		sync_enabled: true,
+		explicit_identity: true,
+		default_project_id: "project-smoke",
+	},
+];
+
+const projects = [
+	{
+		id: "project-smoke",
+		name: "Smoke Project",
+		slug: "smoke-project",
+		kind: "environment",
+		origin_environment_id: "11111111-1111-4111-8111-111111111111",
+		archived_at: null,
+		created_at: now.toISOString(),
+		is_owner: true,
+		owner_display: "Dev User",
+		owner_handle: "dev-user",
+	},
+	{
+		id: "project-unrelated",
+		name: "Unrelated Project",
+		slug: "unrelated-project",
+		kind: "workspace",
+		origin_environment_id: null,
+		archived_at: null,
+		created_at: now.toISOString(),
+		is_owner: true,
+		owner_display: "Dev User",
+		owner_handle: "dev-user",
+	},
+];
+
+const projectBindings = [
+	{
+		id: "binding-primary",
+		agent_id: "11111111-1111-4111-8111-111111111111",
+		project_id: "project-smoke",
+		binding_type: "primary",
+		priority: 0,
+		default_write_enabled: true,
+		created_at: now.toISOString(),
+	},
+];
+
+const vaults = {
+	items: [
+		{
+			id: "vault-scoped",
+			slug: "scoped-vault",
+			name: "Scoped Vault",
+			project_ids: ["project-smoke"],
+			is_owner: true,
+			item_count: 2,
+			created_at: now.toISOString(),
+		},
+		{
+			id: "vault-unrelated",
+			slug: "unrelated-vault",
+			name: "Unrelated Vault",
+			project_ids: ["project-unrelated"],
+			is_owner: true,
+			item_count: 3,
+			created_at: now.toISOString(),
+		},
+	],
+	total: 2,
+	page: 1,
+	page_size: 200,
+};
+
+const dashboardStats = {
+	total_sessions: 1,
+	total_messages: 2,
+	total_tokens: 300,
+	active_days: 1,
+	current_streak: 1,
+	longest_streak: 1,
+	peak_hour: 12,
+	favorite_model: "gpt-5",
+	skills_count: 1,
+	memories_count: 1,
+	vault_count: 1,
+	vault_keys_count: 1,
+	connectors_count: 1,
+	manual_sessions_last_7_days: 1,
+	contribution: [{ date: "2026-07-04", count: 1, level: 1 }],
+};
+
+const sessions = {
+	items: [
+		{
+			id: "session-smoke-1",
+			local_session_id: "local-smoke-1",
+			project_path: "/smoke",
+			agent_name: "smoke-codex",
+			agent_display_name: "Smoke Codex",
+			agent_default_name: "Smoke Codex",
+			agent_type: "codex",
+			machine_name: "smoke-machine.local",
+			started_at: now.toISOString(),
+			ended_at: null,
+			updated_at: now.toISOString(),
+			last_activity_at: now.toISOString(),
+			duration_seconds: 60,
+			message_count: 2,
+			input_tokens: 100,
+			output_tokens: 200,
+			cache_read_tokens: 0,
+			model: "gpt-5",
+			models_used: ["gpt-5"],
+			summary: "Smoke session",
+			tags: [],
+			status: "active",
+			content_hash: "smoke-hash",
+		},
+	],
+	total: 1,
+	page: 1,
+	page_size: 25,
+};
+const overviewSessions = {
+	...sessions,
+	items: Array.from({ length: 5 }, (_, index) => ({
+		...sessions.items[0],
+		id: `session-overview-${index + 1}`,
+		local_session_id: `local-overview-${index + 1}`,
+		summary: [
+			"Plan release",
+			"Review customer notes before the quarterly planning meeting",
+			"Investigate a very long synchronization issue affecting several workspaces and prepare a clear remediation plan for the team before the next release review with every regional owner",
+			"Draft update",
+			"Fifth hidden session",
+		][index],
+		message_count: index + 2,
+		input_tokens: [8, 1200, 18_500, 420, 60][index],
+		output_tokens: [4, 340, 9200, 80, 20][index],
+		last_activity_at: new Date(now.getTime() - index * 60 * 60 * 1000).toISOString(),
+	})),
+	total: 5,
+	page_size: 3,
+};
+
+const memories = {
+	items: [
+		{
+			id: "memory-smoke-1",
+			content: "Shared account context",
+			category: "context",
+			tags: ["shared"],
+			source: "web",
+			source_session_id: "session-smoke-1",
+			source_machine_name: "smoke-machine.local",
+			access_count: 1,
+			created_at: now.toISOString(),
+		},
+	],
+	total: 1,
+	page: 1,
+	page_size: 25,
+};
+
+async function fulfillJson(route: Route, body: unknown, status = 200) {
+	await route.fulfill({
+		status,
+		contentType: "application/json",
+		body: JSON.stringify(body),
+	});
+}
+
+type DashboardApiStubOptions = {
+	accountResourceRequests?: string[];
+	agentDetailRequests?: string[];
+	projectResourceRequests?: string[];
+	sessionsPage?: unknown;
+	sessionRequests?: string[];
+	connectorConnections?: readonly unknown[];
+	connectorConnectionsGate?: Promise<void>;
+	connectorConnectionsResponse?: { body: unknown; status: number };
+	connectorCatalog?: readonly {
+		name: string;
+		display_name: string;
+		logo: string;
+		description: string;
+		auth_type: string;
+		connect_disabled: boolean;
+		connect_disabled_reason: string | null;
+	}[];
+	connectorCatalogGate?: Promise<void>;
+	connectorCatalogResponse?: { body: unknown; status: number };
+	connectorMetadataRequests?: string[];
+	connectorMetadataGate?: Promise<void>;
+	connectorAuthFields?: Record<string, unknown>;
+	connectorCredentialRequests?: Array<{ appName: string; body: unknown }>;
+	connectorOAuthRequests?: Array<{ appName: string; body: unknown }>;
+	memoryDetailGate?: Promise<void>;
+	memoryDetailResponse?: { body: unknown; status: number };
+	projectBindingRequests?: string[];
+	projectLinkDeltaBodies?: unknown[];
+	projectRequests?: string[];
+	projectCreateBodies?: unknown[];
+	projectBindings?: readonly unknown[];
+	projectBindingsError?: { status: number; detail: string };
+	projectBindingsGate?: Promise<void>;
+	projects?: readonly unknown[];
+	projectsGate?: Promise<void>;
+	projectsResponse?: { body: unknown; status: number };
+	legacySkillDetailRequests?: string[];
+	skillDetailRequests?: string[];
+	skillDetailResponses?: Readonly<Record<string, { body: unknown; status: number }>>;
+	skillCreateRequests?: Array<{ projectId: string; body: unknown }>;
+	skillRequests?: string[];
+	skillsByProjectId?: Readonly<Record<string, readonly unknown[]>>;
+	vaultRequests?: string[];
+	vaultItemWriteRequests?: Array<{ url: string; body: unknown }>;
+	vaultItems?: readonly (typeof vaults.items)[number][];
+};
+
+async function stubDashboardApi(
+	page: Page,
+	agentOrderRequests: string[] = [],
+	options: DashboardApiStubOptions = {},
+) {
+	const removedProjectIds = new Set<string>();
+	const addedProjectIds = new Set<string>();
+	const createdProjects: unknown[] = [];
+	const createdProjectBindings: unknown[] = [];
+	await page.route("**/v1/**", async (route) => {
+		const url = new URL(route.request().url());
+		if (url.pathname === "/v1/auth/me") {
+			await fulfillJson(route, {
+				id: "11111111-1111-4111-8111-111111111119",
+				email: "dev@clawdi.local",
+				name: "Dev User",
+				auth_type: "clerk",
+			});
+			return;
+		}
+		if (
+			/^\/v1\/memories\/[^/]+$/.test(url.pathname) ||
+			url.pathname === "/v1/connectors" ||
+			url.pathname.startsWith("/v1/connectors/")
+		) {
+			options.accountResourceRequests?.push(`${route.request().method()} ${url.pathname}`);
+		}
+		if (
+			/^\/v1\/agents\/[^/]+\/project-bindings$/.test(url.pathname) ||
+			url.pathname === "/v1/projects" ||
+			url.pathname === "/v1/skills" ||
+			url.pathname.startsWith("/v1/vault") ||
+			/^\/v1\/projects\/[^/]+\/skills\//.test(url.pathname)
+		) {
+			options.projectResourceRequests?.push(`${route.request().method()} ${url.pathname}`);
+		}
+		if (url.pathname === "/v1/agents/order" && route.request().method() === "PATCH") {
+			agentOrderRequests.push(route.request().postData() ?? "");
+			const requested = JSON.parse(route.request().postData() ?? "{}") as {
+				agent_ids?: string[];
+			};
+			const byId = new Map(agents.map((agent) => [agent.id, agent]));
+			const ordered = (requested.agent_ids ?? [])
+				.map((id) => byId.get(id))
+				.filter((agent) => agent !== undefined)
+				.map((agent, index) => ({ ...agent, sort_order: index }));
+			await fulfillJson(route, ordered);
+			return;
+		}
+		if (url.pathname === "/v1/agents") {
+			await fulfillJson(route, agents);
+			return;
+		}
+		const agentMatch = url.pathname.match(/^\/v1\/agents\/([^/]+)$/);
+		if (agentMatch) {
+			options.agentDetailRequests?.push(route.request().url());
+			const agent = agents.find((candidate) => candidate.id === decodeURIComponent(agentMatch[1]));
+			await fulfillJson(route, agent ?? { detail: "Agent not found" }, agent ? 200 : 404);
+			return;
+		}
+		const projectBindingsMatch = url.pathname.match(/^\/v1\/agents\/([^/]+)\/project-bindings$/);
+		if (projectBindingsMatch) {
+			options.projectBindingRequests?.push(route.request().url());
+			await options.projectBindingsGate;
+			if (options.projectBindingsError) {
+				await fulfillJson(
+					route,
+					{ detail: options.projectBindingsError.detail },
+					options.projectBindingsError.status,
+				);
+				return;
+			}
+			const agentId = decodeURIComponent(projectBindingsMatch[1] ?? "");
+			const currentBindings = [
+				...(options.projectBindings ??
+					projectBindings.map((binding) => ({ ...binding, agent_id: agentId }))),
+				...createdProjectBindings,
+			].filter(
+				(binding) =>
+					!(
+						typeof binding === "object" &&
+						binding !== null &&
+						"project_id" in binding &&
+						removedProjectIds.has(String(binding.project_id))
+					),
+			);
+			for (const projectId of addedProjectIds) {
+				if (
+					currentBindings.some(
+						(binding) =>
+							typeof binding === "object" &&
+							binding !== null &&
+							"project_id" in binding &&
+							binding.project_id === projectId,
+					)
+				)
+					continue;
+				currentBindings.push({
+					id: `binding-${projectId}`,
+					agent_id: agentId,
+					project_id: projectId,
+					binding_type: "context",
+					priority: currentBindings.length,
+					default_write_enabled: false,
+					created_at: now.toISOString(),
+				});
+			}
+			await fulfillJson(route, currentBindings);
+			return;
+		}
+		if (
+			url.pathname === "/v1/agents/11111111-1111-4111-8111-111111111111/projects" &&
+			route.request().method() === "PATCH"
+		) {
+			const body = route.request().postDataJSON() as {
+				add_project_ids: string[];
+				remove_project_ids: string[];
+			};
+			options.projectLinkDeltaBodies?.push(body);
+			for (const projectId of body.remove_project_ids) {
+				removedProjectIds.add(projectId);
+				addedProjectIds.delete(projectId);
+			}
+			for (const projectId of body.add_project_ids) {
+				removedProjectIds.delete(projectId);
+				addedProjectIds.add(projectId);
+			}
+			await fulfillJson(route, {
+				agent_id: "11111111-1111-4111-8111-111111111111",
+				added_project_ids: body.add_project_ids,
+				removed_project_ids: body.remove_project_ids,
+			});
+			return;
+		}
+		if (url.pathname === "/v1/dashboard/stats") {
+			await fulfillJson(route, dashboardStats);
+			return;
+		}
+		const agentProjectCreateMatch = url.pathname.match(/^\/v1\/projects\/for-agent\/([^/]+)$/);
+		if (agentProjectCreateMatch && route.request().method() === "POST") {
+			const body = route.request().postDataJSON() as {
+				name?: string;
+				description?: string | null;
+			};
+			const agentId = decodeURIComponent(agentProjectCreateMatch[1] ?? "");
+			const project = {
+				id: "project-created",
+				name: body.name ?? "Created Project",
+				description: body.description ?? null,
+				slug: "created-project",
+				kind: "workspace",
+				origin_environment_id: null,
+				archived_at: null,
+				created_at: now.toISOString(),
+				is_owner: true,
+				owner_display: "Dev User",
+				owner_handle: "dev-user",
+				skill_count: 0,
+				vault_count: 0,
+				agent_count: 1,
+				member_count: 0,
+			};
+			options.projectCreateBodies?.push(body);
+			createdProjects.push(project);
+			createdProjectBindings.push({
+				id: "binding-project-created",
+				agent_id: agentId,
+				project_id: project.id,
+				binding_type: "context",
+				priority: 3,
+				default_write_enabled: false,
+				created_at: now.toISOString(),
+			});
+			await fulfillJson(route, project, 201);
+			return;
+		}
+		if (url.pathname === "/v1/projects" && route.request().method() === "POST") {
+			const body = route.request().postDataJSON() as {
+				name?: string;
+				description?: string | null;
+			};
+			options.projectCreateBodies?.push(body);
+			const project = {
+				id: "project-created",
+				name: body.name ?? "Created Project",
+				description: body.description ?? null,
+				slug: "created-project",
+				kind: "workspace",
+				origin_environment_id: null,
+				archived_at: null,
+				created_at: now.toISOString(),
+				is_owner: true,
+				owner_display: "Dev User",
+				owner_handle: "dev-user",
+			};
+			createdProjects.push(project);
+			await fulfillJson(route, project);
+			return;
+		}
+		if (url.pathname === "/v1/projects") {
+			options.projectRequests?.push(route.request().url());
+			await options.projectsGate;
+			if (options.projectsResponse) {
+				await fulfillJson(route, options.projectsResponse.body, options.projectsResponse.status);
+				return;
+			}
+			await fulfillJson(route, [...(options.projects ?? projects), ...createdProjects]);
+			return;
+		}
+		const projectDetailMatch = url.pathname.match(/^\/v1\/projects\/([^/]+)$/);
+		if (projectDetailMatch && route.request().method() === "GET") {
+			options.projectRequests?.push(route.request().url());
+			await options.projectsGate;
+			const projectId = decodeURIComponent(projectDetailMatch[1] ?? "");
+			const project = [...(options.projects ?? projects), ...createdProjects].find(
+				(candidate) =>
+					typeof candidate === "object" &&
+					candidate !== null &&
+					"id" in candidate &&
+					candidate.id === projectId,
+			);
+			await fulfillJson(route, project ?? { detail: "Project not found" }, project ? 200 : 404);
+			return;
+		}
+		if (url.pathname === "/v1/skills") {
+			options.skillRequests?.push(route.request().url());
+			const projectId = url.searchParams.get("project_id") ?? "";
+			const pageNumber = Number(url.searchParams.get("page") ?? "1");
+			const pageSize = Number(url.searchParams.get("page_size") ?? "25");
+			const projectSkills = options.skillsByProjectId?.[projectId] ?? [];
+			const start = (pageNumber - 1) * pageSize;
+			await fulfillJson(route, {
+				items: projectSkills.slice(start, start + pageSize),
+				total: projectSkills.length,
+				page: pageNumber,
+				page_size: pageSize,
+			});
+			return;
+		}
+		const projectSkillCreateMatch = url.pathname.match(/^\/v1\/projects\/([^/]+)\/skills$/);
+		if (projectSkillCreateMatch && route.request().method() === "POST") {
+			options.skillCreateRequests?.push({
+				projectId: decodeURIComponent(projectSkillCreateMatch[1] ?? ""),
+				body: route.request().postDataJSON(),
+			});
+			await fulfillJson(route, {}, 201);
+			return;
+		}
+		const projectSkillDetailMatch = url.pathname.match(/^\/v1\/projects\/([^/]+)\/skills\/(.+)$/);
+		if (projectSkillDetailMatch && route.request().method() === "GET") {
+			options.skillDetailRequests?.push(route.request().url());
+			const projectId = decodeURIComponent(projectSkillDetailMatch[1] ?? "");
+			const skillKey = decodeURIComponent(projectSkillDetailMatch[2] ?? "");
+			const response = options.skillDetailResponses?.[`${projectId}/${skillKey}`];
+			await fulfillJson(
+				route,
+				response?.body ?? { detail: "Skill not found" },
+				response?.status ?? 404,
+			);
+			return;
+		}
+		if (/^\/v1\/skills\/.+/.test(url.pathname) && route.request().method() === "GET") {
+			options.legacySkillDetailRequests?.push(route.request().url());
+			await fulfillJson(route, { detail: "Skill not found" }, 404);
+			return;
+		}
+		if (url.pathname === "/v1/vault" && route.request().method() === "POST") {
+			await fulfillJson(route, {});
+			return;
+		}
+		if (url.pathname === "/v1/vault") {
+			options.vaultRequests?.push(route.request().url());
+			const projectId = url.searchParams.get("project_id");
+			const availableVaults = options.vaultItems ?? vaults.items;
+			const items = projectId
+				? availableVaults.filter((vault) => vault.project_ids.includes(projectId))
+				: availableVaults;
+			await fulfillJson(route, {
+				...vaults,
+				items,
+				total: items.length,
+				page: Number(url.searchParams.get("page") ?? "1"),
+				page_size: Number(url.searchParams.get("page_size") ?? "25"),
+			});
+			return;
+		}
+		if (url.pathname === "/v1/vault/requests" && route.request().method() === "GET") {
+			await fulfillJson(route, []);
+			return;
+		}
+		if (url.pathname === "/v1/vault/detail") {
+			const vaultId = url.searchParams.get("vault_id");
+			const vault = (options.vaultItems ?? vaults.items).find(
+				(candidate) => candidate.id === vaultId,
+			);
+			await fulfillJson(route, vault ?? { detail: "Vault not found" }, vault ? 200 : 404);
+			return;
+		}
+		if (/^\/v1\/vault\/[^/]+\/items$/.test(url.pathname)) {
+			if (route.request().method() === "PUT") {
+				options.vaultItemWriteRequests?.push({
+					url: route.request().url(),
+					body: route.request().postDataJSON(),
+				});
+			}
+			await fulfillJson(route, { "(default)": ["API_KEY", "ACCESS_TOKEN"] });
+			return;
+		}
+		if (url.pathname === "/v1/connectors") {
+			await options.connectorConnectionsGate;
+			if (options.connectorConnectionsResponse) {
+				await fulfillJson(
+					route,
+					options.connectorConnectionsResponse.body,
+					options.connectorConnectionsResponse.status,
+				);
+				return;
+			}
+			await fulfillJson(route, options.connectorConnections ?? []);
+			return;
+		}
+		const connectorAuthFieldsMatch = url.pathname.match(/^\/v1\/connectors\/([^/]+)\/auth-fields$/);
+		if (connectorAuthFieldsMatch && route.request().method() === "GET") {
+			const appName = decodeURIComponent(connectorAuthFieldsMatch[1] ?? "");
+			await fulfillJson(
+				route,
+				options.connectorAuthFields?.[appName] ?? { expected_input_fields: [] },
+			);
+			return;
+		}
+		const connectorCredentialsMatch = url.pathname.match(
+			/^\/v1\/connectors\/([^/]+)\/connect-credentials$/,
+		);
+		if (connectorCredentialsMatch && route.request().method() === "POST") {
+			options.connectorCredentialRequests?.push({
+				appName: decodeURIComponent(connectorCredentialsMatch[1] ?? ""),
+				body: route.request().postDataJSON(),
+			});
+			await fulfillJson(route, { connected: true }, 201);
+			return;
+		}
+		const connectorOAuthMatch = url.pathname.match(/^\/v1\/connectors\/([^/]+)\/connect$/);
+		if (connectorOAuthMatch && route.request().method() === "POST") {
+			options.connectorOAuthRequests?.push({
+				appName: decodeURIComponent(connectorOAuthMatch[1] ?? ""),
+				body: route.request().postDataJSON(),
+			});
+			await fulfillJson(route, { connect_url: "https://accounts.example.test/oauth" });
+			return;
+		}
+		const connectorAppMatch = url.pathname.match(/^\/v1\/connectors\/available\/([^/]+)$/);
+		if (connectorAppMatch) {
+			options.connectorMetadataRequests?.push(route.request().url());
+			await options.connectorMetadataGate;
+			const app = (
+				options.connectorCatalog ?? [
+					{
+						name: "gmail",
+						display_name: "Gmail",
+						logo: "",
+						description: "Email connector",
+						auth_type: "oauth",
+						connect_disabled: false,
+						connect_disabled_reason: null,
+					},
+				]
+			).find((item) => item.name === decodeURIComponent(connectorAppMatch[1]));
+			await fulfillJson(route, app ?? { detail: "App not found" }, app ? 200 : 404);
+			return;
+		}
+		if (/^\/v1\/connectors\/[^/]+\/tools$/.test(url.pathname)) {
+			await fulfillJson(route, []);
+			return;
+		}
+		if (url.pathname === "/v1/connectors/available") {
+			await options.connectorCatalogGate;
+			if (options.connectorCatalogResponse) {
+				await fulfillJson(
+					route,
+					options.connectorCatalogResponse.body,
+					options.connectorCatalogResponse.status,
+				);
+				return;
+			}
+			await fulfillJson(route, {
+				items: options.connectorCatalog ?? [
+					{
+						name: "gmail",
+						display_name: "Gmail",
+						logo: "",
+						description: "Email connector",
+						auth_type: "oauth",
+						connect_disabled: false,
+						connect_disabled_reason: null,
+					},
+				],
+				total: 48,
+				page: Number(url.searchParams.get("page") ?? "1"),
+				page_size: 24,
+			});
+			return;
+		}
+		if (url.pathname === "/v1/sessions") {
+			options.sessionRequests?.push(route.request().url());
+			await fulfillJson(route, options.sessionsPage ?? sessions);
+			return;
+		}
+		const memoryDetailMatch = url.pathname.match(/^\/v1\/memories\/([^/]+)$/);
+		if (memoryDetailMatch) {
+			await options.memoryDetailGate;
+			if (options.memoryDetailResponse) {
+				await fulfillJson(
+					route,
+					options.memoryDetailResponse.body,
+					options.memoryDetailResponse.status,
+				);
+				return;
+			}
+			const memory = memories.items.find(
+				(item) => item.id === decodeURIComponent(memoryDetailMatch[1]),
+			);
+			await fulfillJson(route, memory ?? { detail: "Memory not found" }, memory ? 200 : 404);
+			return;
+		}
+		if (url.pathname === "/v1/memories") {
+			await fulfillJson(route, memories);
+			return;
+		}
+		if (url.pathname === "/v1/settings") {
+			await fulfillJson(route, { memory_provider: "builtin", mem0_api_key: null });
+			return;
+		}
+		if (url.pathname === "/v1/auth/keys") {
+			await fulfillJson(route, []);
+			return;
+		}
+		await fulfillJson(route, {});
+	});
+}
+
+test("sidebar shortcut preserves the desktop focus rail and Escape closes the mobile drawer", async ({
+	page,
+}) => {
+	await stubDashboardApi(page);
+	await page.setViewportSize({ width: 1280, height: 800 });
+	await page.goto("/");
+
+	const trigger = page.getByRole("button", { name: "Toggle Sidebar" });
+	const separator = page.locator('header [data-slot="separator"]');
+	const focusRail = page.getByTestId("app-sidebar-agent-rail");
+	const navigationPane = page.getByTestId("app-sidebar");
+	const desktopSidebar = page.locator('[data-slot="sidebar"][data-state]');
+	await expect(trigger).toBeHidden();
+	await expect(separator).toBeHidden();
+	await expect(focusRail).toBeVisible();
+	await expect(desktopSidebar).toHaveAttribute("data-state", "expanded");
+	await expect(page.getByTestId("app-sidebar-agent-tile")).toHaveCount(2);
+	await page.keyboard.press("ControlOrMeta+b");
+	await expect(desktopSidebar).toHaveAttribute("data-state", "collapsed");
+	await expect
+		.poll(async () => {
+			const [railBox, paneBox] = await Promise.all([
+				focusRail.boundingBox(),
+				navigationPane.boundingBox(),
+			]);
+			if (!railBox || !paneBox) return false;
+			return paneBox.x + paneBox.width <= railBox.x + 1;
+		})
+		.toBe(true);
+	await expect(focusRail).toBeVisible();
+
+	await page.setViewportSize({ width: 320, height: 568 });
+	await expect(trigger).toBeVisible();
+	await expect(separator).toBeVisible();
+	await trigger.click();
+	const drawer = page.getByRole("dialog", { name: "Sidebar" });
+	await expect(drawer).toBeVisible();
+	await page.keyboard.press("Escape");
+	await expect(drawer).toBeHidden();
+});
+
+test("connected primary Project navigation stays hidden until scope resolves", async ({ page }) => {
+	let releaseBindings: (() => void) | undefined;
+	const projectBindingsGate = new Promise<void>((resolve) => {
+		releaseBindings = resolve;
+	});
+	await stubDashboardApi(page, [], { projectBindingsGate });
+
+	await page.goto("/agents/11111111-1111-4111-8111-111111111111");
+	const sidebar = page.getByTestId("app-sidebar");
+	const workspaceGroup = sidebar.getByRole("group", { name: "Workspace", exact: true });
+	await expect(workspaceGroup).toBeVisible();
+	await expect(workspaceGroup.getByRole("link")).toHaveText(["Projects"]);
+	await expect(sidebar.getByRole("group", { name: "Shared", exact: true })).toBeVisible();
+
+	if (!releaseBindings) throw new Error("Project binding gate was not initialized");
+	releaseBindings();
+	await expect(workspaceGroup.getByRole("link")).toHaveText(["Projects", "Skills", "Vaults"]);
+	expect(
+		await sidebar.locator('[data-slot="sidebar-group-label"]').allTextContents(),
+	).not.toContain("Smoke Project");
+});
+
+test("connected agent settings protects an unsaved display name", async ({ page }) => {
+	await stubDashboardApi(page);
+	await page.goto("/agents/11111111-1111-4111-8111-111111111111/settings");
+	const displayName = page.getByRole("textbox", { name: "Agent name" });
+	await displayName.fill("Unsaved agent name");
+
+	const sessionsLink = page
+		.locator('a[href="/agents/11111111-1111-4111-8111-111111111111/sessions"]')
+		.first();
+	await sessionsLink.click();
+	const warning = page.getByRole("alertdialog", { name: "Discard unsaved changes?" });
+	await expect(warning).toBeVisible();
+	await expect(page).toHaveURL(/\/agents\/11111111-1111-4111-8111-111111111111\/settings$/);
+
+	await warning.getByRole("button", { name: "Keep editing" }).click();
+	await expect(displayName).toHaveValue("Unsaved agent name");
+	await sessionsLink.click();
+	await warning.getByRole("button", { name: "Discard changes" }).click();
+	await expect(page).toHaveURL(/\/agents\/11111111-1111-4111-8111-111111111111\/sessions$/);
+});
+
+test("connected Agent Memories keeps established UI through nested list and detail navigation", async ({
+	page,
+}) => {
+	await stubDashboardApi(page);
+	await page.goto("/agents/11111111-1111-4111-8111-111111111111/memories");
+
+	const main = page.locator("main");
+	await expect(main.getByRole("heading", { name: "Memories", level: 1 })).toBeVisible({
+		timeout: 15_000,
+	});
+	await expect(page).toHaveTitle("Memories · iforge");
+	await expect(page.locator('[data-slot="breadcrumb-page"]')).toHaveText("Memories");
+	await expect(
+		main.getByText("Memories are shared across all agents.", {
+			exact: true,
+		}),
+	).toHaveCount(1);
+	await expect(main.getByTestId("memories-surface")).toBeVisible();
+	const memoryCard = main.locator("article").filter({ hasText: "Shared account context" });
+	await expect(memoryCard).toBeVisible();
+	await expect(memoryCard.getByRole("link")).toHaveAttribute(
+		"href",
+		"/agents/11111111-1111-4111-8111-111111111111/memories/memory-smoke-1",
+	);
+	await page.setViewportSize({ width: 390, height: 844 });
+	const deleteMemoryButton = memoryCard.getByRole("button", { name: /Delete memory:/ });
+	const deleteMemoryBox = await deleteMemoryButton.boundingBox();
+	expect(deleteMemoryBox?.width ?? 0).toBeGreaterThanOrEqual(44);
+	expect(deleteMemoryBox?.height ?? 0).toBeGreaterThanOrEqual(44);
+	expect(
+		await page
+			.locator("html")
+			.evaluate((element) => element.scrollWidth <= element.clientWidth + 1),
+	).toBe(true);
+
+	await page.setViewportSize({ width: 1280, height: 900 });
+	await memoryCard.getByRole("link").click();
+	await expect(page).toHaveURL(
+		"/agents/11111111-1111-4111-8111-111111111111/memories/memory-smoke-1",
+	);
+	await expect(
+		main.getByRole("heading", { name: "Shared account context", level: 1 }),
+	).toBeVisible();
+	await expect(main.getByRole("button", { name: "Delete", exact: true })).toBeVisible();
+	await expect(main.getByRole("link", { name: "View session" })).toHaveAttribute(
+		"href",
+		"/agents/11111111-1111-4111-8111-111111111111/sessions/session-smoke-1",
+	);
+
+	const sidebar = page.getByTestId("app-sidebar");
+	const sessionsLink = sidebar.getByRole("link", { name: "Sessions", exact: true });
+	const memoriesLink = sidebar.getByRole("link", { name: "Memories", exact: true });
+	await expect(memoriesLink).toHaveAttribute(
+		"href",
+		"/agents/11111111-1111-4111-8111-111111111111/memories",
+	);
+	await expect(sidebar.getByRole("link", { name: "Connectors", exact: true })).toBeVisible();
+	expect(await sessionsLink.evaluate((element) => element.hasAttribute("data-active"))).toBe(false);
+	expect(await memoriesLink.evaluate((element) => element.hasAttribute("data-active"))).toBe(true);
+	await memoriesLink.click();
+	await expect(page).toHaveURL("/agents/11111111-1111-4111-8111-111111111111/memories");
+});
+
+test("nested account resources fail closed when the Agent does not exist", async ({ page }) => {
+	const accountResourceRequests: string[] = [];
+	const projectResourceRequests: string[] = [];
+	await stubDashboardApi(page, [], { accountResourceRequests, projectResourceRequests });
+	const main = page.locator("main");
+
+	for (const path of [
+		"/agents/ffffffff-ffff-4fff-8fff-ffffffffffff/memories/memory-smoke-1",
+		"/agents/ffffffff-ffff-4fff-8fff-ffffffffffff/connectors/gmail",
+		"/agents/ffffffff-ffff-4fff-8fff-ffffffffffff/project-access/project-smoke",
+		"/agents/ffffffff-ffff-4fff-8fff-ffffffffffff/skills/scoped-skill?project=project-smoke",
+		"/agents/ffffffff-ffff-4fff-8fff-ffffffffffff/vaults/scoped-vault?project=project-smoke&vault=vault-scoped",
+	]) {
+		await page.goto(path);
+		await expect(main.getByText("Agent not found", { exact: true })).toBeVisible();
+		await expect(
+			main.getByText("This Agent does not exist or is no longer available."),
+		).toBeVisible();
+		await expect(page).toHaveURL(path);
+		await main.getByRole("button", { name: "Back to Agents" }).click();
+		await expect(page).toHaveURL("/agents");
+	}
+
+	expect(accountResourceRequests).toEqual([]);
+	expect(projectResourceRequests).toEqual([]);
+});
+
+test("connected all-agent detail loading, not-found, and error states keep Agent scope", async ({
+	page,
+}) => {
+	let releaseMemory: (() => void) | undefined;
+	let releaseConnector: (() => void) | undefined;
+	const memoryDetailGate = new Promise<void>((resolve) => {
+		releaseMemory = resolve;
+	});
+	const connectorMetadataGate = new Promise<void>((resolve) => {
+		releaseConnector = resolve;
+	});
+	await stubDashboardApi(page, [], {
+		memoryDetailGate,
+		connectorMetadataGate,
+		connectorConnectionsResponse: { body: { detail: "Connections unavailable" }, status: 503 },
+	});
+	const main = page.locator("main");
+
+	await page.goto("/agents/11111111-1111-4111-8111-111111111111/memories/memory-smoke-1");
+	await expect(main.locator('[data-slot="skeleton"]').first()).toBeVisible();
+	await expect(page).toHaveURL(
+		"/agents/11111111-1111-4111-8111-111111111111/memories/memory-smoke-1",
+	);
+	releaseMemory?.();
+	await expect(
+		main.getByRole("heading", { name: "Shared account context", level: 1 }),
+	).toBeVisible();
+
+	await page.goto("/agents/11111111-1111-4111-8111-111111111111/memories/missing-memory");
+	await expect(main.getByText("Memory not found", { exact: true })).toBeVisible();
+	await expect(page).toHaveURL(
+		"/agents/11111111-1111-4111-8111-111111111111/memories/missing-memory",
+	);
+	await page.route("**/v1/memories/error-memory", async (route) => {
+		await fulfillJson(route, { detail: "Memory service unavailable" }, 503);
+	});
+	await page.goto("/agents/11111111-1111-4111-8111-111111111111/memories/error-memory");
+	await expect(main.getByText("Couldn't load memory", { exact: true })).toBeVisible({
+		timeout: 12_000,
+	});
+	await expect(page).toHaveURL(
+		"/agents/11111111-1111-4111-8111-111111111111/memories/error-memory",
+	);
+
+	await page.goto("/agents/11111111-1111-4111-8111-111111111111/connectors/gmail");
+	await expect(main.locator('[data-slot="skeleton"]').first()).toBeVisible();
+	await expect(page).toHaveURL("/agents/11111111-1111-4111-8111-111111111111/connectors/gmail");
+	releaseConnector?.();
+	await expect(main.getByRole("heading", { name: "Gmail", level: 1 })).toBeVisible();
+	await expect(main.getByText("Couldn't load connections", { exact: true })).toBeVisible({
+		timeout: 12_000,
+	});
+
+	await page.goto("/agents/11111111-1111-4111-8111-111111111111/connectors/missing-connector");
+	await expect(main.getByText("Connector unavailable", { exact: true })).toBeVisible();
+	await expect(page).toHaveURL(
+		"/agents/11111111-1111-4111-8111-111111111111/connectors/missing-connector",
+	);
+	await page.route("**/v1/connectors/available/error-connector", async (route) => {
+		await fulfillJson(route, { detail: "Connector service unavailable" }, 503);
+	});
+	await page.goto("/agents/11111111-1111-4111-8111-111111111111/connectors/error-connector");
+	await expect(main.getByText("Couldn't load connector", { exact: true })).toBeVisible({
+		timeout: 12_000,
+	});
+	await expect(page).toHaveURL(
+		"/agents/11111111-1111-4111-8111-111111111111/connectors/error-connector",
+	);
+});
+
+test("connector cards complete each authentication flow in Agent scope", async ({ page }) => {
+	const credentialRequests: Array<{ appName: string; body: unknown }> = [];
+	const oauthRequests: Array<{ appName: string; body: unknown }> = [];
+	await stubDashboardApi(page, [], {
+		connectorCatalog: [
+			{
+				name: "gmail",
+				display_name: "Gmail",
+				logo: "",
+				description: "Email connector",
+				auth_type: "oauth",
+				connect_disabled: false,
+				connect_disabled_reason: null,
+			},
+			{
+				name: "api-tool",
+				display_name: "API Tool",
+				logo: "",
+				description: "Credential connector",
+				auth_type: "api_key",
+				connect_disabled: false,
+				connect_disabled_reason: null,
+			},
+			{
+				name: "public-data",
+				display_name: "Public Data",
+				logo: "",
+				description: "No account required",
+				auth_type: "no_auth",
+				connect_disabled: false,
+				connect_disabled_reason: null,
+			},
+			{
+				name: "admin-oauth",
+				display_name: "Admin OAuth",
+				logo: "",
+				description: "Workspace-managed connector",
+				auth_type: "oauth",
+				connect_disabled: true,
+				connect_disabled_reason:
+					"This Connector needs additional OAuth configuration before it can be connected. Contact support to continue.",
+			},
+		],
+		connectorAuthFields: {
+			"api-tool": {
+				expected_input_fields: [
+					{
+						name: "api_key",
+						display_name: "API key",
+						description: "Key used by API Tool",
+						required: true,
+						is_secret: true,
+					},
+				],
+			},
+		},
+		connectorCredentialRequests: credentialRequests,
+		connectorOAuthRequests: oauthRequests,
+	});
+
+	const agentConnectors = "/agents/11111111-1111-4111-8111-111111111111/connectors";
+	await page.goto(agentConnectors);
+	const main = page.locator("main");
+	await expect(main.getByRole("heading", { name: "Connectors", level: 1 })).toBeVisible();
+
+	const gmailCard = main.getByRole("link", { name: "Gmail" }).locator("..");
+	await gmailCard.getByRole("button", { name: "Connect", exact: true }).click();
+	await page.getByRole("dialog").getByLabel("Name (optional)").fill("work-gmail");
+	const popupPromise = page.waitForEvent("popup");
+	await page.getByRole("dialog").getByRole("button", { name: "Continue", exact: true }).click();
+	const popup = await popupPromise;
+	await expect.poll(() => oauthRequests).toHaveLength(1);
+	const oauthRequest = oauthRequests[0];
+	expect(oauthRequest?.appName).toBe("gmail");
+	expect(oauthRequest?.body).toMatchObject({ alias: "work-gmail" });
+	if (
+		typeof oauthRequest?.body !== "object" ||
+		oauthRequest.body === null ||
+		!("redirect_url" in oauthRequest.body) ||
+		typeof oauthRequest.body.redirect_url !== "string"
+	) {
+		throw new Error("Expected the OAuth request to include a redirect_url");
+	}
+	expect(new URL(oauthRequest.body.redirect_url).pathname).toBe(`${agentConnectors}/gmail`);
+	await expect(page.getByRole("dialog")).not.toBeVisible();
+	await popup.close();
+
+	const publicDataCard = main.getByRole("link", { name: "Public Data" }).locator("..");
+	await expect(publicDataCard.getByText("Ready", { exact: true })).toBeVisible();
+
+	const unavailable = main.getByLabel(/Unavailable: This Connector needs additional OAuth/);
+	await expect(unavailable).toBeVisible();
+
+	const apiToolCard = main.getByRole("link", { name: "API Tool" }).locator("..");
+	await apiToolCard.getByRole("button", { name: "Connect", exact: true }).click();
+	const credentialDialog = page.getByRole("dialog", { name: "Connect API Tool" });
+	await credentialDialog.getByLabel("API key").fill("browser-secret-key");
+	await credentialDialog.getByRole("button", { name: "Connect", exact: true }).click();
+	await expect(credentialDialog).toHaveCount(0);
+	await expect
+		.poll(() => credentialRequests)
+		.toEqual([
+			{
+				appName: "api-tool",
+				body: { credentials: { api_key: "browser-secret-key" } },
+			},
+		]);
+	await expect(page).toHaveURL(agentConnectors);
+});
+
+async function stubConnectedAgentResources(page: Page) {
+	const skillRequests: string[] = [];
+	const skillCreateRequests: Array<{ projectId: string; body: unknown }> = [];
+	const vaultRequests: string[] = [];
+	const vaultItemWriteRequests: Array<{ url: string; body: unknown }> = [];
+	const projectCreateBodies: unknown[] = [];
+	const projectLinkDeltaBodies: unknown[] = [];
+	const projectBindingRequests: string[] = [];
+	const projectRequests: string[] = [];
+	const longContextProjectName =
+		"Automation Library for exceptionally long production workflow names across several teams";
+	const longContextProjectSlug =
+		"automation-library-for-exceptionally-long-production-workflow-names-across-several-teams";
+	const longContextProjectDescription =
+		"Reusable instructions and protected Vault access for exceptionally long production workflows across several teams";
+	const projectAccessBindings = [
+		{
+			...projectBindings[0],
+		},
+		{
+			id: "binding-context-later",
+			agent_id: "11111111-1111-4111-8111-111111111111",
+			project_id: "project-context-later",
+			binding_type: "context",
+			priority: 2,
+			default_write_enabled: false,
+			created_at: "2026-07-04T12:02:00.000Z",
+		},
+		{
+			id: "binding-context-first",
+			agent_id: "11111111-1111-4111-8111-111111111111",
+			project_id: "project-context-first",
+			binding_type: "context",
+			priority: 1,
+			default_write_enabled: false,
+			created_at: "2026-07-04T12:01:00.000Z",
+		},
+	];
+	const projectAccessProjects = [
+		...projects,
+		{
+			id: "project-context-first",
+			name: "Team Knowledge",
+			skill_count: 2,
+			vault_count: 2,
+			member_count: 0,
+			agent_count: 1,
+			slug: "team-knowledge",
+			description: "Shared review instructions and protected Vault access",
+			kind: "workspace",
+			origin_environment_id: null,
+			archived_at: null,
+			created_at: now.toISOString(),
+			is_owner: false,
+			owner_display: "Teammate",
+			owner_handle: "teammate",
+		},
+		{
+			id: "project-context-later",
+			name: longContextProjectName,
+			slug: longContextProjectSlug,
+			description: longContextProjectDescription,
+			kind: "workspace",
+			origin_environment_id: null,
+			archived_at: null,
+			created_at: now.toISOString(),
+			is_owner: true,
+			owner_display: "Dev User",
+			owner_handle: "dev-user",
+		},
+		{
+			id: "project-batch-second",
+			name: "Release Project",
+			slug: "release-project",
+			description: "Release checklists and protected Vault access",
+			kind: "workspace",
+			origin_environment_id: null,
+			archived_at: null,
+			created_at: now.toISOString(),
+			is_owner: true,
+			owner_display: "Dev User",
+			owner_handle: "dev-user",
+		},
+	];
+	const projectSkill = (projectId: string, skillKey: string, name: string) => ({
+		id: `${projectId}-${skillKey}`,
+		skill_key: skillKey,
+		name,
+		description: `${name} instructions`,
+		version: 1,
+		source: projectId === "project-smoke" ? "agent_sync" : "cloud",
+		authority: projectId === "project-smoke" ? "agent_sync" : "cloud",
+		source_repo: null,
+		agent_types: ["codex"],
+		file_count: 1,
+		content_hash: "a".repeat(64),
+		is_active: true,
+		created_at: now.toISOString(),
+		updated_at: now.toISOString(),
+		project_id: projectId,
+		project_name: projectId === "project-smoke" ? "Smoke Project" : "Team Knowledge",
+		project_kind: projectId === "project-smoke" ? "environment" : "workspace",
+	});
+	const projectAccessVaults = [
+		vaults.items[0],
+		{
+			...vaults.items[0],
+			id: "vault-team",
+			slug: "team-vault",
+			name: "Team Vault",
+			project_ids: ["project-context-first"],
+		},
+		{
+			...vaults.items[0],
+			id: "vault-shared",
+			slug: "shared-vault",
+			name: "Shared Vault",
+			project_ids: ["project-smoke", "project-context-first"],
+		},
+		vaults.items[1],
+	];
+
+	await stubDashboardApi(page, [], {
+		projectBindings: projectAccessBindings,
+		projects: projectAccessProjects,
+		skillDetailResponses: {
+			"project-context-first/team-only": {
+				body: projectSkill("project-context-first", "team-only", "Team-only Skill"),
+				status: 200,
+			},
+		},
+		skillsByProjectId: {
+			"project-smoke": [
+				projectSkill("project-smoke", "primary-only", "Primary-only Skill"),
+				projectSkill("project-smoke", "shared-workflow", "Shared Workflow"),
+			],
+			"project-context-first": [
+				projectSkill("project-context-first", "team-only", "Team-only Skill"),
+				projectSkill("project-context-first", "shared-workflow", "Shared Workflow"),
+			],
+		},
+		skillRequests,
+		skillCreateRequests,
+		vaultRequests,
+		vaultItemWriteRequests,
+		vaultItems: projectAccessVaults,
+		projectCreateBodies,
+		projectLinkDeltaBodies,
+		projectBindingRequests,
+		projectRequests,
+	});
+
+	return {
+		projectAccessVaults,
+		skillRequests,
+		skillCreateRequests,
+		vaultRequests,
+		vaultItemWriteRequests,
+		projectCreateBodies,
+		projectLinkDeltaBodies,
+		projectBindingRequests,
+		projectRequests,
+		longContextProjectName,
+		longContextProjectSlug,
+	};
+}
+
+test("connected overview shows sessions and resources according to agent capabilities", async ({
+	page,
+}) => {
+	await page.clock.setFixedTime(now);
+	const agent = agents[0];
+	if (!agent) throw new Error("Missing Connected Agent fixture");
+	const currentAgent = { ...agent, adapter_modules: ["sessions", "skills"] };
+	const currentSessions = { ...overviewSessions };
+	const sessionRequests: string[] = [];
+	await stubDashboardApi(page, [], { sessionsPage: currentSessions, sessionRequests });
+	await page.route("**/v1/agents", (route) =>
+		fulfillJson(
+			route,
+			agents.map((item) => (item.id === agent.id ? currentAgent : item)),
+		),
+	);
+	await page.route(`**/v1/agents/${agent.id}`, (route) => fulfillJson(route, currentAgent));
+	for (const { sessionCount, syncDisabled, ...viewport } of [
+		{ width: 1440, height: 900, sessionCount: 0, syncDisabled: false },
+		{ width: 1440, height: 900, sessionCount: 1, syncDisabled: false },
+		{ width: 1440, height: 900, sessionCount: 3, syncDisabled: false },
+		{ width: 390, height: 844, sessionCount: 3, syncDisabled: false },
+		{ width: 320, height: 800, sessionCount: 3, syncDisabled: true },
+	]) {
+		Object.assign(currentSessions, {
+			items: overviewSessions.items.slice(0, sessionCount),
+			total: sessionCount,
+		});
+		currentAgent.sync_enabled = !syncDisabled;
+		await page.setViewportSize(viewport);
+		await page.goto(`/agents/${agent.id}`);
+		const main = page.locator("main");
+		const status = main.locator('[data-overview-status="status"]');
+		await expect(status).toContainText(syncDisabled ? "Setup" : "Live");
+		await expect(status).toContainText(agent.machine_name);
+		await expect(status.getByRole("link", { name: "Status", exact: true })).toHaveAttribute(
+			"href",
+			`/agents/${agent.id}/settings`,
+		);
+		await expect(
+			main.getByRole("region", { name: "Recent sessions" }).getByRole("article"),
+		).toHaveCount(sessionCount);
+		await expect(main.locator('[data-overview-module="skills"]')).toContainText("skill");
+		await expect(main.locator('[data-overview-module="vaults"]')).toContainText("1 vault");
+		await expect(main.locator('[data-overview-module="memories"]')).toContainText("1 memory");
+		await expect(main.locator('[data-overview-module="connectors"]')).toContainText("app");
+		await expect(
+			main.locator(
+				'[data-overview-section="tools"], [data-overview-module="channels"], [data-overview-module="model-provider"]',
+			),
+		).toHaveCount(0);
+	}
+	expect(sessionRequests.every((url) => new URL(url).searchParams.get("page_size") === "3")).toBe(
+		true,
+	);
+	currentAgent.adapter_modules = [];
+	sessionRequests.length = 0;
+	await page.goto(`/agents/${agent.id}`);
+	await expect(page.locator('[data-overview-status="status"]')).toContainText("Setup");
+	await expect(page.getByRole("region", { name: "Recent sessions" })).toHaveCount(0);
+	await expect(page.locator('main [data-overview-module="skills"]')).toHaveCount(0);
+	expect(sessionRequests).toEqual([]);
+});
+
+test("connected agent shares the Project catalog and preserves scoped Skills and Vaults", async ({
+	page,
+}) => {
+	const {
+		skillRequests,
+		projectCreateBodies,
+		projectLinkDeltaBodies,
+		projectBindingRequests,
+		projectRequests,
+		longContextProjectName,
+		longContextProjectSlug,
+	} = await stubConnectedAgentResources(page);
+
+	await page.setViewportSize({ width: 1280, height: 900 });
+	const main = page.locator("main");
+	await page.goto("/agents/11111111-1111-4111-8111-111111111111/project-access");
+	await expect(main.getByRole("heading", { name: "Projects", level: 1 })).toBeVisible({
+		timeout: 15_000,
+	});
+	const projectStack = main.getByTestId("agent-project-stack");
+	const projectGrid = projectStack.getByTestId("agent-project-grid");
+	const projectCards = projectGrid.getByTestId("agent-project-card");
+	await expect(projectCards).toHaveCount(4);
+	const linkedProjects = projectStack.getByRole("region", { name: "Linked Projects", exact: true });
+	const availableProjects = projectStack.getByRole("region", { name: "Available Projects" });
+	await expect(linkedProjects.getByText("Linked", { exact: true }).locator("..")).toHaveText(
+		"Linked2",
+	);
+	await expect(availableProjects.getByText("Available", { exact: true }).locator("..")).toHaveText(
+		"Available2",
+	);
+	await expect(linkedProjects.getByTestId("agent-project-card")).toHaveCount(2);
+	await expect(availableProjects.getByTestId("agent-project-card")).toHaveCount(2);
+	const teamCard = projectCards.filter({ hasText: "Team Knowledge" });
+	const longCard = projectCards.filter({ hasText: longContextProjectName });
+	const releaseCard = projectCards.filter({ hasText: "Release Project" });
+	await expect(projectCards.nth(0)).toContainText(longContextProjectName);
+	await expect(teamCard).toContainText("Viewer");
+	await expect(teamCard).toContainText("by Teammate");
+	await expect(teamCard.getByRole("button")).toHaveText(["Unlink"]);
+	await expect(
+		releaseCard.getByRole("button", { name: "Link Release Project", exact: true }),
+	).toBeVisible();
+	await expect(projectStack.getByRole("button", { name: "Manage projects" })).toHaveCount(0);
+	await expect(projectStack.getByRole("link", { name: "Open Smoke Project" })).toHaveCount(0);
+	await expect(releaseCard.getByRole("link", { name: "Open Release Project" })).toHaveAttribute(
+		"href",
+		/\/agents\/[^/]+\/project-access\/project-batch-second$/,
+	);
+	const search = projectStack.getByPlaceholder("Search projects…");
+	await search.fill("protected");
+	await expect(linkedProjects.getByTestId("agent-project-card")).toHaveCount(2);
+	await expect(availableProjects.getByTestId("agent-project-card")).toHaveCount(1);
+	await expect(availableProjects.getByText("Available", { exact: true }).locator("..")).toHaveText(
+		"Available1",
+	);
+	await search.fill("Teammate");
+	await expect(projectCards).toHaveCount(1);
+	await expect(teamCard).toBeVisible();
+	await expect(linkedProjects.getByText("Linked", { exact: true }).locator("..")).toHaveText(
+		"Linked1",
+	);
+	await expect(availableProjects).toHaveCount(0);
+	await search.fill("Release");
+	await expect(releaseCard).toBeVisible();
+	await expect(linkedProjects).toHaveCount(0);
+	await expect(availableProjects.getByTestId("agent-project-card")).toHaveCount(1);
+	await search.fill("[]$");
+	await expect(projectStack.getByText("No matching Projects", { exact: true })).toBeVisible();
+	await expect(projectStack.getByRole("region")).toHaveCount(0);
+	await search.fill("");
+	await expect(projectCards).toHaveCount(4);
+	await expect(
+		projectStack.getByRole("button", { name: "Create project", exact: true }),
+	).toBeVisible();
+	await projectStack.getByRole("button", { name: "Create project", exact: true }).click();
+	const createProjectDialog = page.getByRole("dialog", { name: "Create project" });
+	await createProjectDialog.getByLabel("Name").fill("Release Review");
+	await createProjectDialog
+		.getByLabel("Description")
+		.fill("Review instructions and protected Vault access");
+	await createProjectDialog.getByRole("button", { name: "Create project" }).click();
+	await expect(createProjectDialog).toHaveCount(0);
+	await expect
+		.poll(() => projectCreateBodies)
+		.toEqual([
+			{
+				name: "Release Review",
+				description: "Review instructions and protected Vault access",
+			},
+		]);
+	expect(projectLinkDeltaBodies).toEqual([]);
+	await expect(projectGrid.getByTestId("agent-project-card")).toHaveCount(5);
+	await expect(linkedProjects.getByText("Release Review", { exact: true })).toBeVisible();
+	await expect(linkedProjects.getByText("Linked", { exact: true }).locator("..")).toHaveText(
+		"Linked3",
+	);
+	const createdToast = page
+		.locator("[data-sonner-toast]")
+		.filter({ hasText: "Project created and linked" });
+	await createdToast.getByRole("button", { name: "Open project" }).click();
+	await expect(page).toHaveURL((url) => {
+		return (
+			url.pathname ===
+				"/agents/11111111-1111-4111-8111-111111111111/project-access/project-created" &&
+			url.searchParams.get("from") === "/agents/11111111-1111-4111-8111-111111111111/project-access"
+		);
+	});
+	await page.goBack();
+	await expect(page).toHaveURL(/\/agents\/11111111-1111-4111-8111-111111111111\/project-access$/);
+	const bindingReadsBeforeLink = projectBindingRequests.length;
+	const projectReadsBeforeLink = projectRequests.length;
+	await teamCard.getByRole("button", { name: "Unlink Team Knowledge" }).click();
+	await expect(
+		teamCard.getByRole("button", { name: "Link Team Knowledge", exact: true }),
+	).toBeEnabled();
+	await expect(availableProjects.getByRole("link", { name: "Open Team Knowledge" })).toBeVisible();
+	await expect(linkedProjects.getByText("Linked", { exact: true }).locator("..")).toHaveText(
+		"Linked2",
+	);
+	await expect(availableProjects.getByText("Available", { exact: true }).locator("..")).toHaveText(
+		"Available3",
+	);
+	let releaseProjectRefresh = () => {};
+	const projectRefreshGate = new Promise<void>((resolve) => {
+		releaseProjectRefresh = resolve;
+	});
+	await page.route("**/v1/projects", async (route) => {
+		await projectRefreshGate;
+		await route.fallback();
+	});
+	try {
+		await releaseCard.getByRole("button", { name: "Link Release Project", exact: true }).click();
+		await expect(linkedProjects.getByRole("link", { name: "Open Release Project" })).toBeVisible();
+		await expect(releaseCard.getByRole("button", { name: "Unlink Release Project" })).toHaveText(
+			"Linking…",
+		);
+	} finally {
+		releaseProjectRefresh();
+	}
+	await expect(releaseCard.getByRole("button", { name: "Unlink Release Project" })).toHaveText(
+		"Unlink",
+	);
+	await expect(linkedProjects.getByText("Linked", { exact: true }).locator("..")).toHaveText(
+		"Linked3",
+	);
+	await expect(availableProjects.getByText("Available", { exact: true }).locator("..")).toHaveText(
+		"Available2",
+	);
+	await expect(releaseCard.getByRole("link", { name: "Open Release Project" })).toHaveAttribute(
+		"href",
+		"/agents/11111111-1111-4111-8111-111111111111/project-access/project-batch-second",
+	);
+	await teamCard.getByRole("button", { name: "Link Team Knowledge", exact: true }).click();
+	await expect(teamCard.getByRole("button")).toHaveText(["Unlink"]);
+	await expect(linkedProjects.getByText("Linked", { exact: true }).locator("..")).toHaveText(
+		"Linked4",
+	);
+	await expect(availableProjects.getByText("Available", { exact: true }).locator("..")).toHaveText(
+		"Available1",
+	);
+	await expect
+		.poll(() => projectLinkDeltaBodies)
+		.toEqual([
+			{ add_project_ids: [], remove_project_ids: ["project-context-first"] },
+			{ add_project_ids: ["project-batch-second"], remove_project_ids: [] },
+			{ add_project_ids: ["project-context-first"], remove_project_ids: [] },
+		]);
+	await expect.poll(() => projectBindingRequests.length).toBeGreaterThan(bindingReadsBeforeLink);
+	await expect.poll(() => projectRequests.length).toBeGreaterThan(projectReadsBeforeLink);
+
+	await expect(page.locator("[data-sonner-toast]")).toHaveCount(0);
+
+	await page.setViewportSize({ width: 390, height: 844 });
+	await expect(longCard).toBeVisible();
+	await expect(longCard.getByText(longContextProjectSlug, { exact: true })).toHaveCount(0);
+	expect(
+		await projectStack.evaluate((element) => element.scrollWidth <= element.clientWidth + 1),
+	).toBe(true);
+	expect(
+		await page
+			.locator("html")
+			.evaluate((element) => element.scrollWidth <= element.clientWidth + 1),
+	).toBe(true);
+
+	await page.goto("/agents/11111111-1111-4111-8111-111111111111/project-access/project-smoke");
+	await expect(page).toHaveURL(
+		/\/agents\/11111111-1111-4111-8111-111111111111\/project-access\/project-smoke$/,
+	);
+	await expect(main.getByRole("heading", { name: "Workspace", level: 1 })).toBeVisible();
+	await expect(main.getByRole("button", { name: "Back to Projects", exact: true })).toHaveAttribute(
+		"href",
+		"/agents/11111111-1111-4111-8111-111111111111/project-access",
+	);
+	await expect(main.getByRole("button", { name: /Add to agent/i })).toHaveCount(0);
+	await expect(main.getByRole("heading", { name: "People", exact: true })).toHaveCount(0);
+	await expect(main.getByRole("heading", { name: "Agents", exact: true })).toHaveCount(0);
+	await expect(main.getByRole("button", { name: "Install skill", exact: true })).toBeVisible();
+	await expect(
+		main.getByRole("button", { name: /^(Link|Unlink|Add|Remove) .* (Workspace|Project)$/ }),
+	).toHaveCount(0);
+	await expect(main.getByRole("button", { name: /Add keys to / })).toHaveCount(0);
+	await expect(main.getByRole("button", { name: "View all Skills", exact: true })).toHaveAttribute(
+		"href",
+		"/agents/11111111-1111-4111-8111-111111111111/project-access/project-smoke/skills",
+	);
+	await expect(main.getByRole("button", { name: "View all Vaults", exact: true })).toHaveAttribute(
+		"href",
+		"/agents/11111111-1111-4111-8111-111111111111/project-access/project-smoke/vaults",
+	);
+	await expect(main.getByText("Primary-only Skill", { exact: true })).toBeVisible();
+	await expect(main.getByText("Shared Workflow", { exact: true })).toBeVisible();
+	await expect(main.getByText("Team-only Skill", { exact: true })).toHaveCount(0);
+	await expect(main.getByText("Scoped Vault", { exact: true })).toBeVisible();
+	await expect(main.getByText("Shared Vault", { exact: true })).toBeVisible();
+	await expect(main.getByText("Team Vault", { exact: true })).toHaveCount(0);
+	await expect(main.getByText("Unrelated Vault", { exact: true })).toHaveCount(0);
+	await expect(main.getByRole("link", { name: "Open Primary-only Skill" })).toHaveAttribute(
+		"href",
+		"/agents/11111111-1111-4111-8111-111111111111/skills/primary-only?project=project-smoke",
+	);
+	await expect(main.getByRole("link", { name: "Open vault Scoped Vault" })).toHaveAttribute(
+		"href",
+		"/agents/11111111-1111-4111-8111-111111111111/vaults/scoped-vault?project=project-smoke&vault=vault-scoped&from=" +
+			encodeURIComponent(
+				"/agents/11111111-1111-4111-8111-111111111111/project-access/project-smoke",
+			),
+	);
+	await page.goto(
+		"/agents/11111111-1111-4111-8111-111111111111/project-access/project-smoke/skills",
+	);
+	const focusedSkillsHeading = main.getByRole("heading", { name: "Skills", level: 1 });
+	await expect(focusedSkillsHeading).toBeVisible();
+	await expect(page).toHaveTitle("Skills · iforge");
+	await expect(main.getByRole("button", { name: "Back to Agent Overview" })).toHaveAttribute(
+		"href",
+		"/agents/11111111-1111-4111-8111-111111111111",
+	);
+	await expect(main.getByRole("heading", { name: "Skills", level: 2 })).toHaveCount(0);
+	await expect(main.getByRole("heading", { name: "Vaults", level: 2 })).toHaveCount(0);
+	await expect(main.getByRole("button", { name: "View all Skills" })).toHaveCount(0);
+	await expect(main.getByRole("button", { name: "Install skill", exact: true })).toBeVisible();
+	await expect(main.getByRole("button", { name: "Add skill", exact: true })).toHaveCount(0);
+	await expect(main.getByRole("button", { name: /Link Vault/i })).toHaveCount(0);
+
+	await page.getByRole("button", { name: "Toggle Sidebar", exact: true }).click();
+	const mobileProjectSidebar = page.getByRole("dialog");
+	await expect(mobileProjectSidebar).toBeVisible();
+	await expect(
+		mobileProjectSidebar.getByRole("group", { name: "Workspace", exact: true }),
+	).toBeVisible();
+	await expect(
+		mobileProjectSidebar.getByRole("link", { name: "Skills", exact: true }),
+	).toHaveAttribute("data-active", "");
+	await expect(
+		mobileProjectSidebar.getByRole("link", { name: "Vaults", exact: true }),
+	).not.toHaveAttribute("data-active", "");
+
+	await page.keyboard.press("Escape");
+	await page.setViewportSize({ width: 1280, height: 1200 });
+	await expect(
+		page
+			.getByRole("navigation", { name: "breadcrumb" })
+			.locator('[data-slot="breadcrumb-item"]:visible'),
+	).toHaveText(["Smoke Codex", "Skills"]);
+	await expect(main.getByRole("button", { name: "Back to Agent Overview" })).toHaveCount(0);
+
+	await page.goto(
+		"/agents/11111111-1111-4111-8111-111111111111/project-access/project-smoke/vaults",
+	);
+	const focusedVaultsHeading = main.getByRole("heading", { name: "Vaults", level: 1 });
+	await expect(focusedVaultsHeading).toBeVisible();
+	await expect(page).toHaveTitle("Vaults · iforge");
+	await expect(
+		page
+			.getByRole("navigation", { name: "breadcrumb" })
+			.locator('[data-slot="breadcrumb-item"]:visible'),
+	).toHaveText(["Smoke Codex", "Vaults"]);
+	await expect(main.getByRole("button", { name: "Back to Agent Overview" })).toHaveCount(0);
+	await expect(main.getByRole("heading", { name: "Vaults", level: 2 })).toHaveCount(0);
+	await expect(main.getByRole("heading", { name: "Skills", level: 2 })).toHaveCount(0);
+	await expect(main.getByRole("button", { name: "View all Vaults" })).toHaveCount(0);
+	await expect(main.getByRole("button", { name: /Install skill/i })).toHaveCount(0);
+	await expect(
+		main.getByRole("button", { name: /^(Link|Unlink|Add|Remove) .* (Workspace|Project)$/ }),
+	).toHaveCount(0);
+	const desktopWorkspace = page
+		.getByTestId("app-sidebar")
+		.getByRole("group", { name: "Workspace", exact: true });
+	await expect(desktopWorkspace.getByRole("link", { name: "Vaults", exact: true })).toHaveAttribute(
+		"data-active",
+		"",
+	);
+	await expect(
+		desktopWorkspace.getByRole("link", { name: "Skills", exact: true }),
+	).not.toHaveAttribute("data-active", "");
+	const linkedVaults = main.getByRole("region", { name: "In this Workspace Vaults", exact: true });
+	await expect(linkedVaults.getByTestId("project-vault-card")).toHaveCount(2);
+	await expect(main.getByRole("region", { name: "Available Workspace Vaults" })).toHaveCount(0);
+	await expect(linkedVaults.getByRole("button")).toHaveCount(0);
+	await expect(main.getByRole("button", { name: "Create vault", exact: true })).toHaveCount(0);
+
+	await page.setViewportSize({ width: 1280, height: 1200 });
+	await page.goto(
+		"/agents/11111111-1111-4111-8111-111111111111/project-access/project-context-first",
+	);
+	await expect(main.getByRole("heading", { name: "Team Knowledge", level: 1 })).toBeVisible();
+	await main.getByRole("tab", { name: "Skills", exact: true }).click();
+	await expect(main.getByText("Team-only Skill", { exact: true })).toBeVisible();
+	await expect(main.getByText("Shared Workflow", { exact: true })).toBeVisible();
+	await expect(main.getByText("Primary-only Skill", { exact: true })).toHaveCount(0);
+	await expect(main.getByRole("link", { name: "Open Team-only Skill" })).toHaveAttribute(
+		"href",
+		"/agents/11111111-1111-4111-8111-111111111111/skills/team-only?project=project-context-first",
+	);
+	await main.getByRole("tab", { name: "Vaults", exact: true }).click();
+	await expect(main.getByText("Team Vault", { exact: true })).toBeVisible();
+	await expect(main.getByText("Shared Vault", { exact: true })).toBeVisible();
+	await expect(main.getByRole("button", { name: /^(Add|Remove) .* Project$/ })).toHaveCount(0);
+	await main.getByRole("tab", { name: "Access", exact: true }).click();
+	await expect(main.getByRole("button", { name: "Leave project" })).toBeVisible();
+	await page.goto(
+		"/agents/11111111-1111-4111-8111-111111111111/project-access/project-context-later?tab=vaults",
+	);
+	await expect(main.getByRole("heading", { name: longContextProjectName, level: 1 })).toBeVisible();
+	await expect(
+		main
+			.getByRole("region", { name: "Available Project Vaults" })
+			.getByTestId("project-vault-card"),
+	).toHaveCount(4);
+	await expect(main.getByRole("button", { name: "Create vault", exact: true })).toBeVisible();
+	await main.getByRole("link", { name: "Open vault Unrelated Vault" }).click();
+	await expect(page).toHaveURL(
+		(url) =>
+			url.pathname === "/agents/11111111-1111-4111-8111-111111111111/vaults/unrelated-vault" &&
+			!url.searchParams.has("project"),
+	);
+	await expect(main.getByRole("heading", { name: "Unrelated Vault", level: 1 })).toBeVisible();
+	await main.getByRole("button", { name: "Back to Project" }).click();
+	await expect(main.getByRole("tab", { name: "Vaults", exact: true })).toHaveAttribute(
+		"aria-selected",
+		"true",
+	);
+
+	const requestsBeforeInvalidScope = skillRequests.length;
+	await page.goto(
+		"/agents/11111111-1111-4111-8111-111111111111/project-access/project-inaccessible/skills",
+	);
+	await expect(
+		main.getByText("Project not available to this Agent", { exact: true }),
+	).toBeVisible();
+	await expect(main.getByRole("button", { name: "Back to Projects" })).toHaveAttribute(
+		"href",
+		"/agents/11111111-1111-4111-8111-111111111111/project-access",
+	);
+	await expect(main.getByRole("heading", { name: "Skills", level: 1 })).toHaveCount(0);
+	expect(skillRequests).toHaveLength(requestsBeforeInvalidScope);
+
+	await page.setViewportSize({ width: 1280, height: 900 });
+	await page.goto("/projects");
+	await expect(main.getByRole("heading", { name: "Projects", level: 1 })).toBeVisible();
+	const consoleProjectGrid = main.getByTestId("project-grid");
+	const consoleSharedProject = consoleProjectGrid.getByRole("link", {
+		name: "Open Team Knowledge",
+	});
+	await expect(consoleSharedProject).toHaveAttribute("href", "/projects/project-context-first");
+	await expect(consoleSharedProject.locator("xpath=..")).toContainText("Viewer");
+	await expect(consoleProjectGrid.getByRole("heading")).toHaveText([
+		longContextProjectName,
+		"Release Project",
+		"Release Review",
+		"Unrelated Project",
+		"Team Knowledge",
+	]);
+	await expect(consoleProjectGrid.getByText("Owner", { exact: true })).toHaveCount(0);
+	await expect(consoleProjectGrid).not.toContainText("undefined skills");
+	await expect(consoleProjectGrid).not.toContainText("undefined vaults");
+	await expect(main.getByRole("link", { name: "Open Smoke Project" })).toHaveCount(0);
+
+	await page.setViewportSize({ width: 390, height: 844 });
+	await expect(consoleSharedProject).toBeVisible();
+	expect(
+		await page
+			.locator("html")
+			.evaluate((element) => element.scrollWidth <= element.clientWidth + 1),
+	).toBe(true);
+});
+
+test("agent scoped Skills and Vaults preserve context for mutations", async ({ page }) => {
+	const { longContextProjectName, skillCreateRequests, vaultRequests, vaultItemWriteRequests } =
+		await stubConnectedAgentResources(page);
+	const main = page.locator("main");
+	await page.setViewportSize({ width: 1280, height: 900 });
+	await page.goto("/agents/11111111-1111-4111-8111-111111111111/skills");
+	await expect(page).toHaveURL(
+		"/agents/11111111-1111-4111-8111-111111111111/project-access/project-smoke/skills",
+	);
+	await expect(main.getByRole("heading", { name: "Skills", level: 1 })).toBeVisible();
+	await page.goto(
+		"/agents/11111111-1111-4111-8111-111111111111/skills?project=project-context-first",
+	);
+	await expect(page).toHaveURL(
+		"/agents/11111111-1111-4111-8111-111111111111/project-access/project-context-first/skills",
+	);
+	await expect(main.getByRole("heading", { name: "Team Knowledge", level: 1 })).toBeVisible();
+	await expect(main.getByRole("tab", { name: "Skills", exact: true })).toHaveAttribute(
+		"aria-selected",
+		"true",
+	);
+	await expect(main.getByText("Team-only Skill", { exact: true })).toBeVisible();
+	await expect(main.getByText("Primary-only Skill", { exact: true })).toHaveCount(0);
+	await expect(main.getByRole("button", { name: "Add skill", exact: true })).toHaveCount(0);
+	expect(vaultRequests).toEqual([]);
+	await page.goto(
+		"/agents/11111111-1111-4111-8111-111111111111/project-access/project-context-later/skills",
+	);
+	await expect(main.getByRole("heading", { name: longContextProjectName, level: 1 })).toBeVisible();
+	const addSkillButton = main.getByRole("button", { name: "Add skill", exact: true });
+	await expect(addSkillButton).toBeVisible();
+	await addSkillButton.click();
+	const addSkillDialog = page.getByRole("dialog", { name: "Add skill" });
+	await addSkillDialog.getByLabel("Skill name").fill("release-checklist");
+	await addSkillDialog
+		.getByLabel("Description")
+		.fill("Review the release checklist before deploy.");
+	await addSkillDialog
+		.getByLabel("Instructions")
+		.fill("Review the release checklist before deploy.");
+	await addSkillDialog.getByRole("button", { name: "Add skill", exact: true }).click();
+	await expect(addSkillDialog).toHaveCount(0);
+	await expect(page).toHaveURL(
+		"/agents/11111111-1111-4111-8111-111111111111/project-access/project-context-later/skills",
+	);
+	await expect
+		.poll(() => skillCreateRequests)
+		.toEqual([
+			{
+				projectId: "project-context-later",
+				body: {
+					name: "release-checklist",
+					description: "Review the release checklist before deploy.",
+					instructions: "Review the release checklist before deploy.",
+				},
+			},
+		]);
+	await expect(main.getByRole("button", { name: /Link Vault/i })).toHaveCount(0);
+
+	const vaultOrigin = "/agents/11111111-1111-4111-8111-111111111111/vaults";
+	await page.goto(`${vaultOrigin}?project=project-unrelated`);
+	await expect(main.getByRole("link", { name: /Open vault / })).toHaveCount(0);
+	await page.goto(vaultOrigin);
+	await expect(main.getByRole("heading", { name: "Vaults", level: 1 })).toBeVisible();
+	const scopedVaultLink = main.getByRole("link", { name: "Open vault Scoped Vault" });
+	await scopedVaultLink.click();
+	await expect(page).toHaveURL(
+		/\/agents\/11111111-1111-4111-8111-111111111111\/vaults\/scoped-vault\?project=project-smoke&vault=vault-scoped&from=/,
+	);
+	await expect(main.getByRole("heading", { name: "Scoped Vault", level: 1 })).toBeVisible();
+	await expect(
+		page
+			.getByRole("navigation", { name: "breadcrumb" })
+			.locator('[data-slot="breadcrumb-item"]:visible'),
+	).toHaveText(["Smoke Codex", "Vaults", "Scoped Vault"]);
+	await expect(main.getByRole("button", { name: "Vaults", exact: true })).toHaveCount(0);
+	await expect(
+		main
+			.getByRole("navigation", { name: "breadcrumb" })
+			.getByRole("link", { name: "Vaults", exact: true }),
+	).toHaveAttribute("href", vaultOrigin);
+	await expect(main.getByRole("button", { name: /^Delete$/ })).toBeVisible();
+	const addKeysButton = main.getByRole("button", { name: "Add keys", exact: true });
+	await expect(addKeysButton).toBeVisible();
+	await addKeysButton.click();
+	const addKeysDialog = page.getByRole("dialog", { name: "Add keys" });
+	await addKeysDialog.getByRole("textbox").fill("DEPLOY_TOKEN=secret-value");
+	await addKeysDialog.getByRole("button", { name: "Save 1" }).click();
+	await expect(addKeysDialog).toHaveCount(0);
+	await expect.poll(() => vaultItemWriteRequests).toHaveLength(1);
+	const vaultWrite = vaultItemWriteRequests[0];
+	expect(vaultWrite?.body).toEqual({ section: "", fields: { DEPLOY_TOKEN: "secret-value" } });
+	const vaultWriteUrl = new URL(vaultWrite?.url ?? "http://invalid");
+	expect(vaultWriteUrl.searchParams.get("project_id")).toBe("project-smoke");
+	expect(vaultWriteUrl.searchParams.get("vault_id")).toBe("vault-scoped");
+	await expect(page).toHaveURL(
+		(url) =>
+			url.pathname.endsWith("/vaults/scoped-vault") && url.searchParams.get("from") === vaultOrigin,
+	);
+	await expect(main.getByRole("link", { name: "Workspace", exact: true }).last()).toHaveAttribute(
+		"href",
+		"/agents/11111111-1111-4111-8111-111111111111/project-access/project-smoke?tab=vaults",
+	);
+	const requestedVaultProjectIds = vaultRequests.map((request) =>
+		new URL(request).searchParams.get("project_id"),
+	);
+	expect(requestedVaultProjectIds).toContain("project-smoke");
+	expect(requestedVaultProjectIds).toContain("project-context-first");
+	expect(requestedVaultProjectIds).not.toContain(null);
+	expect(requestedVaultProjectIds).not.toContain("project-unrelated");
+});
+
+test("Workspace Skills fail closed on Project binding errors without reading Skills", async ({
+	page,
+}) => {
+	const skillRequests: string[] = [];
+	await stubDashboardApi(page, [], {
+		projectBindingsError: { status: 503, detail: "bindings unavailable" },
+		skillRequests,
+	});
+
+	await page.goto(
+		"/agents/11111111-1111-4111-8111-111111111111/project-access/project-smoke/skills",
+	);
+	const main = page.locator("main");
+	await expect(
+		main.getByText("Couldn't verify Workspace or Project access", { exact: true }),
+	).toBeVisible({ timeout: 15_000 });
+	// Fail closed: the Workspace rail keeps only its unconditional Projects
+	// entry — scoped Skills/Vaults items stay hidden while bindings error.
+	const workspaceGroup = page
+		.getByTestId("app-sidebar")
+		.getByRole("group", { name: "Workspace", exact: true });
+	await expect(workspaceGroup.getByRole("link")).toHaveText(["Projects"]);
+	expect(skillRequests).toEqual([]);
+});
+
+test("agent Skill details resolve only through effective Projects", async ({ page }) => {
+	let releaseBindings: (() => void) | undefined;
+	const projectBindingsGate = new Promise<void>((resolve) => {
+		releaseBindings = resolve;
+	});
+	const skillDetailRequests: string[] = [];
+	const legacySkillDetailRequests: string[] = [];
+	const contextProjectId = "project-context";
+	const scopedSkill = {
+		id: "skill-scoped",
+		skill_key: "scoped-skill",
+		name: "Scoped Skill",
+		description: "Available through the primary Project",
+		version: 1,
+		source: "cloud",
+		authority: "cloud",
+		source_repo: null,
+		file_count: 1,
+		content: "Follow the scoped instructions.\n",
+		agent_types: ["codex"],
+		created_at: now.toISOString(),
+		content_hash: "a".repeat(64),
+		updated_at: now.toISOString(),
+		project_id: "project-smoke",
+		project_name: "Smoke Project",
+		project_kind: "environment",
+		environment_id: "11111111-1111-4111-8111-111111111111",
+		machine_name: "smoke-machine.local",
+	};
+	const contextSkill = {
+		...scopedSkill,
+		id: "skill-context",
+		skill_key: "context-only",
+		name: "Context-only Skill",
+		description: "Available through an added Project",
+		content: "Follow the context instructions.\n",
+		project_id: contextProjectId,
+		project_name: "Context Project",
+		project_kind: "workspace",
+		environment_id: null,
+		machine_name: null,
+	};
+	await stubDashboardApi(page, [], {
+		projectBindingsGate,
+		projectBindings: [
+			...projectBindings,
+			{
+				id: "binding-context",
+				agent_id: "11111111-1111-4111-8111-111111111111",
+				project_id: contextProjectId,
+				binding_type: "context",
+				priority: 1,
+				default_write_enabled: false,
+				created_at: now.toISOString(),
+			},
+		],
+		projects: [
+			...projects,
+			{
+				id: contextProjectId,
+				name: "Context Project",
+				slug: "context-project",
+				kind: "workspace",
+				origin_environment_id: null,
+				archived_at: null,
+				created_at: now.toISOString(),
+				is_owner: true,
+				owner_display: "Dev User",
+				owner_handle: "dev-user",
+			},
+		],
+		skillDetailRequests,
+		legacySkillDetailRequests,
+		skillDetailResponses: {
+			"project-smoke/scoped-skill": { body: scopedSkill, status: 200 },
+			[`${contextProjectId}/context-only`]: { body: contextSkill, status: 200 },
+		},
+	});
+
+	const routeQuery = "keep=state";
+	await page.goto(
+		`/agents/11111111-1111-4111-8111-111111111111/skills/scoped-skill?project=project-smoke&${routeQuery}`,
+	);
+	const main = page.locator("main");
+	expect(skillDetailRequests).toEqual([]);
+	if (!releaseBindings) throw new Error("Project binding gate was not initialized");
+	releaseBindings();
+	await expect.poll(() => skillDetailRequests.length).toBe(1);
+	await expect(main.getByRole("heading", { name: "Scoped Skill", level: 1 })).toBeVisible();
+	await expect(
+		page
+			.getByRole("navigation", { name: "breadcrumb" })
+			.locator('[data-slot="breadcrumb-item"]:visible'),
+	).toHaveText(["Smoke Codex", "Skills", "Scoped Skill"]);
+	await expect(main.getByRole("button", { name: "Agent Skills" })).toHaveCount(0);
+	const agentSkillsLink = main
+		.getByRole("navigation", { name: "breadcrumb" })
+		.getByRole("link", { name: "Skills", exact: true });
+	await expect(agentSkillsLink).toHaveAttribute(
+		"href",
+		"/agents/11111111-1111-4111-8111-111111111111/project-access/project-smoke/skills",
+	);
+	expect(
+		skillDetailRequests.some(
+			(request) => new URL(request).pathname === "/v1/projects/project-smoke/skills/scoped-skill",
+		),
+	).toBe(true);
+	expect(legacySkillDetailRequests).toEqual([]);
+
+	const requestsBeforeTamperedProject = skillDetailRequests.length;
+	await page.goto(
+		`/agents/11111111-1111-4111-8111-111111111111/skills/scoped-skill?project=project-inaccessible&${routeQuery}`,
+	);
+	await expect(
+		main.getByText("Project not available to this Agent", { exact: true }),
+	).toBeVisible();
+	await expect(main.getByRole("heading", { name: "Scoped Skill", level: 1 })).toHaveCount(0);
+	await expect(main.getByRole("button", { name: "Agent Skills" })).toHaveCount(0);
+	expect(skillDetailRequests).toHaveLength(requestsBeforeTamperedProject);
+	expect(legacySkillDetailRequests).toEqual([]);
+
+	await page.goto(
+		`/agents/11111111-1111-4111-8111-111111111111/skills/context-only?project=${contextProjectId}&${routeQuery}`,
+	);
+	await expect(main.getByRole("heading", { name: "Context-only Skill", level: 1 })).toBeVisible();
+	const contextRequests = skillDetailRequests.filter((request) =>
+		new URL(request).pathname.endsWith("/skills/context-only"),
+	);
+	expect(contextRequests.map((request) => new URL(request).pathname)).toEqual([
+		`/v1/projects/${contextProjectId}/skills/context-only`,
+	]);
+	expect(legacySkillDetailRequests).toEqual([]);
+
+	const requestsBeforeMissingProject = skillDetailRequests.length;
+	await page.goto(`/agents/11111111-1111-4111-8111-111111111111/skills/context-only?${routeQuery}`);
+	await expect(page).toHaveURL((url) => {
+		return (
+			url.pathname === "/agents/11111111-1111-4111-8111-111111111111/skills/context-only" &&
+			url.searchParams.get("project") === "project-smoke" &&
+			!url.searchParams.has("keep") &&
+			!url.searchParams.has("source") &&
+			!url.searchParams.has("d")
+		);
+	});
+	await expect(main.getByText("Skill not found", { exact: true })).toBeVisible();
+	expect(skillDetailRequests).toHaveLength(requestsBeforeMissingProject + 1);
+	expect(new URL(skillDetailRequests.at(-1) ?? "").pathname).toBe(
+		"/v1/projects/project-smoke/skills/context-only",
+	);
+
+	await page.goto(
+		`/agents/11111111-1111-4111-8111-111111111111/skills/missing-skill?project=${contextProjectId}&${routeQuery}`,
+	);
+	await expect(main.getByText("Skill not found", { exact: true })).toBeVisible();
+	await expect(main.getByText("This Skill was not found in this Agent's Projects.")).toBeVisible();
+	expect(legacySkillDetailRequests).toEqual([]);
+
+	const errorPage = await page.context().newPage();
+	const errorSkillDetailRequests: string[] = [];
+	try {
+		await stubDashboardApi(errorPage, [], {
+			projectBindingsError: { status: 503, detail: "bindings unavailable" },
+			skillDetailRequests: errorSkillDetailRequests,
+		});
+		await errorPage.goto(
+			`/agents/11111111-1111-4111-8111-111111111111/skills/scoped-skill?project=project-smoke&${routeQuery}`,
+		);
+		const errorMain = errorPage.locator("main");
+		await expect(
+			errorMain.getByText("Couldn't verify Workspace or Project access", { exact: true }),
+		).toBeVisible({ timeout: 15_000 });
+		await expect(errorMain.getByRole("button", { name: "Agent Skills" })).toHaveCount(0);
+		await expect(
+			errorMain
+				.getByRole("navigation", { name: "breadcrumb" })
+				.getByRole("link", { name: "Skills", exact: true }),
+		).toHaveAttribute(
+			"href",
+			"/agents/11111111-1111-4111-8111-111111111111/project-access/project-smoke/skills",
+		);
+		expect(errorSkillDetailRequests).toEqual([]);
+	} finally {
+		await errorPage.close();
+	}
+});
+
+test("agent rail preserves keyboard sorting and primes agent switches", async ({ page }) => {
+	const agentOrderRequests: string[] = [];
+	const agentDetailRequests: string[] = [];
+	await stubDashboardApi(page, agentOrderRequests, { agentDetailRequests });
+	await page.goto("/");
+
+	const tiles = page.getByTestId("app-sidebar-agent-tile");
+	await expect(tiles).toHaveCount(2, { timeout: 15_000 });
+	await expect(page.getByRole("button", { name: /^Reorder / })).toHaveCount(0);
+	const firstTile = tiles.filter({ hasText: "Smoke Codex" });
+	const firstButton = firstTile.locator("button");
+	const firstTileBox = await firstTile.boundingBox();
+	const firstButtonBox = await firstButton.boundingBox();
+	if (!firstTileBox || !firstButtonBox) throw new Error("Agent rail tile should be interactive.");
+	expect(firstButtonBox.height).toBeCloseTo(firstTileBox.height, 0);
+	expect(firstButtonBox.width).toBeCloseTo(firstTileBox.width, 0);
+
+	await firstButton.focus();
+	await page.keyboard.down("Space");
+	await expect(firstButton).toHaveAttribute("aria-pressed", "true");
+	await page.keyboard.up("Space");
+	await page.keyboard.press("ArrowDown");
+	await page.keyboard.press("Escape");
+	await expect(firstButton).not.toHaveAttribute("aria-pressed", "true");
+	await expect(page).toHaveURL("/");
+	expect(agentOrderRequests).toEqual([]);
+	await expect(tiles.nth(0)).toContainText("Smoke Codex");
+
+	await firstButton.focus();
+	await page.keyboard.down("Space");
+	await expect(firstButton).toHaveAttribute("aria-pressed", "true");
+	await expect(page).toHaveURL("/");
+	await page.keyboard.up("Space");
+	await expect(page).toHaveURL("/");
+	await page.keyboard.press("ArrowDown");
+	await page.keyboard.down("Space");
+	await expect(firstButton).not.toHaveAttribute("aria-pressed", "true");
+	await expect(page).toHaveURL("/");
+	await page.keyboard.up("Space");
+
+	await expect(page).toHaveURL("/");
+	await expect.poll(() => agentOrderRequests.length).toBe(1);
+	expect(JSON.parse(agentOrderRequests[0] ?? "{}")).toEqual({
+		agent_ids: ["22222222-2222-4222-8222-222222222222", "11111111-1111-4111-8111-111111111111"],
+	});
+	await expect(tiles.nth(0)).toContainText("Smoke Hermes");
+
+	const postDragTarget = tiles.filter({ hasText: "Smoke Hermes" }).locator("button");
+	await postDragTarget.click();
+	await expect(page).toHaveURL("/agents/22222222-2222-4222-8222-222222222222");
+	await expect(page.getByRole("heading", { name: "Smoke Hermes", level: 1 })).toBeVisible();
+	expect(agentDetailRequests).toEqual([]);
+});
+
+test("Project catalog stays readable while link state fails and recovers", async ({ page }) => {
+	let releaseBindings = () => {};
+	const options: DashboardApiStubOptions = {
+		projectBindingsError: { status: 503, detail: "Project links temporarily unavailable" },
+		projectBindingsGate: new Promise<void>((resolve) => {
+			releaseBindings = resolve;
+		}),
+	};
+	await stubDashboardApi(page, [], options);
+	const main = page.locator("main");
+	await page.goto("/agents/11111111-1111-4111-8111-111111111111/project-access");
+	const card = main.getByTestId("agent-project-card").filter({ hasText: "Unrelated Project" });
+	try {
+		await expect(card.getByRole("link", { name: "Open Unrelated Project" })).toBeVisible();
+		await expect(
+			card.getByRole("button", { name: "Link status unavailable for Unrelated Project" }),
+		).toHaveText("Loading…");
+		await expect(main.getByTestId("agent-project-stack").getByRole("region")).toHaveCount(0);
+	} finally {
+		releaseBindings();
+	}
+	await expect(main.getByText("Couldn't load Project links", { exact: true })).toBeVisible();
+	await expect(main.getByTestId("agent-project-stack").getByRole("region")).toHaveCount(0);
+	await expect(
+		card.getByRole("button", { name: "Link status unavailable for Unrelated Project" }),
+	).toBeDisabled();
+	await expect(card.getByText("Not linked", { exact: true })).toHaveCount(0);
+	options.projectBindingsError = undefined;
+	await main.getByRole("button", { name: /Retry/ }).click();
+	await expect(
+		card.getByRole("button", { name: "Link Unrelated Project", exact: true }),
+	).toBeEnabled();
+	const available = main.getByRole("region", { name: "Available Projects" });
+	await expect(available.getByText("Available", { exact: true }).locator("..")).toHaveText(
+		"Available1",
+	);
+	await expect(main.getByRole("region", { name: "Linked Projects", exact: true })).toHaveCount(0);
+	await page.route("**/v1/agents/*/projects", (route) =>
+		fulfillJson(route, { detail: "Skill key conflict" }, 409),
+	);
+	await card.getByRole("button", { name: "Link Unrelated Project", exact: true }).click();
+	await expect(page.getByText("Couldn't update Project link", { exact: true })).toBeVisible();
+	await expect(available.getByText("Available", { exact: true }).locator("..")).toHaveText(
+		"Available1",
+	);
+	await expect(
+		card.getByRole("button", { name: "Link Unrelated Project", exact: true }),
+	).toBeEnabled();
+});
+
+test("cached Project links retain their state and destination after a failed refresh", async ({
+	page,
+}) => {
+	await stubConnectedAgentResources(page);
+	await page.goto("/agents/11111111-1111-4111-8111-111111111111/project-access?q=Team");
+	const card = page.getByTestId("agent-project-card").filter({ hasText: "Team Knowledge" });
+	const link = card.getByRole("link", { name: "Open Team Knowledge" });
+	const unlink = card.getByRole("button", { name: "Unlink Team Knowledge" });
+	await expect(unlink).toBeEnabled();
+	const href = await link.getAttribute("href");
+	const linked = page.getByRole("region", { name: "Linked Projects", exact: true });
+	await expect(linked.getByText("Linked", { exact: true }).locator("..")).toHaveText("Linked2");
+	const bindingRoute = "**/v1/agents/*/project-bindings";
+	await page.route(bindingRoute, (route) =>
+		fulfillJson(route, { detail: "Temporary refresh failure" }, 503),
+	);
+	await page.clock.setFixedTime(new Date(Date.now() + 60_000));
+	await page.evaluate(() => window.dispatchEvent(new Event("visibilitychange")));
+	await expect(page.getByText("Couldn't load Project links", { exact: true })).toBeVisible();
+	await expect(unlink).toBeDisabled();
+	await expect(linked.getByText("Linked", { exact: true }).locator("..")).toHaveText("Linked2");
+	await expect(page.getByRole("region", { name: "Available Projects" })).toHaveCount(0);
+	await expect(link).toHaveAttribute("href", href ?? "");
+	await page.unroute(bindingRoute);
+	await page.locator("main").getByRole("button", { name: "Retry" }).click();
+	await expect(unlink).toBeEnabled();
+	await link.click();
+	await expect(page.getByRole("heading", { name: "Team Knowledge", level: 1 })).toBeVisible();
+	await page.getByRole("button", { name: "Back to Agent Projects" }).click();
+	await expect(page.getByPlaceholder("Search projects…")).toHaveValue("Team");
+});
+
+test("Agent Vault inventory aggregates bound Projects and retains safe data on refresh errors", async ({
+	page,
+}) => {
+	const { projectAccessVaults, vaultRequests } = await stubConnectedAgentResources(page);
+	const origin = "/agents/11111111-1111-4111-8111-111111111111/vaults";
+	let failVaults = false;
+	await page.route(
+		(url) => url.pathname === "/v1/vault",
+		async (route) => {
+			const url = new URL(route.request().url());
+			vaultRequests.push(url.href);
+			const projectId = url.searchParams.get("project_id");
+			expect(projectId).toBeTruthy();
+			if (failVaults) return fulfillJson(route, { detail: "Temporary failure" }, 503);
+			const items = projectAccessVaults
+				.filter((vault) => vault.project_ids.includes(projectId ?? ""))
+				.map((vault) => ({ ...vault, project_ids: [projectId] }));
+			return fulfillJson(route, { ...vaults, items, total: items.length });
+		},
+	);
+	let failBindings = true;
+	await page.route("**/v1/agents/*/project-bindings", (route) =>
+		failBindings ? fulfillJson(route, { detail: "Unavailable" }, 503) : route.fallback(),
+	);
+	await page.goto(origin);
+	const main = page.locator("main");
+	await expect(main.getByText("Couldn't load Agent Vault access")).toBeVisible();
+	await expect(main.getByRole("link", { name: /Open vault / })).toHaveCount(0);
+	expect(vaultRequests).toEqual([]);
+	failBindings = false;
+	await main.getByRole("button", { name: "Retry" }).click();
+	const inventory = page.getByTestId("vaults-surface");
+	await expect(inventory.getByRole("link", { name: /Open vault / })).toHaveCount(3);
+	await expect(inventory.getByRole("link", { name: "Open vault Shared Vault" })).toHaveCount(1);
+	await expect(
+		inventory.getByText("From Workspace, Team Knowledge", { exact: true }),
+	).toBeVisible();
+	await expect(inventory.getByText("Unrelated Vault", { exact: true })).toHaveCount(0);
+	await expect(
+		inventory.getByRole("button", { name: /^(Create vault|Add keys|Link|Unlink|Add |Remove )/ }),
+	).toHaveCount(0);
+	expect(vaultRequests.every((request) => new URL(request).searchParams.has("project_id"))).toBe(
+		true,
+	);
+	await page.setViewportSize({ width: 1440, height: 900 });
+	await expect(
+		page.getByTestId("app-sidebar").getByRole("link", { name: "Vaults", exact: true }),
+	).toHaveAttribute("data-active", "");
+	await expect(
+		page.getByTestId("app-sidebar").getByRole("link", { name: "Overview", exact: true }),
+	).not.toHaveAttribute("data-active", "");
+	await expect(
+		page
+			.getByRole("navigation", { name: "breadcrumb" })
+			.locator('[data-slot="breadcrumb-item"]:visible'),
+	).toHaveText(["Smoke Codex", "Vaults"]);
+
+	await page.setViewportSize({ width: 390, height: 844 });
+
+	expect(
+		await page
+			.locator("html")
+			.evaluate((element) => element.scrollWidth <= element.clientWidth + 1),
+	).toBe(true);
+	failVaults = true;
+	await page.clock.setFixedTime(new Date(Date.now() + 60_000));
+	await page.evaluate(() => window.dispatchEvent(new Event("visibilitychange")));
+	await expect(inventory.getByText("Couldn’t refresh Vaults")).toBeVisible();
+	await expect(inventory.getByRole("link", { name: /Open vault / })).toHaveCount(3);
+	failVaults = false;
+	await inventory.getByRole("button", { name: "Retry" }).click();
+	await expect(inventory.getByRole("alert")).toHaveCount(0);
+	await inventory.getByPlaceholder("Search vaults…").fill("Team");
+	await inventory.getByRole("link", { name: "Open vault Team Vault" }).click();
+	await expect(page).toHaveURL(
+		(url) =>
+			url.searchParams.get("vault") === "vault-team" &&
+			url.searchParams.get("project") === "project-context-first" &&
+			url.searchParams.get("from") === `${origin}?q=Team`,
+	);
+	await expect(
+		main.getByRole("button", { name: /^(Link|Unlink|Remove from|Share keys)/ }),
+	).toHaveCount(0);
+	await expect(
+		main.getByRole("link", { name: "Team Knowledge", exact: true }).last(),
+	).toHaveAttribute(
+		"href",
+		"/agents/11111111-1111-4111-8111-111111111111/project-access/project-context-first?tab=vaults",
+	);
+	await main.getByRole("button", { name: "Back to Agent Vaults" }).click();
+	await expect(inventory.getByPlaceholder("Search vaults…")).toHaveValue("Team");
+	await page.goto("/agents/11111111-1111-4111-8111-111111111111");
+	await expect(main.locator('[data-overview-module="vaults"]')).toContainText("3 vaults");
+	await expect(main.locator('[data-overview-module="vaults"]').getByRole("link")).toHaveAttribute(
+		"href",
+		origin,
+	);
+});
+
+test("Project card menu dialogs survive menu dismissal", async ({ page }) => {
+	await stubDashboardApi(page);
+	await page.route(
+		/\/v1\/projects\/project-unrelated\/(members|invitations|share-links)$/,
+		(route) => fulfillJson(route, []),
+	);
+	await page.goto("/projects");
+	await expect(page.getByTestId("project-card")).toHaveCount(1);
+	await expect(page.getByTestId("projects-surface").getByRole("region")).toHaveCount(0);
+	await expect(
+		page.getByTestId("projects-surface").getByRole("button", { name: /^(Link|Unlink) / }),
+	).toHaveCount(0);
+	const card = page.getByTestId("project-card").filter({ hasText: "Unrelated Project" });
+	const trigger = card.getByRole("button", { name: "Actions for Unrelated Project" });
+	for (const width of [1280, 390]) {
+		await page.setViewportSize({ width, height: 900 });
+		await trigger.click();
+		await page.getByRole("menuitem", { name: "Edit", exact: true }).click();
+		await expect(page.getByRole("menu")).toBeHidden();
+		const edit = page.getByRole("dialog", { name: "Edit project", exact: true });
+		await expect(edit).toBeVisible();
+		await expect(edit.getByLabel("Name", { exact: true })).toHaveValue("Unrelated Project");
+		await edit.getByLabel("Name", { exact: true }).fill("Unsaved name");
+		await edit.getByRole("button", { name: "Cancel", exact: true }).click();
+		await expect(edit).toBeHidden();
+		await trigger.click();
+		await page.getByRole("menuitem", { name: "Share", exact: true }).click();
+		await expect(page.getByRole("menu")).toBeHidden();
+		const share = page.getByRole("dialog", { name: "Share Unrelated Project", exact: true });
+		await expect(share).toBeVisible();
+		await expect(
+			share.getByRole("heading", { name: "People with access", exact: true }),
+		).toBeVisible();
+		await page.keyboard.press("Escape");
+		await expect(share).toBeHidden();
+		await trigger.click();
+		await page.getByRole("menuitem", { name: "Archive", exact: true }).click();
+		await expect(page.getByRole("menu")).toBeHidden();
+		const archive = page.getByRole("alertdialog", { name: "Archive Unrelated Project?" });
+		await expect(archive).toBeVisible();
+		await archive.getByRole("button", { name: "Cancel", exact: true }).click();
+		await expect(archive).toBeHidden();
+		await expect(card.getByRole("link", { name: "Open Unrelated Project" })).toBeVisible();
+	}
+});
+
+test("unlinked Project resources stay inside the Agent without granting runtime access", async ({
+	page,
+}) => {
+	const { projectLinkDeltaBodies } = await stubConnectedAgentResources(page);
+	const base = "/agents/11111111-1111-4111-8111-111111111111";
+	await page.goto("/projects/project-context-first");
+	await expect(page.getByRole("tablist", { name: "Project pages" })).toBeVisible();
+	const libraryTabs = await page
+		.getByRole("tablist", { name: "Project pages" })
+		.getByRole("tab")
+		.allTextContents();
+	await page.goto(`${base}/project-access?q=Team`);
+	const card = page.getByTestId("agent-project-card").filter({ hasText: "Team Knowledge" });
+	await card.getByRole("button", { name: "Unlink Team Knowledge" }).click();
+	await expect(
+		card.getByRole("button", { name: "Link Team Knowledge", exact: true }),
+	).toBeEnabled();
+	await card.getByRole("link", { name: "Open Team Knowledge" }).click();
+	await expect(page).toHaveURL(
+		(url) => url.pathname === `${base}/project-access/project-context-first`,
+	);
+	const main = page.locator("main");
+	await expect(main.getByRole("heading", { name: "Team Knowledge", level: 1 })).toBeVisible();
+	await expect(main.getByRole("tablist", { name: "Project pages" }).getByRole("tab")).toHaveText(
+		libraryTabs,
+	);
+
+	await page.setViewportSize({ width: 1280, height: 900 });
+	await main.getByRole("tab", { name: "Skills", exact: true }).click();
+	await main.getByRole("link", { name: "Open Team-only Skill" }).click();
+	await expect(page).toHaveURL(
+		(url) =>
+			url.pathname === `${base}/skills/team-only` &&
+			url.searchParams.get("project") === "project-context-first",
+	);
+	await expect(main.getByRole("heading", { name: "Team-only Skill", level: 1 })).toBeVisible();
+	await page.reload();
+	await expect(main.getByRole("heading", { name: "Team-only Skill", level: 1 })).toBeVisible();
+	await page.goBack();
+	await main.getByRole("tab", { name: "Vaults", exact: true }).click();
+	await main.getByRole("link", { name: "Open vault Team Vault" }).click();
+	await expect(page).toHaveURL((url) => url.pathname === `${base}/vaults/team-vault`);
+	await expect(main.getByRole("heading", { name: "Team Vault", level: 1 })).toBeVisible();
+	const source = main.getByRole("link", { name: "Team Knowledge", exact: true }).last();
+	await source.click();
+	await expect(page).toHaveURL(
+		(url) => url.pathname === `${base}/project-access/project-context-first`,
+	);
+	await page.goto(`${base}/project-access?q=Team`);
+	await expect(
+		card.getByRole("button", { name: "Link Team Knowledge", exact: true }),
+	).toBeEnabled();
+	expect(projectLinkDeltaBodies).toHaveLength(1);
+});

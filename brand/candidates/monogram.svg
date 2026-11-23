@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  iforge monogram candidate
+  Lowercase i on a base bar, knocked out of a rounded plate.
+
+  Authored from scratch for iforge. Not traced from, derived from, or
+  recoloured from any pre-existing artwork (MIGR-04).
+
+  Colour lives in exactly one place: the fill attribute on the root element.
+  Do not switch this to currentColor. The rasteriser available on this host
+  (ImageMagick MSVG fallback, rsvg-convert absent) renders currentColor as
+  nothing at all, which would silently generate empty PNGs downstream.
+  Light accent #c96442, dark accent #d97757.
+-->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512" fill="#c96442" role="img" aria-label="iforge monogram candidate">
+  <path fill-rule="evenodd" d="M144 52 L368 52 C418.81 52 460 93.19 460 144 L460 368 C460 418.81 418.81 460 368 460 L144 460 C93.19 460 52 418.81 52 368 L52 144 C52 93.19 93.19 52 144 52 Z M214 106 L298 106 L298 190 L214 190 Z M214 230 L298 230 L298 366 L360 366 L360 406 L152 406 L152 366 L214 366 Z"/>
+</svg>

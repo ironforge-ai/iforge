@@ -1,0 +1,115 @@
+import { readdirSync, readFileSync } from "node:fs";
+import { createRequire } from "node:module";
+import { dirname, join } from "node:path";
+import { sentryTanstackStart } from "@sentry/tanstackstart-react/vite";
+import tailwindcss from "@tailwindcss/vite";
+import { tanstackStart } from "@tanstack/react-start/plugin/vite";
+import viteReact from "@vitejs/plugin-react";
+import { nitro } from "nitro/vite";
+import { defineConfig, loadEnv, type Plugin } from "vite";
+
+const require = createRequire(import.meta.url);
+const clerkBrowserDist = dirname(require.resolve("@clerk/clerk-js"));
+
+function clerkBrowserAssetClosure(): string[] {
+	const files = readdirSync(clerkBrowserDist);
+	const entry = "clerk.browser.js";
+	if (!files.includes(entry)) throw new Error(`Missing Clerk browser entry: ${entry}`);
+	const chunks = files.filter((name) => /_clerk\.browser_.*\.js$/.test(name));
+	if (chunks.length === 0) throw new Error("Missing Clerk browser chunks");
+	return [entry, ...chunks];
+}
+
+function desktopClerkAssetPlugin(): Plugin {
+	return {
+		name: "clawdi-desktop-clerk-asset",
+		apply: "build",
+		buildStart() {
+			for (const file of clerkBrowserAssetClosure()) {
+				this.emitFile({
+					type: "asset",
+					fileName: `assets/${file}`,
+					source: readFileSync(join(clerkBrowserDist, file)),
+				});
+			}
+		},
+	};
+}
+
+export default defineConfig(({ mode }) => {
+	// Vite does not load .env files into process.env while evaluating this file.
+	// Loading without a prefix follows Sentry's documented Vite plugin setup.
+	const env = loadEnv(mode, process.cwd(), "");
+	const desktopBuild = env.VITE_IFORGE_DESKTOP_BUILD === "true";
+
+	// Vercel system variables are server-only by default. Mirror only the public
+	// deployment metadata Sentry needs before Vite resolves import.meta.env.
+	if (env.VERCEL_ENV) {
+		process.env.VITE_SENTRY_ENVIRONMENT = env.VERCEL_ENV;
+	}
+	if (env.VERCEL_GIT_COMMIT_SHA) {
+		process.env.VITE_SENTRY_RELEASE = env.VERCEL_GIT_COMMIT_SHA;
+	}
+
+	const sentryPlugins =
+		env.SENTRY_AUTH_TOKEN && env.SENTRY_ORG && env.SENTRY_PROJECT
+			? sentryTanstackStart({
+					authToken: env.SENTRY_AUTH_TOKEN,
+					org: env.SENTRY_ORG,
+					project: env.SENTRY_PROJECT,
+					release: env.VERCEL_GIT_COMMIT_SHA ? { name: env.VERCEL_GIT_COMMIT_SHA } : undefined,
+				})
+			: [];
+
+	// Vite refuses any request whose `Host` header it does not recognise. Bare
+	// IPv4/IPv6 literals are always allowed, so a LAN or Tailscale IP reaches the
+	// dev server unconfigured; a DNS name does not — a MagicDNS host like
+	// `myhost.tailnet.ts.net` gets a flat "Blocked request" page that looks like
+	// the dev server being down rather than a host check. Comma-separated list;
+	// scripts/uat-stack.sh sets it from the host it advertises.
+	const allowedHosts = (env.UAT_ALLOWED_HOSTS ?? "")
+		.split(",")
+		.map((host) => host.trim())
+		.filter(Boolean);
+
+	return {
+		...(desktopBuild
+			? { preview: { host: "127.0.0.1" } }
+			: {
+					server: {
+						port: 3000,
+						...(allowedHosts.length > 0 ? { allowedHosts } : {}),
+					},
+				}),
+		ssr: {
+			// Published leaf components use extensionless internal ESM imports,
+			// so Vite must transform this package before Node evaluates SSR.
+			noExternal: ["@lobehub/icons"],
+		},
+		resolve: {
+			tsconfigPaths: true,
+		},
+		plugins: [
+			tailwindcss(),
+			...(desktopBuild ? [desktopClerkAssetPlugin()] : []),
+			tanstackStart({
+				...(desktopBuild
+					? {
+							spa: {
+								enabled: true,
+								prerender: { outputPath: "index" },
+							},
+						}
+					: {}),
+				importProtection: {
+					client: { specifiers: ["@clerk/tanstack-react-start/server"] },
+				},
+			}),
+			viteReact(),
+			...(desktopBuild
+				? []
+				: [nitro({ rolldownConfig: { output: { strictExecutionOrder: true } } })]),
+			...sentryPlugins,
+		],
+	};
+});

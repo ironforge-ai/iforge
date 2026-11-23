@@ -1,0 +1,34 @@
+{
+	"kind": "postiz",
+	"installationId": "5f0c6d2e-8a41-4b7f-9e3c-2d1a7b6e4c90",
+	"isolationTier": "standard",
+	"lifecycle": "present",
+	"version": "v2.24.0",
+	"artifact": {
+		"image": "ghcr.io/gitroomhq/postiz-app",
+		"sha256": "01b24a4fc1055f6833122c99614805bea702fdc0ee30c9b5d09330b521fa1efa"
+	},
+	"dependencies": {
+		"postgres": {
+			"image": "ghcr.io/clawdi-ai/postgres-pgbackrest",
+			"sha256": "db8d1af12ebac7fe10c57730502a31e9b34586ac1ed32852639007dd77eda449"
+		},
+		"redis": {
+			"image": "docker.io/library/redis",
+			"sha256": "0637954999d01b7c9ce9167db2da50656e2590d3b884f1c600c5f63bb6e6773c"
+		}
+	},
+	"port": 9130,
+	"hostname": "postiz-abcdefghij12.companions.example",
+	"credentials": {
+		"appEnvSecretRef": "secret://companions/postiz/5f0c6d2e-8a41-4b7f-9e3c-2d1a7b6e4c90/app-env",
+		"dbEnvSecretRef": "secret://companions/postiz/5f0c6d2e-8a41-4b7f-9e3c-2d1a7b6e4c90/db-env",
+		"apiKeySecretRef": "secret://companions/postiz/5f0c6d2e-8a41-4b7f-9e3c-2d1a7b6e4c90/api-key",
+		"adminSecretRef": "secret://companions/postiz/5f0c6d2e-8a41-4b7f-9e3c-2d1a7b6e4c90/admin"
+	},
+	"backup": null,
+	"exportRequests": [],
+	"adminUserId": null,
+	"update": null,
+	"retiredInstallations": []
+}

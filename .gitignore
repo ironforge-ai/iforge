@@ -1,0 +1,70 @@
+node_modules/
+.output/
+.tanstack/
+.nitro/
+.vite/
+.vite-temp/
+dist/
+packages/cli/dist-native/
+packages/cli/dist-release/
+packages/cli/clawdi-mitm-broker/
+apps/desktop/resources/native/
+apps/desktop/release/
+.turbo/
+*.tsbuildinfo
+test-results/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+*.egg-info/
+
+# Environment
+.env
+.env.local
+.clawdi.env
+.vercel/
+.paseo/
+
+# File Store (local dev)
+data/
+
+# OS
+.DS_Store
+.claude/
+.gstack/
+
+# Test fixtures deliberately use these names as SKIP_DIRS sentinels — the
+# adapter tests assert they are dropped, so they must be committed.
+!/packages/cli/tests/fixtures/**/node_modules
+!/packages/cli/tests/fixtures/**/node_modules/**
+!/packages/cli/tests/fixtures/**/dist
+!/packages/cli/tests/fixtures/**/dist/**
+!/packages/cli/tests/fixtures/**/__pycache__
+!/packages/cli/tests/fixtures/**/__pycache__/**
+
+# PDM (local interpreter path — machine-specific)
+.pdm-python
+
+# Local dev seed scripts — they embed user-specific paths and personal
+# memory content; keep them out of the repo.
+backend/scripts/seed_demo.py
+backend/pdm.lock
+.kamal/secrets
+.kamal/secrets.tmp
+
+# Local UAT stack logs (scripts/uat-stack.sh)
+.uat-logs/
+
+# GSD runtime state (dispatch-isolation sentinel). Tool residue, not repository
+# content: the residual guard reads untracked files since 03.1-11 (WR-06), so an
+# unignored runtime dir would otherwise demand a scope decision it does not merit.
+.gsd/
+
+# GSD per-session pid lock. Swept into c127262e by a broad `git add -A .planning`;
+# it names a pid and session id, so it is machine-local and must not travel.
+# NOTE: .planning/research/.cache/ is deliberately NOT ignored — it was committed
+# on purpose by 56364cdc "docs: complete project research" and is a project
+# artifact, not a throwaway cache.
+.planning/milestone.lock

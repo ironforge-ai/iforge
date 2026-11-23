@@ -1,0 +1,4251 @@
+"""Tests for `/api/admin/*` endpoints.
+
+Auth via X-Admin-Key header (shared secret). Tests run against the
+`db_session` directly without dependency overriding the auth gate —
+we verify the gate as part of test surface, not bypass it.
+"""
+
+import asyncio
+import json
+import logging
+import uuid
+from collections import Counter
+from collections.abc import AsyncIterator, Sequence
+from contextlib import asynccontextmanager
+from datetime import UTC, datetime, timedelta
+from uuid import UUID
+
+import httpx
+import pytest
+import pytest_asyncio
+from httpx import ASGITransport
+from sqlalchemy.ext.asyncio import async_sessionmaker
+
+from app.core.config import settings
+from app.core.database import get_control_session, get_session
+from app.main import app
+from app.services.managed_ai_provider import (
+    MANAGED_AI_PROVIDER_API_MODE,
+    MANAGED_AI_PROVIDER_PROVENANCE_CAPABILITY,
+    MANAGED_AI_PROVIDER_RUNTIME_ENV,
+    V1_MANAGED_AI_PROVIDER_ID,
+    V2_DEPLOYMENT_MANAGED_AI_PROVIDER_PREFIX,
+    V2_LEGACY_MANAGED_AI_PROVIDER_ID,
+    V2_LEGACY_PUBLIC_MANAGED_AI_PROVIDER_ID,
+    V2_MANAGED_AI_PROVIDER_ID,
+)
+from app.services.whatsapp_native_transport import (
+    WhatsAppSidecarCapabilities,
+    WhatsAppSidecarHealth,
+    WhatsAppSidecarPairingStatus,
+    WhatsAppSidecarUnavailableError,
+)
+from app.services.whatsapp_sidecar_registry import ConfiguredWhatsAppSidecarRegistry
+
+_ADMIN_KEY = "test-admin-secret-do-not-use-in-prod"
+# Shared header dict for the bulk of tests that exercise the happy-path
+# `X-Admin-Key` gate. Tests that deliberately omit or mutate the header
+# (auth-gate regression tests) build their own dict inline so the
+# tampering stays visible at the call site.
+_AUTH = {"X-Admin-Key": _ADMIN_KEY}
+_CLERK_ISSUER = "https://admin-tests.clerk.example.test"
+
+
+@pytest.fixture(autouse=True)
+def _configured_clerk_issuer(monkeypatch):
+    monkeypatch.setattr(settings, "clerk_jwt_issuer", _CLERK_ISSUER)
+
+
+class _ManagedOnboardingSidecar:
+    def __init__(self) -> None:
+        self.connected = False
+        self.registered = False
+        self.qr = "sensitive-rotating-qr"
+        self.logout_fails = False
+        self.logout_calls = 0
+        self.cancel_calls = 0
+        self.stopped = False
+
+    async def refresh_health(self) -> bool:
+        return self.connected
+
+    async def aclose(self) -> None:
+        return None
+
+    async def capabilities(self):
+        return WhatsAppSidecarCapabilities(
+            pairing=frozenset({"qr", "code", "cancel", "logout", "retry", "recover"})
+        )
+
+    async def health(self):
+        return WhatsAppSidecarHealth(
+            status="connected" if self.connected else "pairing_qr",
+            connected=self.connected,
+            registered=self.registered,
+            account_jid="15551234567:1@s.whatsapp.net" if self.registered else None,
+            account_lid="900000000000001:1@lid" if self.registered else None,
+        )
+
+    async def pairing_qr(self):
+        self.stopped = False
+        return await self.pairing_status()
+
+    async def pairing_status(self):
+        if self.stopped:
+            return WhatsAppSidecarPairingStatus(status="stopped", registered=False)
+        if self.connected:
+            return WhatsAppSidecarPairingStatus(status="connected", registered=self.registered)
+        return WhatsAppSidecarPairingStatus(
+            status="pairing_qr",
+            registered=False,
+            qr=self.qr,
+            qr_expires_at=datetime.now(UTC) + timedelta(seconds=30),
+        )
+
+    async def pairing_cancel(self):
+        self.cancel_calls += 1
+        if self.registered:
+            raise AssertionError("registered sessions must logout, not cancel")
+        self.connected = False
+        self.stopped = True
+        return WhatsAppSidecarPairingStatus(status="stopped", registered=False)
+
+    async def pairing_logout(self):
+        self.logout_calls += 1
+        if self.logout_fails:
+            raise WhatsAppSidecarUnavailableError("unavailable")
+        self.connected = False
+        self.registered = False
+        self.stopped = True
+        return WhatsAppSidecarPairingStatus(status="stopped", registered=False)
+
+    async def pairing_retry(self):
+        self.connected = True
+        return await self.pairing_status()
+
+    async def pairing_recover(self):
+        self.connected = False
+        self.registered = False
+        self.stopped = True
+        return WhatsAppSidecarPairingStatus(status="stopped", registered=False)
+
+    async def provider_events(self, *, limit=100, wait_ms=0):
+        return []
+
+    async def acknowledge_provider_events(self, *, through_sequence):
+        return None
+
+    async def relay_message(self, request):
+        return request.message_id
+
+    async def send_node(self, node):
+        return None
+
+    async def query(self, node, timeout_ms):
+        return None
+
+
+@pytest_asyncio.fixture
+async def admin_client(db_session, seed_user) -> AsyncIterator[httpx.AsyncClient]:
+    """Client that does NOT inject auth — admin endpoints test the
+    `X-Admin-Key` header gate directly. Sets settings.admin_api_key
+    to a known value for the test project and restores it in teardown
+    even if the transport / context-manager raises before yield."""
+
+    async def _override_get_session():
+        yield db_session
+
+    original_admin_key = settings.admin_api_key
+    settings.admin_api_key = _ADMIN_KEY
+    app.dependency_overrides[get_control_session] = _override_get_session
+    app.dependency_overrides[get_session] = _override_get_session
+
+    # Outer try/finally guards `settings.admin_api_key` restoration
+    # against a raise from `ASGITransport(app=app)` or the
+    # AsyncClient context manager itself — without it a setup
+    # failure here would silently contaminate every subsequent
+    # test in the same process with the test-project admin secret.
+    try:
+        transport = ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+            yield ac
+    finally:
+        app.dependency_overrides.clear()
+        settings.admin_api_key = original_admin_key
+
+
+@asynccontextmanager
+async def _isolated_admin_client(engine) -> AsyncIterator[httpx.AsyncClient]:
+    """Give concurrent requests independent real PostgreSQL transactions."""
+
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+
+    async def _override_get_session():
+        async with session_factory() as session:
+            yield session
+
+    original_admin_key = settings.admin_api_key
+    settings.admin_api_key = _ADMIN_KEY
+    app.dependency_overrides[get_control_session] = _override_get_session
+    app.dependency_overrides[get_session] = _override_get_session
+    try:
+        async with httpx.AsyncClient(
+            transport=ASGITransport(app=app, raise_app_exceptions=False),
+            base_url="http://test",
+        ) as client:
+            yield client
+    finally:
+        app.dependency_overrides.clear()
+        settings.admin_api_key = original_admin_key
+
+
+async def _replace_managed_provider_runtime_metadata(
+    client: httpx.AsyncClient,
+    provider_id: str,
+    body: dict,
+) -> httpx.Response:
+    return await client.put(
+        f"/v1/admin/ai-providers/{provider_id}/runtime-metadata",
+        headers=_AUTH,
+        json=body,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("api_mode", ["codex_responses", "openai_responses"])
+async def test_admin_v1_managed_provider_supports_metadata_only_repair(
+    admin_client,
+    db_session,
+    seed_user,
+    api_mode: str,
+):
+    from sqlalchemy import select
+
+    from app.models.ai_provider import AiProvider, AiProviderAuthPayload
+
+    old_url = "https://legacy-gateway.example.test/v1"
+    new_url = "https://stable-gateway.example.test/v1"
+    owner = {"kind": "clerk", "ref": seed_user.clerk_id}
+    provider = AiProvider(
+        owner_user_id=seed_user.id,
+        provider_id=V1_MANAGED_AI_PROVIDER_ID,
+        type="custom_openai_compatible",
+        label="Legacy managed provider",
+        base_url=old_url,
+        api_mode=api_mode,
+        auth_type="api_key",
+        auth_ref=None,
+        auth_metadata={"source": "managed", "profile": "default"},
+        managed_by="clawdi",
+        runtime_env_name="CLAWDI_MANAGED_OPENAI_API_KEY",
+        models=[{"id": "gpt-5.6-sol"}],
+    )
+    db_session.add(provider)
+    await db_session.commit()
+
+    readback = await admin_client.get(
+        f"/v1/admin/ai-providers/{V1_MANAGED_AI_PROVIDER_ID}",
+        headers=_AUTH,
+        params=owner,
+    )
+    replaced = await _replace_managed_provider_runtime_metadata(
+        admin_client,
+        V1_MANAGED_AI_PROVIDER_ID,
+        {
+            "owner": owner,
+            "base_url": new_url,
+            "models": [{"id": "gpt-5.6-sol"}],
+        },
+    )
+    delete_response = await admin_client.delete(
+        f"/v1/admin/ai-providers/{V1_MANAGED_AI_PROVIDER_ID}",
+        headers=_AUTH,
+        params=owner,
+    )
+
+    assert readback.status_code == 200, readback.text
+    assert readback.json()["owner"] == owner
+    assert readback.json()["provider_id"] == V1_MANAGED_AI_PROVIDER_ID
+    assert readback.json()["base_url"] == old_url
+    assert replaced.status_code == 200, replaced.text
+    assert replaced.json()["owner"] == owner
+    assert replaced.json()["provider_id"] == V1_MANAGED_AI_PROVIDER_ID
+    assert replaced.json()["base_url"] == new_url
+    assert delete_response.status_code == 405, delete_response.text
+
+    await db_session.refresh(provider)
+    assert provider.base_url == new_url
+    assert provider.api_mode == api_mode
+    assert provider.runtime_env_name == "CLAWDI_MANAGED_OPENAI_API_KEY"
+    assert provider.auth_type == "api_key"
+    assert provider.auth_ref is None
+    assert provider.auth_metadata == {"source": "managed", "profile": "default"}
+    assert (
+        await db_session.scalar(
+            select(AiProviderAuthPayload.id).where(
+                AiProviderAuthPayload.owner_user_id == seed_user.id,
+                AiProviderAuthPayload.provider_id == V1_MANAGED_AI_PROVIDER_ID,
+            )
+        )
+        is None
+    )
+
+
+@pytest.mark.asyncio
+async def test_admin_mint_requires_admin_key(admin_client, seed_user):
+    """Without the X-Admin-Key header, endpoint returns 401."""
+    r = await admin_client.post(
+        "/v1/admin/auth/keys",
+        json={"target_clerk_id": seed_user.clerk_id, "label": "test"},
+    )
+    assert r.status_code == 401, r.text
+
+
+@pytest.mark.asyncio
+async def test_admin_mint_rejects_wrong_key(admin_client, seed_user):
+    """Wrong header value: 401."""
+    r = await admin_client.post(
+        "/v1/admin/auth/keys",
+        headers={"X-Admin-Key": "wrong-key"},
+        json={"target_clerk_id": seed_user.clerk_id, "label": "test"},
+    )
+    assert r.status_code == 401
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "target_clerk_id",
+    ["", " user_123", "user 123", "partner:phala:team_123", "x" * 201],
+)
+async def test_admin_mint_rejects_invalid_target_clerk_id(admin_client, target_clerk_id):
+    response = await admin_client.post(
+        "/v1/admin/auth/keys",
+        headers=_AUTH,
+        json={"target_clerk_id": target_clerk_id, "label": "invalid-target"},
+    )
+
+    assert response.status_code == 422, response.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("path", "payload"),
+    [
+        ("/v1/admin/auth/keys", {"label": "partner-runtime"}),
+        (
+            "/v1/admin/agents",
+            {
+                "agent_id": "de9e247b-1c60-4f8a-ad7b-537b16b247a8",
+                "machine_id": "partner-agent",
+                "machine_name": "Partner Agent",
+                "agent_type": "openclaw",
+            },
+        ),
+    ],
+)
+async def test_legacy_admin_rejects_partner_principal_fields(
+    admin_client,
+    seed_user,
+    path,
+    payload,
+):
+    response = await admin_client.post(
+        path,
+        headers=_AUTH,
+        json={
+            "target_clerk_id": seed_user.clerk_id,
+            "principal_kind": "partner_tenant",
+            "partner_tenant_ref": "phala_cloud:team_123",
+            **payload,
+        },
+    )
+
+    assert response.status_code == 422, response.text
+    extra_fields = {
+        error["loc"][-1]
+        for error in response.json()["detail"]
+        if error["type"] == "extra_forbidden"
+    }
+    assert extra_fields == {"principal_kind", "partner_tenant_ref"}
+
+
+@pytest.mark.asyncio
+async def test_admin_endpoints_disabled_when_unset(db_session, seed_user):
+    """If `settings.admin_api_key` is empty, endpoints return 503
+    regardless of header. Default OSS posture: admin endpoints are
+    OPT-IN, not present unless operator explicitly configures them."""
+
+    async def _override_get_session():
+        yield db_session
+
+    original = settings.admin_api_key
+    settings.admin_api_key = ""
+
+    app.dependency_overrides[get_control_session] = _override_get_session
+    app.dependency_overrides[get_session] = _override_get_session
+    try:
+        transport = ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+            r = await ac.post(
+                "/v1/admin/auth/keys",
+                headers={"X-Admin-Key": "anything"},
+                json={"target_clerk_id": seed_user.clerk_id, "label": "test"},
+            )
+            assert r.status_code == 503
+    finally:
+        app.dependency_overrides.clear()
+        settings.admin_api_key = original
+
+
+@pytest.mark.asyncio
+async def test_admin_mint_default_grants_full_account_access(admin_client, db_session, seed_user):
+    """Mint via admin endpoint with no `scopes` field defaults to
+    full account access — same as user-self-mint via Clerk JWT."""
+    from sqlalchemy import select
+
+    from app.models.api_key import ApiKey
+
+    r = await admin_client.post(
+        "/v1/admin/auth/keys",
+        headers=_AUTH,
+        json={"target_clerk_id": seed_user.clerk_id, "label": "default-scopes"},
+    )
+    assert r.status_code == 200
+
+    minted = (
+        await db_session.execute(
+            select(ApiKey).where(ApiKey.user_id == seed_user.id, ApiKey.label == "default-scopes")
+        )
+    ).scalar_one()
+
+    # `scopes=None` is the full-API-permission sentinel; matches
+    # user-self-mint behaviour. Hosted pods need full parity with
+    # self-managed installs (vault reads, memory reads) so the admin
+    # path does not impose a permission ceiling.
+    assert minted.scopes is None
+
+
+@pytest.mark.asyncio
+async def test_admin_mint_accepts_explicit_narrow_scopes(admin_client, db_session, seed_user):
+    """Callers can lock the minted key down by passing an explicit
+    API permission list — useful for ops tooling that doesn't need everything."""
+    from sqlalchemy import select
+
+    from app.models.api_key import ApiKey
+
+    r = await admin_client.post(
+        "/v1/admin/auth/keys",
+        headers=_AUTH,
+        json={
+            "target_clerk_id": seed_user.clerk_id,
+            "label": "narrow-explicit",
+            "scopes": ["sessions:write"],
+        },
+    )
+    assert r.status_code == 200
+
+    minted = (
+        await db_session.execute(
+            select(ApiKey).where(ApiKey.user_id == seed_user.id, ApiKey.label == "narrow-explicit")
+        )
+    ).scalar_one()
+    assert minted.scopes == ["sessions:write"]
+
+
+@pytest.mark.asyncio
+async def test_admin_mint_accepts_managed_flag(admin_client, db_session, seed_user):
+    from sqlalchemy import select
+
+    from app.models.api_key import ApiKey
+
+    response = await admin_client.post(
+        "/v1/admin/auth/keys",
+        headers=_AUTH,
+        json={
+            "target_clerk_id": seed_user.clerk_id,
+            "label": "platform-managed",
+            "managed": True,
+        },
+    )
+    assert response.status_code == 200, response.text
+
+    minted = (
+        await db_session.execute(
+            select(ApiKey).where(ApiKey.user_id == seed_user.id, ApiKey.label == "platform-managed")
+        )
+    ).scalar_one()
+    assert minted.managed is True
+    assert minted.environment_id is None
+
+
+@pytest.mark.asyncio
+async def test_admin_managed_environment_key_stays_legacy_and_rejects_v2_binding(
+    admin_client,
+    db_session,
+    seed_user,
+):
+    from sqlalchemy import func, select
+
+    from app.models.api_key import ApiKey
+    from app.models.runtime_observation import V2RuntimeEnvironmentFence
+    from tests.conftest import create_env_with_project
+
+    legacy_environment = await create_env_with_project(
+        db_session,
+        user_id=seed_user.id,
+        machine_id=f"legacy-managed-{uuid.uuid4().hex}",
+        machine_name="legacy-managed",
+    )
+    strict_v2_environment = await create_env_with_project(
+        db_session,
+        user_id=seed_user.id,
+        machine_id=f"strict-v2-managed-{uuid.uuid4().hex}",
+        machine_name="strict-v2-managed",
+    )
+
+    legacy = await admin_client.post(
+        "/v1/admin/auth/keys",
+        headers=_AUTH,
+        json={
+            "target_clerk_id": seed_user.clerk_id,
+            "label": "legacy-managed-environment",
+            "environment_id": str(legacy_environment.id),
+            "managed": True,
+        },
+    )
+    rejected_v2 = await admin_client.post(
+        "/v1/admin/auth/keys",
+        headers=_AUTH,
+        json={
+            "target_clerk_id": seed_user.clerk_id,
+            "label": "strict-v2-managed-environment",
+            "environment_id": str(strict_v2_environment.id),
+            "deployment_id": "deployment-strict-v2",
+            "managed": True,
+        },
+    )
+
+    assert legacy.status_code == 200, legacy.text
+    assert rejected_v2.status_code == 422, rejected_v2.text
+    assert any(error["loc"][-1] == "deployment_id" for error in rejected_v2.json()["detail"])
+    assert await db_session.get(V2RuntimeEnvironmentFence, legacy_environment.id) is None
+    assert await db_session.get(V2RuntimeEnvironmentFence, strict_v2_environment.id) is None
+    legacy_key = (
+        await db_session.execute(select(ApiKey).where(ApiKey.label == "legacy-managed-environment"))
+    ).scalar_one()
+    assert legacy_key.runtime_deployment_id is None
+    rejected_key_count = await db_session.scalar(
+        select(func.count())
+        .select_from(ApiKey)
+        .where(ApiKey.label == "strict-v2-managed-environment")
+    )
+    assert rejected_key_count == 0
+
+
+@pytest.mark.asyncio
+async def test_admin_mint_accepts_arbitrary_scopes(admin_client, db_session, seed_user):
+    """No allowlist ceiling: callers can mint keys carrying any API
+    permission they want (vault:resolve, sessions:read, etc.). Trust
+    model is that X-Admin-Key holders are already first-party SaaS callers."""
+    from sqlalchemy import select
+
+    from app.models.api_key import ApiKey
+
+    r = await admin_client.post(
+        "/v1/admin/auth/keys",
+        headers=_AUTH,
+        json={
+            "target_clerk_id": seed_user.clerk_id,
+            "label": "vault-and-read",
+            "scopes": ["sessions:read", "vault:resolve"],
+        },
+    )
+    assert r.status_code == 200
+
+    minted = (
+        await db_session.execute(
+            select(ApiKey).where(ApiKey.user_id == seed_user.id, ApiKey.label == "vault-and-read")
+        )
+    ).scalar_one()
+    assert minted.scopes == ["sessions:read", "vault:resolve"]
+
+
+@pytest.mark.asyncio
+async def test_admin_mint_api_key_writes_control_plane_audit(admin_client, db_session, seed_user):
+    from sqlalchemy import select
+
+    from app.models.audit import ControlPlaneAuditEvent
+
+    response = await admin_client.post(
+        "/v1/admin/auth/keys",
+        headers=_AUTH,
+        json={
+            "target_clerk_id": seed_user.clerk_id,
+            "label": "audit-mint",
+            "managed": True,
+        },
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+
+    event = (
+        await db_session.execute(
+            select(ControlPlaneAuditEvent).where(
+                ControlPlaneAuditEvent.action == "api_key.mint",
+                ControlPlaneAuditEvent.resource_id == body["id"],
+            )
+        )
+    ).scalar_one()
+    assert event.actor_type == "admin"
+    assert event.resource_type == "api_key"
+    assert event.target_user_id == seed_user.id
+    assert event.source == "api.admin"
+    assert event.details["label"] == "audit-mint"
+    assert event.details["key_prefix"] == body["key_prefix"]
+    assert event.details["managed"] is True
+    assert event.details["has_environment_binding"] is False
+    assert body["raw_key"] not in str(event.details)
+
+
+@pytest.mark.asyncio
+@pytest.mark.committed_db
+async def test_admin_mint_api_key_rolls_back_key_when_audit_fails(
+    admin_client, engine, seed_user, monkeypatch
+):
+    """Key row and audit event share one transaction.
+
+    A key that commits while the caller gets a 500 is an untrackable,
+    unrevokable credential: the SaaS side only learns `key_id` from a
+    successful response, so it can never revoke what it never saw.
+    """
+    from sqlalchemy import select
+    from sqlalchemy.ext.asyncio import async_sessionmaker
+
+    from app.models.api_key import ApiKey
+    from app.routes import admin as admin_routes
+
+    def explode(*args, **kwargs):
+        raise RuntimeError("audit write failed")
+
+    monkeypatch.setattr(admin_routes, "record_control_plane_audit", explode)
+
+    with pytest.raises(RuntimeError):
+        await admin_client.post(
+            "/v1/admin/auth/keys",
+            headers=_AUTH,
+            json={
+                "target_clerk_id": seed_user.clerk_id,
+                "label": "orphan-check",
+                "managed": True,
+            },
+        )
+
+    # Assert through a fresh session: it only sees committed rows. A key
+    # visible here was committed before the audit event — the exact
+    # orphan this test guards against.
+    async with async_sessionmaker(engine, expire_on_commit=False)() as fresh:
+        # Prove this test is in the real-commit lane: the independently
+        # connected observer must see the fixture user before checking the
+        # failed mutation. Otherwise an outer test transaction could hide
+        # both a broken early commit and the setup row.
+        assert await fresh.get(type(seed_user), seed_user.id) is not None
+        orphan = (
+            await fresh.execute(
+                select(ApiKey).where(ApiKey.user_id == seed_user.id, ApiKey.label == "orphan-check")
+            )
+        ).scalar_one_or_none()
+    assert orphan is None
+
+
+@pytest.mark.asyncio
+async def test_admin_mint_lazy_creates_user(admin_client, db_session):
+    """First-time deploy path: a user who's never visited cloud-api
+    directly (no row yet) clicks Deploy on the upstream SaaS
+    dashboard. SaaS calls admin mint with their Clerk id. cloud-api
+    lazy-creates the user row + Personal project, then mints normally —
+    same identity the user gets when they later sign in directly.
+
+    Without this, the most common SaaS-side entry path silently
+    fails: deploy succeeds but pod has no sync env, user has to
+    redeploy after their first direct cloud-api visit.
+    """
+    # Random per-run clerk_id — test DB is real Postgres and rows
+    # persist across test runs; a hardcoded id would collide.
+
+    from sqlalchemy import select
+
+    from app.models.project import PROJECT_KIND_PERSONAL, Project
+    from app.models.user import User
+
+    novel_clerk_id = f"user_first_deploy_{uuid.uuid4().hex[:12]}"
+
+    # Pre-flight: confirm the user really doesn't exist yet.
+    pre = (
+        await db_session.execute(select(User).where(User.clerk_id == novel_clerk_id))
+    ).scalar_one_or_none()
+    assert pre is None
+
+    r = await admin_client.post(
+        "/v1/admin/auth/keys",
+        headers=_AUTH,
+        json={"target_clerk_id": novel_clerk_id, "label": "first-deploy"},
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["raw_key"].startswith("clawdi_")
+
+    # User row was created with the right clerk_id, no email/name
+    # (admin endpoint doesn't have those — JWT path will fill on
+    # first cloud.clawdi.ai sign-in).
+    user = (
+        await db_session.execute(select(User).where(User.clerk_id == novel_clerk_id))
+    ).scalar_one()
+    assert user.principal_kind == "clerk"
+    assert user.partner_tenant_ref is None
+    assert user.email is None
+    assert user.name is None
+
+    # Personal project was created in the same transaction. Downstream
+    # resolvers assume it exists; this matches the JWT path's
+    # invariant.
+    personal = (
+        await db_session.execute(
+            select(Project).where(Project.user_id == user.id, Project.kind == PROJECT_KIND_PERSONAL)
+        )
+    ).scalar_one_or_none()
+    assert personal is not None
+    assert personal.slug == "personal"
+
+
+@pytest.mark.asyncio
+async def test_admin_mint_existing_user_reuses_row(admin_client, db_session, seed_user):
+    """Re-minting for an existing user MUST reuse the row, not
+    create a new one. Test pins the idempotency contract — if the
+    helper accidentally always inserts, every admin mint would
+    explode on the clerk_id unique constraint."""
+    from sqlalchemy import func, select
+
+    from app.models.user import User
+
+    pre_count = (await db_session.execute(select(func.count(User.id)))).scalar_one()
+
+    r = await admin_client.post(
+        "/v1/admin/auth/keys",
+        headers=_AUTH,
+        json={"target_clerk_id": seed_user.clerk_id, "label": "second-mint"},
+    )
+    assert r.status_code == 200
+
+    post_count = (await db_session.execute(select(func.count(User.id)))).scalar_one()
+    assert post_count == pre_count, "lazy-create must skip when user already exists"
+
+
+@pytest.mark.asyncio
+@pytest.mark.committed_db
+async def test_admin_mint_lazy_create_handles_race(engine, monkeypatch):
+    """Two first-time admin mints adopt one User and Personal project."""
+    from sqlalchemy import func, select
+
+    from app.models.project import PROJECT_KIND_PERSONAL, Project
+    from app.models.user import User
+    from app.routes import admin as admin_routes
+
+    clerk_id = f"clerk_race_{uuid.uuid4().hex}"
+    original_load = admin_routes.load_clerk_user_for_issuer
+    both_missing = asyncio.Event()
+    arrivals = 0
+
+    async def synchronize_missing_user(*args, **kwargs):
+        nonlocal arrivals
+        user = await original_load(*args, **kwargs)
+        assert user is None
+        arrivals += 1
+        if arrivals == 2:
+            both_missing.set()
+        await asyncio.wait_for(both_missing.wait(), timeout=5)
+        return user
+
+    monkeypatch.setattr(admin_routes, "load_clerk_user_for_issuer", synchronize_missing_user)
+    async with _isolated_admin_client(engine) as client:
+        responses = await asyncio.wait_for(
+            asyncio.gather(
+                *(
+                    client.post(
+                        "/v1/admin/auth/keys",
+                        headers=_AUTH,
+                        json={"target_clerk_id": clerk_id, "label": label},
+                    )
+                    for label in ("race-first", "race-second")
+                )
+            ),
+            timeout=10,
+        )
+
+    assert arrivals == 2
+    assert [response.status_code for response in responses] == [200, 200]
+    assert responses[0].json()["id"] != responses[1].json()["id"]
+    async with async_sessionmaker(engine, expire_on_commit=False)() as observer:
+        winner = (
+            await observer.execute(select(User).where(User.clerk_id == clerk_id))
+        ).scalar_one()
+        assert (
+            await observer.scalar(
+                select(func.count(Project.id)).where(
+                    Project.user_id == winner.id, Project.kind == PROJECT_KIND_PERSONAL
+                )
+            )
+            == 1
+        )
+
+
+@pytest.mark.asyncio
+async def test_admin_mint_lazy_create_500s_when_winner_disappears(db_session):
+    """Pathological case: IntegrityError fires (someone else
+    inserted), but by the time we re-query, the row is gone (would
+    require a concurrent delete — extremely unlikely). Helper must
+    surface as 500 rather than 404 so the SaaS caller sees this is
+    an operational anomaly, not a wrong-clerk_id payload.
+    """
+    from fastapi import HTTPException
+    from sqlalchemy.exc import IntegrityError
+
+    from app.routes.admin import _resolve_or_create_user
+
+    clerk_id = f"clerk_ghost_winner_{uuid.uuid4().hex[:12]}"
+
+    # No row pre-seeded — re-query after rollback will find nothing.
+    real_flush = db_session.flush
+
+    async def mock_flush(_objects: Sequence[object] | None = None) -> None:
+        raise IntegrityError("simulated race", None, Exception())
+
+    db_session.flush = mock_flush
+
+    try:
+        with pytest.raises(HTTPException) as exc_info:
+            await _resolve_or_create_user(db_session, clerk_id)
+    finally:
+        db_session.flush = real_flush
+
+    assert exc_info.value.status_code == 500
+    assert "could not create or load user" in exc_info.value.detail
+
+
+@pytest.mark.asyncio
+async def test_admin_lazy_create_creates_personal_project(db_session):
+    """The lazy-create transaction MUST create a Personal project
+    alongside the User row. Downstream resolvers (sessions, skills,
+    memories) all assume every user has one and 500 without it.
+    JWT path enforces the same invariant; admin path must too."""
+
+    from sqlalchemy import select
+
+    from app.models.project import PROJECT_KIND_PERSONAL, Project
+    from app.routes.admin import _resolve_or_create_user
+
+    clerk_id = f"clerk_project_inv_{uuid.uuid4().hex[:12]}"
+    user = await _resolve_or_create_user(db_session, clerk_id)
+
+    personal = (
+        await db_session.execute(
+            select(Project).where(Project.user_id == user.id, Project.kind == PROJECT_KIND_PERSONAL)
+        )
+    ).scalar_one_or_none()
+    assert personal is not None, "Personal project must exist after lazy-create"
+    assert personal.slug == "personal"
+
+
+@pytest.mark.asyncio
+async def test_admin_revoke_happy_path(admin_client, db_session, seed_user):
+    """Mint a key, then revoke it via admin endpoint. Verify revoked_at set."""
+    from sqlalchemy import select
+
+    from app.models.api_key import ApiKey
+
+    minted_resp = await admin_client.post(
+        "/v1/admin/auth/keys",
+        headers=_AUTH,
+        json={"target_clerk_id": seed_user.clerk_id, "label": "to-revoke"},
+    )
+    key_id = minted_resp.json()["id"]
+
+    r = await admin_client.delete(
+        f"/v1/admin/auth/keys/{key_id}",
+        headers=_AUTH,
+    )
+    assert r.status_code == 200
+    assert r.json()["status"] == "revoked"
+
+    db_session.expire_all()
+    row = (await db_session.execute(select(ApiKey).where(ApiKey.id == key_id))).scalar_one()
+    assert row.revoked_at is not None
+
+
+@pytest.mark.asyncio
+async def test_admin_revoke_api_key_writes_control_plane_audit(admin_client, db_session, seed_user):
+    from sqlalchemy import select
+
+    from app.models.audit import ControlPlaneAuditEvent
+
+    minted_response = await admin_client.post(
+        "/v1/admin/auth/keys",
+        headers=_AUTH,
+        json={"target_clerk_id": seed_user.clerk_id, "label": "audit-revoke"},
+    )
+    assert minted_response.status_code == 200, minted_response.text
+    minted = minted_response.json()
+
+    response = await admin_client.delete(
+        f"/v1/admin/auth/keys/{minted['id']}",
+        headers=_AUTH,
+    )
+    assert response.status_code == 200, response.text
+
+    event = (
+        await db_session.execute(
+            select(ControlPlaneAuditEvent).where(
+                ControlPlaneAuditEvent.action == "api_key.revoke",
+                ControlPlaneAuditEvent.resource_id == minted["id"],
+            )
+        )
+    ).scalar_one()
+    assert event.actor_type == "admin"
+    assert event.resource_type == "api_key"
+    assert event.target_user_id == seed_user.id
+    assert event.source == "api.admin"
+    assert event.details["label"] == "audit-revoke"
+    assert event.details["key_prefix"] == minted["key_prefix"]
+    assert minted["raw_key"] not in str(event.details)
+
+
+@pytest.mark.asyncio
+async def test_admin_revoke_can_revoke_managed_key(admin_client, db_session, seed_user):
+    from sqlalchemy import select
+
+    from app.models.api_key import ApiKey
+
+    minted_resp = await admin_client.post(
+        "/v1/admin/auth/keys",
+        headers=_AUTH,
+        json={
+            "target_clerk_id": seed_user.clerk_id,
+            "label": "managed-to-revoke",
+            "managed": True,
+        },
+    )
+    key_id = minted_resp.json()["id"]
+
+    response = await admin_client.delete(
+        f"/v1/admin/auth/keys/{key_id}",
+        headers=_AUTH,
+    )
+    assert response.status_code == 200, response.text
+
+    row = (await db_session.execute(select(ApiKey).where(ApiKey.id == key_id))).scalar_one()
+    assert row.managed is True
+    assert row.revoked_at is not None
+
+
+@pytest.mark.asyncio
+async def test_admin_revoke_idempotent_on_already_revoked(admin_client, db_session, seed_user):
+    """Revoking an already-revoked key returns 200 (idempotent), not
+    an error. Useful for migration retry semantics."""
+    minted_resp = await admin_client.post(
+        "/v1/admin/auth/keys",
+        headers=_AUTH,
+        json={"target_clerk_id": seed_user.clerk_id, "label": "double-revoke"},
+    )
+    key_id = minted_resp.json()["id"]
+
+    await admin_client.delete(
+        f"/v1/admin/auth/keys/{key_id}",
+        headers=_AUTH,
+    )
+    r = await admin_client.delete(
+        f"/v1/admin/auth/keys/{key_id}",
+        headers=_AUTH,
+    )
+    assert r.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_admin_revoke_unknown_key(admin_client):
+    """404 for a key id that doesn't exist."""
+
+    r = await admin_client.delete(
+        f"/v1/admin/auth/keys/{uuid.uuid4()}",
+        headers=_AUTH,
+    )
+    assert r.status_code == 404
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "route_provider_id",
+    [
+        V2_MANAGED_AI_PROVIDER_ID,
+        V2_LEGACY_PUBLIC_MANAGED_AI_PROVIDER_ID,
+        V2_LEGACY_MANAGED_AI_PROVIDER_ID,
+    ],
+)
+async def test_admin_upsert_managed_ai_provider_writes_fixed_contract(
+    admin_client, db_session, seed_user, route_provider_id: str
+):
+    from sqlalchemy import select
+
+    from app.models.ai_provider import AiProvider, AiProviderAuthPayload
+    from app.models.audit import ControlPlaneAuditEvent
+    from app.services.managed_ai_provider import (
+        MANAGED_AI_PROVIDER_API_MODE,
+        MANAGED_AI_PROVIDER_RUNTIME_ENV,
+    )
+    from app.services.vault_crypto import decrypt
+
+    raw_key = "sk-admin-managed-secret"
+    managed_models = [
+        {
+            "id": "gpt-5.4-mini",
+            "context_window": 272000,
+            "max_tokens": 128000,
+            "input_modalities": ["text", "image"],
+            "supports_vision": True,
+            "supports_tools": True,
+            "supports_reasoning": True,
+        }
+    ]
+    wire_models = [
+        {
+            "id": "gpt-5.4-mini",
+            "max_tokens": 128000,
+            "context_window": 272000,
+            "supports_tools": True,
+            "supports_vision": True,
+            "input_modalities": ["text", "image"],
+            "supports_reasoning": True,
+        }
+    ]
+    previous_audit_ids = set(
+        (
+            await db_session.scalars(
+                select(ControlPlaneAuditEvent.id).where(
+                    ControlPlaneAuditEvent.action == "ai_provider.managed.upsert",
+                    ControlPlaneAuditEvent.resource_id == V2_MANAGED_AI_PROVIDER_ID,
+                )
+            )
+        ).all()
+    )
+    r = await admin_client.put(
+        f"/v1/admin/ai-providers/{route_provider_id}",
+        headers=_AUTH,
+        json={
+            "target_clerk_id": seed_user.clerk_id,
+            "base_url": "https://ai-gateway.clawdi.ai/v1",
+            "api_key": raw_key,
+            "default_model": "gpt-5.4-mini",
+            "models": managed_models,
+        },
+    )
+    assert r.status_code == 200, r.text
+    assert raw_key not in r.text
+    expected_response = {
+        "owner_user_id": str(seed_user.id),
+        "owner_clerk_id": seed_user.clerk_id,
+        "provider_id": V2_MANAGED_AI_PROVIDER_ID,
+        "api_mode": MANAGED_AI_PROVIDER_API_MODE,
+        "runtime_env_name": MANAGED_AI_PROVIDER_RUNTIME_ENV,
+        "base_url": "https://ai-gateway.clawdi.ai/v1",
+        "models": wire_models,
+        "has_api_key": True,
+    }
+    assert r.json() == expected_response
+    assert r.content == json.dumps(expected_response, separators=(",", ":")).encode()
+
+    provider = (
+        await db_session.execute(
+            select(AiProvider).where(
+                AiProvider.owner_user_id == seed_user.id,
+                AiProvider.provider_id == V2_MANAGED_AI_PROVIDER_ID,
+            )
+        )
+    ).scalar_one()
+    assert provider.type == "custom_openai_compatible"
+    assert provider.api_mode == MANAGED_AI_PROVIDER_API_MODE
+    assert provider.auth_type == "api_key"
+    assert provider.auth_ref is None
+    assert provider.auth_metadata == {"source": "managed", "profile": "default"}
+    assert provider.managed_by == "clawdi"
+    assert provider.runtime_env_name == MANAGED_AI_PROVIDER_RUNTIME_ENV
+    assert provider.models == managed_models
+    assert provider.archived_at is None
+
+    payload = (
+        await db_session.execute(
+            select(AiProviderAuthPayload).where(
+                AiProviderAuthPayload.owner_user_id == seed_user.id,
+                AiProviderAuthPayload.provider_id == V2_MANAGED_AI_PROVIDER_ID,
+                AiProviderAuthPayload.auth_profile == "default",
+            )
+        )
+    ).scalar_one()
+    assert payload.kind == "api_key"
+    assert payload.source == "managed"
+    assert payload.payload_metadata == {"runtime_env_name": MANAGED_AI_PROVIDER_RUNTIME_ENV}
+    assert decrypt(payload.encrypted_payload, payload.nonce) == raw_key
+
+    for method in (admin_client.get, admin_client.delete):
+        unchanged_method_response = await method(
+            f"/v1/admin/ai-providers/{route_provider_id}",
+            headers=_AUTH,
+        )
+        assert unchanged_method_response.status_code == 405
+        assert unchanged_method_response.headers["allow"] == "PUT"
+        assert unchanged_method_response.content == b'{"detail":"Method Not Allowed"}'
+
+    event = (
+        await db_session.execute(
+            select(ControlPlaneAuditEvent).where(
+                ControlPlaneAuditEvent.action == "ai_provider.managed.upsert",
+                ControlPlaneAuditEvent.resource_id == V2_MANAGED_AI_PROVIDER_ID,
+                ControlPlaneAuditEvent.id.not_in(previous_audit_ids),
+            )
+        )
+    ).scalar_one()
+    assert event.actor_type == "admin"
+    assert event.target_user_id == seed_user.id
+    assert event.source == "api.admin"
+    audit_models = [{**managed_models[0], "max_tokens": "[REDACTED]"}]
+    assert event.details == {
+        "provider_id": V2_MANAGED_AI_PROVIDER_ID,
+        "api_mode": MANAGED_AI_PROVIDER_API_MODE,
+        "runtime_env_name": MANAGED_AI_PROVIDER_RUNTIME_ENV,
+        "models": audit_models,
+        "has_capabilities": False,
+    }
+
+
+@pytest.mark.asyncio
+async def test_admin_fixed_managed_ai_provider_preserves_null_models_wire_response(
+    admin_client,
+    seed_user,
+):
+    from app.services.managed_ai_provider import (
+        MANAGED_AI_PROVIDER_API_MODE,
+        MANAGED_AI_PROVIDER_RUNTIME_ENV,
+    )
+
+    response = await admin_client.put(
+        f"/v1/admin/ai-providers/{V2_MANAGED_AI_PROVIDER_ID}",
+        headers=_AUTH,
+        json={
+            "target_clerk_id": seed_user.clerk_id,
+            "base_url": "https://ai-gateway.clawdi.ai/v1",
+            "api_key": "sk-fixed-null-models",
+        },
+    )
+
+    expected = {
+        "owner_user_id": str(seed_user.id),
+        "owner_clerk_id": seed_user.clerk_id,
+        "provider_id": V2_MANAGED_AI_PROVIDER_ID,
+        "api_mode": MANAGED_AI_PROVIDER_API_MODE,
+        "runtime_env_name": MANAGED_AI_PROVIDER_RUNTIME_ENV,
+        "base_url": "https://ai-gateway.clawdi.ai/v1",
+        "models": None,
+        "has_api_key": True,
+    }
+    assert response.status_code == 200, response.text
+    assert response.json() == expected
+    assert response.content == json.dumps(expected, separators=(",", ":")).encode()
+
+
+@pytest.mark.asyncio
+async def test_admin_fixed_managed_provider_invalidates_bound_runtime_on_manifest_changes(
+    admin_client,
+    db_session,
+    seed_user,
+):
+    from app.models.hosted_runtime import HostedRuntimeState
+    from app.services import sync_events
+    from tests.conftest import create_env_with_project
+
+    env = await create_env_with_project(
+        db_session,
+        user_id=seed_user.id,
+        machine_id=f"fixed-managed-provider-event-{uuid.uuid4().hex[:8]}",
+        machine_name="Fixed managed provider event",
+        agent_type="openclaw",
+    )
+    db_session.add(
+        HostedRuntimeState(
+            environment_id=env.id,
+            deployment_id="fixed-managed-provider-event",
+            instance_id=f"instance-{uuid.uuid4().hex}",
+            generation=1,
+            cli_package_spec="clawdi@1.2.3-test",
+            locale={"language": "en", "timezone": "UTC"},
+            system={},
+            live_sync={"enabled": False, "agents": []},
+            recovery={"cacheManifest": True, "allowOfflineBoot": True},
+            tools={
+                "codex": {
+                    "enabled": True,
+                    "provider_id": V2_LEGACY_MANAGED_AI_PROVIDER_ID,
+                    "primary_model": {
+                        "provider_id": V2_LEGACY_MANAGED_AI_PROVIDER_ID,
+                        "model": "gpt-5.5",
+                    },
+                }
+            },
+            runtimes={
+                "openclaw": {
+                    "enabled": True,
+                    "providerMode": "configured",
+                    "provider_ids": [V2_LEGACY_MANAGED_AI_PROVIDER_ID],
+                    "primary_model": {
+                        "provider_id": V2_LEGACY_MANAGED_AI_PROVIDER_ID,
+                        "model": "gpt-5.5",
+                    },
+                    "install": {"source": "official"},
+                }
+            },
+        )
+    )
+    await db_session.commit()
+
+    queue = sync_events.subscribe(seed_user.id, frozenset(), environment_id=env.id)
+    body = {
+        "target_clerk_id": seed_user.clerk_id,
+        "base_url": "https://ai-gateway.clawdi.ai/v1",
+        "api_key": "sk-fixed-initial",
+        "models": [{"id": "gpt-5.5"}],
+    }
+    expected_event = {
+        "type": "runtime_manifest_changed",
+        "environment_id": str(env.id),
+    }
+    try:
+        created = await admin_client.put(
+            f"/v1/admin/ai-providers/{V2_LEGACY_MANAGED_AI_PROVIDER_ID}",
+            headers=_AUTH,
+            json=body,
+        )
+        assert created.status_code == 200, created.text
+        assert queue.get_nowait() == expected_event
+        assert queue.empty()
+
+        credential_only = await admin_client.put(
+            f"/v1/admin/ai-providers/{V2_MANAGED_AI_PROVIDER_ID}",
+            headers=_AUTH,
+            json={**body, "api_key": "sk-fixed-rotated"},
+        )
+        assert credential_only.status_code == 200, credential_only.text
+        assert queue.get_nowait() == expected_event
+        assert queue.empty()
+
+        replayed_write = await admin_client.put(
+            f"/v1/admin/ai-providers/{V2_MANAGED_AI_PROVIDER_ID}",
+            headers=_AUTH,
+            json={**body, "api_key": "sk-fixed-rotated"},
+        )
+        assert replayed_write.status_code == 200, replayed_write.text
+        assert queue.get_nowait() == expected_event
+        assert queue.empty()
+
+        catalog_changed = await admin_client.put(
+            f"/v1/admin/ai-providers/{V2_MANAGED_AI_PROVIDER_ID}",
+            headers=_AUTH,
+            json={
+                **body,
+                "api_key": "sk-fixed-rotated",
+                "models": [{"id": "gpt-5.6"}],
+            },
+        )
+        assert catalog_changed.status_code == 200, catalog_changed.text
+        assert queue.get_nowait() == expected_event
+        assert queue.empty()
+    finally:
+        sync_events.unsubscribe(seed_user.id, queue)
+
+
+@pytest.mark.asyncio
+async def test_admin_deployment_managed_ai_provider_lifecycle_is_owner_scoped_and_audited(
+    admin_client,
+    db_session,
+    seed_user,
+):
+    from sqlalchemy import select
+
+    from app.models.ai_provider import AiProvider, AiProviderAuthPayload
+    from app.models.audit import ControlPlaneAuditEvent
+    from app.models.user import User
+
+    provider_id = f"{V2_DEPLOYMENT_MANAGED_AI_PROVIDER_PREFIX}42"
+    marker = "provisioning-intent-42"
+    owner = {"kind": "clerk", "ref": seed_user.clerk_id}
+    created = await admin_client.put(
+        f"/v1/admin/ai-providers/{provider_id}",
+        headers=_AUTH,
+        json={
+            "owner": owner,
+            "base_url": "https://ai-gateway.clawdi.ai/v1",
+            "api_key": "sk-deployment-owner-one",
+            "models": [{"id": "gpt-5.5"}],
+            "capabilities": {
+                "chat": True,
+                MANAGED_AI_PROVIDER_PROVENANCE_CAPABILITY: marker,
+            },
+        },
+    )
+    assert created.status_code == 200, created.text
+    created_body = created.json()
+    assert str(UUID(created_body["id"])) == created_body["id"]
+    assert created_body == {
+        "id": created_body["id"],
+        "owner": owner,
+        "owner_user_id": str(seed_user.id),
+        "owner_clerk_id": seed_user.clerk_id,
+        "provider_id": provider_id,
+        "scope": "account_global",
+        "type": "custom_openai_compatible",
+        "label": "Clawdi managed",
+        "api_mode": "openai_responses",
+        "auth": {"type": "api_key", "source": "managed", "profile": "default"},
+        "managed_by": "clawdi",
+        "runtime_env_name": "CLAWDI_AI_API_KEY",
+        "base_url": "https://ai-gateway.clawdi.ai/v1",
+        "capabilities": {
+            "chat": True,
+            MANAGED_AI_PROVIDER_PROVENANCE_CAPABILITY: marker,
+        },
+        "models": [{"id": "gpt-5.5"}],
+        "has_api_key": True,
+    }
+
+    discovered = await admin_client.get(
+        f"/v1/admin/ai-providers/{provider_id}",
+        headers=_AUTH,
+        params=owner,
+    )
+    assert discovered.status_code == 200, discovered.text
+    assert discovered.json() == created_body
+
+    other = User(clerk_id="managed_provider_other_owner")
+    db_session.add(other)
+    await db_session.flush()
+    other_owner = {"kind": "clerk", "ref": other.clerk_id}
+
+    cross_owner_get = await admin_client.get(
+        f"/v1/admin/ai-providers/{provider_id}",
+        headers=_AUTH,
+        params=other_owner,
+    )
+    assert cross_owner_get.status_code == 404, cross_owner_get.text
+    cross_owner_delete = await admin_client.delete(
+        f"/v1/admin/ai-providers/{provider_id}",
+        headers=_AUTH,
+        params=other_owner,
+    )
+    assert cross_owner_delete.status_code == 404, cross_owner_delete.text
+    metadata = {"owner": owner, "base_url": "https://gateway.example.test/v1", "models": None}
+    cross_owner_replace = await _replace_managed_provider_runtime_metadata(
+        admin_client,
+        provider_id,
+        {**metadata, "owner": other_owner},
+    )
+    assert cross_owner_replace.status_code == 404, cross_owner_replace.text
+
+    still_active = (
+        await db_session.execute(
+            select(AiProvider).where(
+                AiProvider.owner_user_id == seed_user.id,
+                AiProvider.provider_id == provider_id,
+            )
+        )
+    ).scalar_one()
+    assert still_active.archived_at is None
+
+    deleted = await admin_client.delete(
+        f"/v1/admin/ai-providers/{provider_id}",
+        headers=_AUTH,
+        params=owner,
+    )
+    assert deleted.status_code == 200, deleted.text
+    assert deleted.json() == {
+        "status": "deleted",
+        "provider_id": provider_id,
+        "remote_revoke_status": "not_required",
+    }
+
+    provider = (
+        await db_session.execute(
+            select(AiProvider).where(
+                AiProvider.owner_user_id == seed_user.id,
+                AiProvider.provider_id == provider_id,
+            )
+        )
+    ).scalar_one()
+    payload = (
+        await db_session.execute(
+            select(AiProviderAuthPayload).where(
+                AiProviderAuthPayload.owner_user_id == seed_user.id,
+                AiProviderAuthPayload.provider_id == provider_id,
+            )
+        )
+    ).scalar_one()
+    assert provider.archived_at is not None
+    assert payload.archived_at is not None
+
+    audit_events = (
+        (
+            await db_session.execute(
+                select(ControlPlaneAuditEvent).where(
+                    ControlPlaneAuditEvent.resource_type == "ai_provider",
+                    ControlPlaneAuditEvent.resource_id == provider_id,
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert Counter(
+        (event.action, event.details["outcome"], event.target_user_id) for event in audit_events
+    ) == Counter(
+        [
+            ("ai_provider.managed.upsert", "success", seed_user.id),
+            ("ai_provider.managed.credential.rotate", "success", seed_user.id),
+            ("ai_provider.managed.read", "success", seed_user.id),
+            ("ai_provider.managed.read", "cross_owner_denied", other.id),
+            ("ai_provider.managed.delete", "cross_owner_denied", other.id),
+            ("ai_provider.managed.runtime_metadata.replace", "cross_owner_denied", other.id),
+            ("ai_provider.managed.delete", "success", seed_user.id),
+            ("ai_provider.managed.credential.archive", "success", seed_user.id),
+        ]
+    )
+    expected_owners = {
+        seed_user.id: owner,
+        other.id: other_owner,
+    }
+    for event in audit_events:
+        assert event.actor_type == "admin"
+        assert event.source == "api.admin"
+        assert event.created_at is not None
+        assert event.details["auth_method"] == "x_admin_key"
+        assert event.details["owner"] == expected_owners[event.target_user_id]
+        assert event.details["owner_user_id"] == str(event.target_user_id)
+        assert event.details["provider_id"] == provider_id
+
+    for rejected_provider_id, body, expected_status in (
+        (V2_MANAGED_AI_PROVIDER_ID, metadata, 404),
+        ("ordinary-provider", metadata, 404),
+        (f"{V2_DEPLOYMENT_MANAGED_AI_PROVIDER_PREFIX}404", metadata, 404),
+        (
+            provider_id,
+            {
+                **metadata,
+                "api_key": "not-accepted",
+                "auth": {"type": "none"},
+                "credential": {"type": "api_key"},
+                "label": "not-accepted",
+                "capabilities": {},
+                "default_model": "not-accepted",
+            },
+            422,
+        ),
+        (provider_id, {"owner": owner, "models": None}, 422),
+        (provider_id, {"owner": owner, "base_url": metadata["base_url"]}, 422),
+    ):
+        response = await _replace_managed_provider_runtime_metadata(
+            admin_client, rejected_provider_id, body
+        )
+        assert response.status_code == expected_status, response.text
+        if "api_key" in body:
+            assert {error["loc"][-1] for error in response.json()["detail"]} == {
+                "api_key",
+                "auth",
+                "credential",
+                "label",
+                "capabilities",
+                "default_model",
+            }
+    archived = await _replace_managed_provider_runtime_metadata(admin_client, provider_id, metadata)
+    assert archived.status_code == 404, archived.text
+
+
+@pytest.mark.asyncio
+async def test_admin_cleanup_deployment_managed_provider_archives_exact_identity_idempotently(
+    admin_client,
+    db_session,
+    seed_user,
+):
+    from sqlalchemy import select
+
+    from app.models.ai_provider import AiProvider, AiProviderAuthPayload
+
+    provider_id = f"{V2_DEPLOYMENT_MANAGED_AI_PROVIDER_PREFIX}5901"
+    marker = "a" * 64
+    owner = {"kind": "clerk", "ref": seed_user.clerk_id}
+    created = await admin_client.put(
+        f"/v1/admin/ai-providers/{provider_id}",
+        headers=_AUTH,
+        json={
+            "owner": owner,
+            "base_url": "https://ai-gateway.clawdi.ai/v1",
+            "api_key": "sk-cleanup-active",
+            "capabilities": {MANAGED_AI_PROVIDER_PROVENANCE_CAPABILITY: marker},
+        },
+    )
+    assert created.status_code == 200, created.text
+    provider_uuid = created.json()["id"]
+    request = {
+        "owner": owner,
+        "expected_provider_uuid": provider_uuid,
+        "provisioning_discovery_key": marker,
+    }
+
+    archived = await admin_client.post(
+        f"/v1/admin/ai-providers/{provider_id}/cleanup",
+        headers=_AUTH,
+        json=request,
+    )
+    assert archived.status_code == 200, archived.text
+    receipt = archived.json()
+    assert receipt == {
+        "status": "archived",
+        "authority": "active_owner",
+        "owner": owner,
+        "provider_id": provider_id,
+        "provider_uuid": provider_uuid,
+        "provisioning_discovery_key": marker,
+        "archived_at": receipt["archived_at"],
+        "principal_cleanup_completed_at": None,
+    }
+
+    replayed = await admin_client.post(
+        f"/v1/admin/ai-providers/{provider_id}/cleanup",
+        headers=_AUTH,
+        json=request,
+    )
+    assert replayed.status_code == 200, replayed.text
+    assert replayed.json() == {
+        **receipt,
+        "status": "already_archived",
+    }
+    provider = await db_session.get(AiProvider, UUID(provider_uuid))
+    assert provider is not None and provider.archived_at is not None
+    payload = (
+        await db_session.execute(
+            select(AiProviderAuthPayload).where(
+                AiProviderAuthPayload.owner_user_id == seed_user.id,
+                AiProviderAuthPayload.provider_id == provider_id,
+            )
+        )
+    ).scalar_one()
+    assert payload.archived_at is not None
+
+
+@pytest.mark.asyncio
+async def test_admin_cleanup_deployment_managed_provider_allows_suspended_owner_only(
+    admin_client,
+    db_session,
+    seed_user,
+):
+    from sqlalchemy import select
+
+    from app.models.ai_provider import AiProvider, AiProviderAuthPayload
+
+    provider_id = f"{V2_DEPLOYMENT_MANAGED_AI_PROVIDER_PREFIX}5903"
+    marker = "e" * 64
+    owner = {"kind": "clerk", "ref": seed_user.clerk_id}
+    created = await admin_client.put(
+        f"/v1/admin/ai-providers/{provider_id}",
+        headers=_AUTH,
+        json={
+            "owner": owner,
+            "base_url": "https://ai-gateway.clawdi.ai/v1",
+            "api_key": "sk-cleanup-suspended",
+            "capabilities": {MANAGED_AI_PROVIDER_PROVENANCE_CAPABILITY: marker},
+        },
+    )
+    assert created.status_code == 200, created.text
+    provider_uuid = created.json()["id"]
+
+    suspended = await admin_client.put(
+        "/v1/admin/auth/suspensions",
+        headers=_AUTH,
+        json={
+            "target_clerk_id": seed_user.clerk_id,
+            "suspended": True,
+            "reason": "hosted_abuse_cleanup",
+        },
+    )
+    assert suspended.status_code == 200, suspended.text
+
+    ordinary_read = await admin_client.get(
+        f"/v1/admin/ai-providers/{provider_id}",
+        headers=_AUTH,
+        params=owner,
+    )
+    assert ordinary_read.status_code == 403, ordinary_read.text
+    ordinary_metadata_write = await _replace_managed_provider_runtime_metadata(
+        admin_client,
+        provider_id,
+        {
+            "owner": owner,
+            "base_url": "https://ai-gateway.clawdi.ai/v1",
+            "models": [{"id": "forbidden-model"}],
+        },
+    )
+    assert ordinary_metadata_write.status_code == 403, ordinary_metadata_write.text
+
+    archived = await admin_client.post(
+        f"/v1/admin/ai-providers/{provider_id}/cleanup",
+        headers=_AUTH,
+        json={
+            "owner": owner,
+            "expected_provider_uuid": provider_uuid,
+            "provisioning_discovery_key": marker,
+        },
+    )
+    assert archived.status_code == 200, archived.text
+    receipt = archived.json()
+    assert receipt["status"] == "archived"
+    assert receipt["authority"] == "active_owner"
+    assert receipt["principal_cleanup_completed_at"] is None
+
+    provider = await db_session.get(AiProvider, UUID(provider_uuid))
+    assert provider is not None and provider.archived_at is not None
+    assert provider.models is None
+    payload = await db_session.scalar(
+        select(AiProviderAuthPayload).where(
+            AiProviderAuthPayload.owner_user_id == seed_user.id,
+            AiProviderAuthPayload.provider_id == provider_id,
+        )
+    )
+    assert payload is not None and payload.archived_at is not None
+
+
+@pytest.mark.asyncio
+@pytest.mark.committed_db
+async def test_admin_provider_archive_is_idempotent_and_fences_recreated_incarnation(
+    admin_client,
+    db_session,
+    engine,
+    seed_user,
+):
+    from sqlalchemy import select
+
+    from app.models.ai_provider import AiProvider
+    from app.services.ai_provider_credentials import lock_ai_provider_owner
+
+    provider_id = "repairable-provider"
+    owner_user_id = seed_user.id
+    provider = AiProvider(
+        owner_user_id=owner_user_id,
+        provider_id=provider_id,
+        type="openai",
+        base_url="https://api.openai.com/v1",
+        api_mode="openai_responses",
+        auth_type="none",
+        managed_by="user",
+    )
+    db_session.add(provider)
+    await db_session.commit()
+    owner = {"kind": "clerk", "ref": seed_user.clerk_id}
+    authority_url = f"/v1/admin/ai-providers/{provider_id}/removal-authority"
+    archive_url = f"/v1/admin/ai-providers/{provider_id}/archive"
+    active_authority = await admin_client.get(
+        authority_url,
+        headers=_AUTH,
+        params=owner,
+    )
+    assert active_authority.status_code == 200, active_authority.text
+    active_token = active_authority.json()["incarnation_token"]
+    active_incarnation_id = provider.incarnation_id
+    provider.label = "Edited without reactivation"
+    provider.activate()
+    await db_session.commit()
+    edited_authority = await admin_client.get(
+        authority_url,
+        headers=_AUTH,
+        params=owner,
+    )
+    assert edited_authority.json()["incarnation_token"] == active_token
+    assert provider.incarnation_id == active_incarnation_id
+    body = {"owner": owner, "expected_incarnation_token": active_token}
+    archive_headers = {**_AUTH, "Idempotency-Key": "archive-active-incarnation"}
+
+    archived = await admin_client.post(
+        archive_url,
+        headers=archive_headers,
+        json=body,
+    )
+    replayed = await admin_client.post(
+        archive_url,
+        headers=archive_headers,
+        json=body,
+    )
+    archived_authority = await admin_client.get(
+        authority_url,
+        headers=_AUTH,
+        params=owner,
+    )
+    archived_token = archived_authority.json()["incarnation_token"]
+    already_archived = await admin_client.post(
+        archive_url,
+        headers={**_AUTH, "Idempotency-Key": "archive-archived-incarnation"},
+        json={"owner": owner, "expected_incarnation_token": archived_token},
+    )
+    absent_authority = await admin_client.get(
+        "/v1/admin/ai-providers/never-created/removal-authority",
+        headers=_AUTH,
+        params=owner,
+    )
+    absent = await admin_client.post(
+        "/v1/admin/ai-providers/never-created/archive",
+        headers={**_AUTH, "Idempotency-Key": "archive-absent-incarnation"},
+        json={
+            "owner": owner,
+            "expected_incarnation_token": absent_authority.json()["incarnation_token"],
+        },
+    )
+
+    assert archived.status_code == 200, archived.text
+    assert archived.json() == {
+        "status": "archived",
+        "provider_id": provider_id,
+        "remote_revoke_status": "not_required",
+    }
+    assert replayed.json() == archived.json()
+    assert archived_token == active_token
+    assert already_archived.json()["status"] == "already_archived"
+    assert absent.json()["status"] == "not_found"
+    await db_session.refresh(provider)
+    assert provider.archived_at is not None
+
+    await db_session.rollback()
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    reactivation_holds_lock = asyncio.Event()
+    allow_reactivation_commit = asyncio.Event()
+
+    async def reactivate_provider() -> None:
+        async with session_factory() as session:
+            await lock_ai_provider_owner(session, owner_user_id)
+            recreated = await session.scalar(
+                select(AiProvider)
+                .where(
+                    AiProvider.owner_user_id == owner_user_id,
+                    AiProvider.provider_id == provider_id,
+                )
+                .with_for_update()
+            )
+            assert recreated is not None
+            recreated.activate()
+            recreated.label = "Recreated provider"
+            reactivation_holds_lock.set()
+            await allow_reactivation_commit.wait()
+            await session.commit()
+
+    reactivation = asyncio.create_task(reactivate_provider())
+    await asyncio.wait_for(reactivation_holds_lock.wait(), timeout=5)
+    stale_archive_request = asyncio.create_task(
+        admin_client.post(
+            archive_url,
+            headers={**_AUTH, "Idempotency-Key": "delayed-old-incarnation"},
+            json={"owner": owner, "expected_incarnation_token": archived_token},
+        )
+    )
+    try:
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(asyncio.shield(stale_archive_request), timeout=0.05)
+    finally:
+        allow_reactivation_commit.set()
+    stale_archive = await asyncio.wait_for(stale_archive_request, timeout=5)
+    await asyncio.wait_for(reactivation, timeout=5)
+
+    recreated_authority = await admin_client.get(
+        authority_url,
+        headers=_AUTH,
+        params=owner,
+    )
+    recreated_token = recreated_authority.json()["incarnation_token"]
+    assert recreated_token != archived_token
+    assert stale_archive.status_code == 409
+    assert stale_archive.json()["detail"]["code"] == "provider_incarnation_mismatch"
+    await db_session.refresh(provider)
+    assert provider.archived_at is None
+
+
+@pytest.mark.asyncio
+async def test_admin_cleanup_proves_exact_provider_archived_by_completed_principal_cleanup(
+    admin_client,
+    db_session,
+    seed_user,
+):
+    from app.models.ai_provider import AiProvider
+    from app.models.principal_lifecycle import PrincipalLifecycle
+    from app.services.principal_lifecycle import complete_principal_cleanup
+
+    provider_id = f"{V2_DEPLOYMENT_MANAGED_AI_PROVIDER_PREFIX}59"
+    marker = "b" * 64
+    owner = {"kind": "clerk", "ref": seed_user.clerk_id}
+    created = await admin_client.put(
+        f"/v1/admin/ai-providers/{provider_id}",
+        headers=_AUTH,
+        json={
+            "owner": owner,
+            "base_url": "https://ai-gateway.clawdi.ai/v1",
+            "api_key": "sk-cleanup-terminated",
+            "capabilities": {MANAGED_AI_PROVIDER_PROVENANCE_CAPABILITY: marker},
+        },
+    )
+    assert created.status_code == 200, created.text
+    provider_uuid = created.json()["id"]
+    now = datetime.now(UTC)
+    seed_user.clerk_issuer = _CLERK_ISSUER
+    lifecycle = PrincipalLifecycle(
+        issuer=_CLERK_ISSUER,
+        subject=seed_user.clerk_id,
+        user_id=seed_user.id,
+        terminated_at=now,
+        next_cleanup_attempt_at=now,
+    )
+    db_session.add(lifecycle)
+    await db_session.flush()
+    await complete_principal_cleanup(db_session, lifecycle_id=lifecycle.id, now=now)
+    await db_session.commit()
+
+    ordinary_read = await admin_client.get(
+        f"/v1/admin/ai-providers/{provider_id}",
+        headers=_AUTH,
+        params=owner,
+    )
+    assert ordinary_read.status_code == 403, ordinary_read.text
+    ordinary_metadata_write = await _replace_managed_provider_runtime_metadata(
+        admin_client,
+        provider_id,
+        {
+            "owner": owner,
+            "base_url": "https://ai-gateway.clawdi.ai/v1",
+            "models": None,
+        },
+    )
+    assert ordinary_metadata_write.status_code == 403, ordinary_metadata_write.text
+
+    proved = await admin_client.post(
+        f"/v1/admin/ai-providers/{provider_id}/cleanup",
+        headers=_AUTH,
+        json={
+            "owner": owner,
+            "expected_provider_uuid": provider_uuid,
+            "provisioning_discovery_key": marker,
+        },
+    )
+    assert proved.status_code == 200, proved.text
+    receipt = proved.json()
+    assert receipt == {
+        "status": "already_archived",
+        "authority": "completed_principal_cleanup",
+        "owner": owner,
+        "provider_id": provider_id,
+        "provider_uuid": provider_uuid,
+        "provisioning_discovery_key": marker,
+        "archived_at": receipt["archived_at"],
+        "principal_cleanup_completed_at": receipt["principal_cleanup_completed_at"],
+    }
+    await db_session.refresh(lifecycle)
+    provider = await db_session.get(AiProvider, UUID(provider_uuid))
+    assert provider is not None and provider.archived_at is not None
+    assert lifecycle.cleanup_completed_at is not None
+    assert lifecycle.cleanup_attempts == 1
+    assert datetime.fromisoformat(receipt["archived_at"]) == provider.archived_at
+    assert (
+        datetime.fromisoformat(receipt["principal_cleanup_completed_at"])
+        == lifecycle.cleanup_completed_at
+    )
+
+
+@pytest.mark.asyncio
+async def test_admin_cleanup_deployment_managed_provider_rejects_mismatch_and_pending_cleanup(
+    admin_client,
+    db_session,
+    seed_user,
+):
+    from app.models.ai_provider import AiProvider
+    from app.models.principal_lifecycle import PrincipalLifecycle
+
+    provider_id = f"{V2_DEPLOYMENT_MANAGED_AI_PROVIDER_PREFIX}5902"
+    marker = "c" * 64
+    owner = {"kind": "clerk", "ref": seed_user.clerk_id}
+    created = await admin_client.put(
+        f"/v1/admin/ai-providers/{provider_id}",
+        headers=_AUTH,
+        json={
+            "owner": owner,
+            "base_url": "https://ai-gateway.clawdi.ai/v1",
+            "api_key": "sk-cleanup-mismatch",
+            "capabilities": {MANAGED_AI_PROVIDER_PROVENANCE_CAPABILITY: marker},
+        },
+    )
+    assert created.status_code == 200, created.text
+    provider_uuid = created.json()["id"]
+    request = {
+        "owner": owner,
+        "expected_provider_uuid": provider_uuid,
+        "provisioning_discovery_key": marker,
+    }
+
+    for mismatch in (
+        {**request, "expected_provider_uuid": str(uuid.uuid4())},
+        {**request, "provisioning_discovery_key": "d" * 64},
+    ):
+        rejected = await admin_client.post(
+            f"/v1/admin/ai-providers/{provider_id}/cleanup",
+            headers=_AUTH,
+            json=mismatch,
+        )
+        assert rejected.status_code == 409, rejected.text
+
+    suspended = await admin_client.put(
+        "/v1/admin/auth/suspensions",
+        headers=_AUTH,
+        json={
+            "target_clerk_id": seed_user.clerk_id,
+            "suspended": True,
+            "reason": "pending_termination_cleanup",
+        },
+    )
+    assert suspended.status_code == 200, suspended.text
+    now = datetime.now(UTC)
+    seed_user.clerk_issuer = _CLERK_ISSUER
+    lifecycle = PrincipalLifecycle(
+        issuer=_CLERK_ISSUER,
+        subject=seed_user.clerk_id,
+        user_id=seed_user.id,
+        terminated_at=now,
+        next_cleanup_attempt_at=now,
+    )
+    db_session.add(lifecycle)
+    await db_session.commit()
+    pending = await admin_client.post(
+        f"/v1/admin/ai-providers/{provider_id}/cleanup",
+        headers=_AUTH,
+        json=request,
+    )
+    assert pending.status_code == 403, pending.text
+    lifecycle.cleanup_attempts = 1
+    lifecycle.cleanup_completed_at = now
+    lifecycle.next_cleanup_attempt_at = None
+    await db_session.commit()
+    inconsistent = await admin_client.post(
+        f"/v1/admin/ai-providers/{provider_id}/cleanup",
+        headers=_AUTH,
+        json=request,
+    )
+    assert inconsistent.status_code == 409, inconsistent.text
+    provider = await db_session.get(AiProvider, UUID(provider_uuid))
+    assert provider is not None and provider.archived_at is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "legacy_runtime_env",
+    ["CLAWDI_MANAGED_OPENAI_API_KEY", MANAGED_AI_PROVIDER_RUNTIME_ENV],
+)
+async def test_admin_deployment_provider_invalidates_only_bound_runtime_on_manifest_changes(
+    admin_client,
+    db_session,
+    seed_user,
+    legacy_runtime_env: str,
+):
+    from sqlalchemy import select
+
+    from app.models.ai_provider import AiProvider, AiProviderAuthPayload
+    from app.models.hosted_runtime import HostedRuntimeState
+    from app.models.user import User
+    from app.services import sync_events
+    from tests.conftest import create_env_with_project
+
+    deployment_id = "8403"
+    provider_id = f"{V2_DEPLOYMENT_MANAGED_AI_PROVIDER_PREFIX}{deployment_id}"
+    owner = {"kind": "clerk", "ref": seed_user.clerk_id}
+    other = User(clerk_id="managed_provider_manifest_event_other_owner")
+    db_session.add(other)
+    await db_session.flush()
+
+    environments = []
+    for user, state_deployment_id in (
+        (seed_user, deployment_id),
+        (seed_user, "unbound-deployment"),
+        (other, deployment_id),
+    ):
+        env = await create_env_with_project(
+            db_session,
+            user_id=user.id,
+            machine_id=f"managed-provider-event-{uuid.uuid4().hex[:8]}",
+            machine_name="Managed provider event",
+            agent_type="openclaw",
+        )
+        db_session.add(
+            HostedRuntimeState(
+                environment_id=env.id,
+                deployment_id=state_deployment_id,
+                instance_id=f"instance-{uuid.uuid4().hex}",
+                generation=1,
+                cli_package_spec="clawdi@1.2.3-test",
+                locale={"language": "en", "timezone": "UTC"},
+                system={},
+                live_sync={"enabled": False, "agents": []},
+                recovery={"cacheManifest": True, "allowOfflineBoot": True},
+                tools={
+                    "codex": {
+                        "enabled": True,
+                        "provider_id": V2_MANAGED_AI_PROVIDER_ID,
+                        "primary_model": {
+                            "provider_id": V2_MANAGED_AI_PROVIDER_ID,
+                            "model": "gpt-5.5",
+                        },
+                    }
+                },
+                runtimes={
+                    "openclaw": {
+                        "enabled": True,
+                        "providerMode": "configured",
+                        "provider_ids": [V2_MANAGED_AI_PROVIDER_ID],
+                        "primary_model": {
+                            "provider_id": V2_MANAGED_AI_PROVIDER_ID,
+                            "model": "gpt-5.5",
+                        },
+                        "install": {"source": "official"},
+                    }
+                },
+            )
+        )
+        environments.append((user, env))
+    await db_session.commit()
+
+    queues = [
+        sync_events.subscribe(user.id, frozenset(), environment_id=env.id)
+        for user, env in environments
+    ]
+    request_body = {
+        "owner": owner,
+        "base_url": "https://ai-gateway.clawdi.ai/v1",
+        "api_key": "sk-initial",
+        "label": "Hosted catalog",
+        "capabilities": {MANAGED_AI_PROVIDER_PROVENANCE_CAPABILITY: "deployment-8403"},
+        "models": [{"id": "gpt-5.5"}],
+    }
+    expected_event = {
+        "type": "runtime_manifest_changed",
+        "environment_id": str(environments[0][1].id),
+    }
+
+    def assert_only_bound_event() -> None:
+        assert queues[0].get_nowait() == expected_event
+        assert all(queue.empty() for queue in queues)
+
+    try:
+        created = await admin_client.put(
+            f"/v1/admin/ai-providers/{provider_id}", headers=_AUTH, json=request_body
+        )
+        assert created.status_code == 200, created.text
+        assert_only_bound_event()
+
+        credential_only = await admin_client.put(
+            f"/v1/admin/ai-providers/{provider_id}",
+            headers=_AUTH,
+            json={**request_body, "api_key": "sk-rotated"},
+        )
+        assert credential_only.status_code == 200, credential_only.text
+        assert_only_bound_event()
+
+        provider = await db_session.scalar(
+            select(AiProvider).where(
+                AiProvider.owner_user_id == seed_user.id,
+                AiProvider.provider_id == provider_id,
+            )
+        )
+        payload = await db_session.scalar(
+            select(AiProviderAuthPayload).where(
+                AiProviderAuthPayload.owner_user_id == seed_user.id,
+                AiProviderAuthPayload.provider_id == provider_id,
+            )
+        )
+        assert provider is not None and payload is not None
+
+        provider.api_mode = "openai_chat"
+        provider.runtime_env_name = legacy_runtime_env
+        payload.payload_metadata = {"runtime_env_name": legacy_runtime_env}
+        await db_session.commit()
+        await db_session.refresh(provider)
+        await db_session.refresh(payload)
+
+        def preserved_storage():
+            return (
+                provider.id,
+                provider.owner_user_id,
+                provider.provider_id,
+                provider.auth_type,
+                provider.auth_ref,
+                provider.auth_metadata,
+                provider.label,
+                provider.capabilities,
+                payload.id,
+                payload.owner_user_id,
+                payload.provider_id,
+                payload.auth_profile,
+                payload.encrypted_payload,
+                payload.nonce,
+                payload.credential_revision,
+                payload.kind,
+                payload.source,
+                payload.payload_metadata,
+                payload.consumer_environment_id,
+                payload.consumer_runtime,
+                payload.archived_at,
+                payload.created_at,
+                payload.updated_at,
+            )
+
+        preserved = preserved_storage()
+        readback = await admin_client.get(
+            f"/v1/admin/ai-providers/{provider_id}", headers=_AUTH, params=owner
+        )
+        assert readback.status_code == 200, readback.text
+        assert readback.json()["api_mode"] == MANAGED_AI_PROVIDER_API_MODE
+        assert readback.json()["runtime_env_name"] == MANAGED_AI_PROVIDER_RUNTIME_ENV
+        assert readback.json()["base_url"] == request_body["base_url"]
+        assert readback.json()["models"] == request_body["models"]
+        await db_session.refresh(provider)
+        assert provider.api_mode == "openai_chat"
+        assert provider.runtime_env_name == legacy_runtime_env
+        assert all(queue.empty() for queue in queues)
+
+        legacy_metadata = {
+            "owner": owner,
+            "base_url": request_body["base_url"],
+            "models": request_body["models"],
+        }
+        upgraded = await _replace_managed_provider_runtime_metadata(
+            admin_client, provider_id, legacy_metadata
+        )
+        assert upgraded.status_code == 200, upgraded.text
+        assert upgraded.json()["api_mode"] == MANAGED_AI_PROVIDER_API_MODE
+        assert upgraded.json()["runtime_env_name"] == MANAGED_AI_PROVIDER_RUNTIME_ENV
+        assert_only_bound_event()
+        await db_session.refresh(provider)
+        await db_session.refresh(payload)
+        assert provider.type == "custom_openai_compatible"
+        assert provider.api_mode == MANAGED_AI_PROVIDER_API_MODE
+        assert provider.managed_by == "clawdi"
+        assert provider.runtime_env_name == MANAGED_AI_PROVIDER_RUNTIME_ENV
+        assert provider.base_url == legacy_metadata["base_url"]
+        assert provider.models == legacy_metadata["models"]
+        assert preserved_storage() == preserved
+
+        unchanged_at = datetime.now(UTC) - timedelta(days=1)
+        provider.updated_at = unchanged_at
+        await db_session.commit()
+        replay = await _replace_managed_provider_runtime_metadata(
+            admin_client, provider_id, legacy_metadata
+        )
+        assert replay.status_code == 200, replay.text
+        assert replay.json() == upgraded.json()
+        await db_session.refresh(provider)
+        assert provider.updated_at == unchanged_at
+        assert all(queue.empty() for queue in queues)
+
+        metadata = {
+            "owner": owner,
+            "base_url": "https://catalog-gateway.example.test/v1",
+            "models": [
+                {
+                    "id": "hermes-primary",
+                    "supports_tools": True,
+                    "compat": {"supportsDeveloperRole": True},
+                },
+                {
+                    "id": "openclaw-fallback",
+                    "alias": "fallback",
+                    "compat": {"maxTokensField": "max_completion_tokens"},
+                },
+            ],
+        }
+        changed = await _replace_managed_provider_runtime_metadata(
+            admin_client, provider_id, metadata
+        )
+        assert changed.status_code == 200, changed.text
+        assert changed.json()["base_url"] == metadata["base_url"]
+        assert changed.json()["models"] == metadata["models"]
+        assert_only_bound_event()
+        await db_session.refresh(provider)
+        await db_session.refresh(payload)
+        assert preserved_storage() == preserved
+
+        provider.runtime_env_name = "CLAWDI_MANAGED_OPENAI_API_KEY"
+        await db_session.commit()
+        invalid_readback = await admin_client.get(
+            f"/v1/admin/ai-providers/{provider_id}", headers=_AUTH, params=owner
+        )
+        assert invalid_readback.status_code == 409, invalid_readback.text
+        invalid_replay = await _replace_managed_provider_runtime_metadata(
+            admin_client, provider_id, metadata
+        )
+        assert invalid_replay.status_code == 409, invalid_replay.text
+        await db_session.refresh(provider)
+        await db_session.refresh(payload)
+        assert provider.runtime_env_name == "CLAWDI_MANAGED_OPENAI_API_KEY"
+        assert provider.base_url == metadata["base_url"]
+        assert provider.models == metadata["models"]
+        assert preserved_storage() == preserved
+        assert all(queue.empty() for queue in queues)
+
+        provider.runtime_env_name = MANAGED_AI_PROVIDER_RUNTIME_ENV
+        await db_session.commit()
+        cleared = await _replace_managed_provider_runtime_metadata(
+            admin_client, provider_id, {**metadata, "models": None}
+        )
+        assert cleared.status_code == 200, cleared.text
+        assert cleared.json()["models"] is None
+        assert_only_bound_event()
+
+        deleted = await admin_client.delete(
+            f"/v1/admin/ai-providers/{provider_id}", headers=_AUTH, params=owner
+        )
+        assert deleted.status_code == 200, deleted.text
+        assert_only_bound_event()
+    finally:
+        for (user, _), queue in zip(environments, queues, strict=True):
+            sync_events.unsubscribe(user.id, queue)
+
+
+@pytest.mark.asyncio
+@pytest.mark.committed_db
+async def test_concurrent_first_deployment_provider_puts_serialize_and_converge(
+    engine,
+    seed_user,
+    monkeypatch,
+):
+    from sqlalchemy import select
+
+    from app.models.ai_provider import AiProvider, AiProviderAuthPayload
+    from app.models.audit import ControlPlaneAuditEvent
+    from app.routes import admin as admin_routes
+    from app.services.vault_crypto import decrypt
+
+    provider_id = f"{V2_DEPLOYMENT_MANAGED_AI_PROVIDER_PREFIX}8401"
+    owner = {"kind": "clerk", "ref": seed_user.clerk_id}
+    first_upsert_entered = asyncio.Event()
+    release_first_upsert = asyncio.Event()
+    second_lock_attempted = asyncio.Event()
+    upsert_calls = 0
+    lock_calls = 0
+    original_upsert = admin_routes.upsert_clawdi_managed_provider
+    original_lock = admin_routes.lock_deployment_managed_provider_mutation
+
+    async def paused_first_upsert(*args, **kwargs):
+        nonlocal upsert_calls
+        upsert_calls += 1
+        if upsert_calls == 1:
+            first_upsert_entered.set()
+            await release_first_upsert.wait()
+        return await original_upsert(*args, **kwargs)
+
+    async def observed_lock(*args, **kwargs):
+        nonlocal lock_calls
+        lock_calls += 1
+        if lock_calls == 2:
+            second_lock_attempted.set()
+        return await original_lock(*args, **kwargs)
+
+    monkeypatch.setattr(admin_routes, "upsert_clawdi_managed_provider", paused_first_upsert)
+    monkeypatch.setattr(
+        admin_routes,
+        "lock_deployment_managed_provider_mutation",
+        observed_lock,
+    )
+
+    async with _isolated_admin_client(engine) as client:
+        first_request = asyncio.create_task(
+            client.put(
+                f"/v1/admin/ai-providers/{provider_id}",
+                headers=_AUTH,
+                json={
+                    "owner": owner,
+                    "base_url": "https://first-gateway.example.test/v1",
+                    "api_key": "sk-concurrent-first",
+                },
+            )
+        )
+        await asyncio.wait_for(first_upsert_entered.wait(), timeout=5)
+        second_request = asyncio.create_task(
+            client.put(
+                f"/v1/admin/ai-providers/{provider_id}",
+                headers=_AUTH,
+                json={
+                    "owner": owner,
+                    "base_url": "https://second-gateway.example.test/v1",
+                    "api_key": "sk-concurrent-second",
+                },
+            )
+        )
+        try:
+            await asyncio.wait_for(second_lock_attempted.wait(), timeout=5)
+            await asyncio.sleep(0.05)
+            second_waited_for_first_transaction = not second_request.done() and upsert_calls == 1
+        except BaseException:
+            release_first_upsert.set()
+            await asyncio.gather(first_request, second_request, return_exceptions=True)
+            raise
+        release_first_upsert.set()
+        responses = await asyncio.wait_for(
+            asyncio.gather(first_request, second_request),
+            timeout=10,
+        )
+
+    assert second_waited_for_first_transaction
+    assert [response.status_code for response in responses] == [200, 200]
+    assert responses[0].json()["id"] == responses[1].json()["id"]
+
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    async with session_factory() as verify_db:
+        providers = (
+            (
+                await verify_db.execute(
+                    select(AiProvider).where(
+                        AiProvider.owner_user_id == seed_user.id,
+                        AiProvider.provider_id == provider_id,
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        payloads = (
+            (
+                await verify_db.execute(
+                    select(AiProviderAuthPayload).where(
+                        AiProviderAuthPayload.owner_user_id == seed_user.id,
+                        AiProviderAuthPayload.provider_id == provider_id,
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        audit_events = (
+            (
+                await verify_db.execute(
+                    select(ControlPlaneAuditEvent).where(
+                        ControlPlaneAuditEvent.resource_id == provider_id
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+
+    assert len(providers) == 1
+    assert providers[0].base_url == "https://second-gateway.example.test/v1"
+    assert providers[0].archived_at is None
+    assert len(payloads) == 1
+    assert payloads[0].archived_at is None
+    assert decrypt(payloads[0].encrypted_payload, payloads[0].nonce) == "sk-concurrent-second"
+    assert Counter(event.action for event in audit_events) == Counter(
+        {
+            "ai_provider.managed.upsert": 2,
+            "ai_provider.managed.credential.rotate": 2,
+        }
+    )
+    assert all(event.details["outcome"] == "success" for event in audit_events)
+
+
+@pytest.mark.asyncio
+@pytest.mark.committed_db
+async def test_deployment_provider_put_and_delete_serialize_on_the_same_lock(
+    engine,
+    seed_user,
+    monkeypatch,
+):
+    from sqlalchemy import select
+
+    from app.models.ai_provider import AiProvider, AiProviderAuthPayload
+    from app.routes import admin as admin_routes
+    from app.services.vault_crypto import decrypt
+
+    provider_id = f"{V2_DEPLOYMENT_MANAGED_AI_PROVIDER_PREFIX}8402"
+    owner = {"kind": "clerk", "ref": seed_user.clerk_id}
+    baseline_body = {
+        "owner": owner,
+        "base_url": "https://baseline-gateway.example.test/v1",
+        "api_key": "sk-race-baseline",
+    }
+
+    async with _isolated_admin_client(engine) as client:
+        baseline = await client.put(
+            f"/v1/admin/ai-providers/{provider_id}",
+            headers=_AUTH,
+            json=baseline_body,
+        )
+        assert baseline.status_code == 200, baseline.text
+
+        put_holds_lock = asyncio.Event()
+        release_put = asyncio.Event()
+        delete_lock_attempted = asyncio.Event()
+        lock_calls = 0
+        original_upsert = admin_routes.upsert_clawdi_managed_provider
+        original_lock = admin_routes.lock_deployment_managed_provider_mutation
+
+        async def paused_put(*args, **kwargs):
+            put_holds_lock.set()
+            await release_put.wait()
+            return await original_upsert(*args, **kwargs)
+
+        async def observed_lock(*args, **kwargs):
+            nonlocal lock_calls
+            lock_calls += 1
+            if lock_calls == 2:
+                delete_lock_attempted.set()
+            return await original_lock(*args, **kwargs)
+
+        monkeypatch.setattr(admin_routes, "upsert_clawdi_managed_provider", paused_put)
+        monkeypatch.setattr(
+            admin_routes,
+            "lock_deployment_managed_provider_mutation",
+            observed_lock,
+        )
+
+        put_request = asyncio.create_task(
+            client.put(
+                f"/v1/admin/ai-providers/{provider_id}",
+                headers=_AUTH,
+                json={
+                    "owner": owner,
+                    "base_url": "https://race-winner-gateway.example.test/v1",
+                    "api_key": "sk-race-put",
+                },
+            )
+        )
+        await asyncio.wait_for(put_holds_lock.wait(), timeout=5)
+        delete_request = asyncio.create_task(
+            client.delete(
+                f"/v1/admin/ai-providers/{provider_id}",
+                headers=_AUTH,
+                params=owner,
+            )
+        )
+        try:
+            await asyncio.wait_for(delete_lock_attempted.wait(), timeout=5)
+            await asyncio.sleep(0.05)
+            delete_waited_for_put_transaction = not delete_request.done()
+        except BaseException:
+            release_put.set()
+            await asyncio.gather(put_request, delete_request, return_exceptions=True)
+            raise
+        release_put.set()
+        put_response, delete_response = await asyncio.wait_for(
+            asyncio.gather(put_request, delete_request),
+            timeout=10,
+        )
+
+    assert delete_waited_for_put_transaction
+    assert put_response.status_code == 200, put_response.text
+    assert delete_response.status_code == 200, delete_response.text
+
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    async with session_factory() as verify_db:
+        providers = (
+            (
+                await verify_db.execute(
+                    select(AiProvider).where(
+                        AiProvider.owner_user_id == seed_user.id,
+                        AiProvider.provider_id == provider_id,
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        payloads = (
+            (
+                await verify_db.execute(
+                    select(AiProviderAuthPayload).where(
+                        AiProviderAuthPayload.owner_user_id == seed_user.id,
+                        AiProviderAuthPayload.provider_id == provider_id,
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+
+    assert len(providers) == 1
+    assert providers[0].base_url == "https://race-winner-gateway.example.test/v1"
+    assert providers[0].archived_at is not None
+    assert len(payloads) == 1
+    assert payloads[0].archived_at is not None
+    assert decrypt(payloads[0].encrypted_payload, payloads[0].nonce) == "sk-race-put"
+
+
+@pytest.mark.asyncio
+async def test_admin_deployment_managed_ai_provider_puts_are_isolated_per_owner(
+    admin_client,
+    db_session,
+    seed_user,
+):
+    from sqlalchemy import select
+
+    from app.models.ai_provider import AiProviderAuthPayload
+    from app.models.user import User
+    from app.services.vault_crypto import decrypt
+
+    provider_id = f"{V2_DEPLOYMENT_MANAGED_AI_PROVIDER_PREFIX}84"
+    other = User(clerk_id="managed_provider_second_owner")
+    db_session.add(other)
+    await db_session.flush()
+
+    responses = []
+    for user, raw_key in (
+        (seed_user, "sk-owner-one"),
+        (other, "sk-owner-two"),
+    ):
+        response = await admin_client.put(
+            f"/v1/admin/ai-providers/{provider_id}",
+            headers=_AUTH,
+            json={
+                "owner": {"kind": "clerk", "ref": user.clerk_id},
+                "base_url": "https://ai-gateway.clawdi.ai/v1",
+                "api_key": raw_key,
+            },
+        )
+        assert response.status_code == 200, response.text
+        responses.append(response.json())
+
+    assert responses[0]["id"] != responses[1]["id"]
+    payloads = (
+        (
+            await db_session.execute(
+                select(AiProviderAuthPayload).where(
+                    AiProviderAuthPayload.owner_user_id.in_([seed_user.id, other.id]),
+                    AiProviderAuthPayload.provider_id == provider_id,
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert {
+        (payload.owner_user_id, decrypt(payload.encrypted_payload, payload.nonce))
+        for payload in payloads
+    } == {
+        (seed_user.id, "sk-owner-one"),
+        (other.id, "sk-owner-two"),
+    }
+
+
+@pytest.mark.asyncio
+async def test_admin_deployment_managed_ai_provider_requires_unambiguous_owner(
+    admin_client,
+    seed_user,
+):
+    provider_id = f"{V2_DEPLOYMENT_MANAGED_AI_PROVIDER_PREFIX}126"
+    missing_put = await admin_client.put(
+        f"/v1/admin/ai-providers/{provider_id}",
+        headers=_AUTH,
+        json={
+            "base_url": "https://ai-gateway.clawdi.ai/v1",
+            "api_key": "sk-missing-owner",
+        },
+    )
+    legacy_owner_put = await admin_client.put(
+        f"/v1/admin/ai-providers/{provider_id}",
+        headers=_AUTH,
+        json={
+            "target_clerk_id": seed_user.clerk_id,
+            "base_url": "https://ai-gateway.clawdi.ai/v1",
+            "api_key": "sk-legacy-owner-not-accepted",
+        },
+    )
+    ambiguous_put = await admin_client.put(
+        f"/v1/admin/ai-providers/{provider_id}",
+        headers=_AUTH,
+        json={
+            "owner": {"kind": "clerk", "ref": seed_user.clerk_id},
+            "target_clerk_id": "different_owner",
+            "base_url": "https://ai-gateway.clawdi.ai/v1",
+            "api_key": "sk-ambiguous-owner",
+        },
+    )
+    missing_get = await admin_client.get(
+        f"/v1/admin/ai-providers/{provider_id}",
+        headers=_AUTH,
+    )
+    missing_delete = await admin_client.delete(
+        f"/v1/admin/ai-providers/{provider_id}",
+        headers=_AUTH,
+    )
+
+    assert missing_put.status_code == 422, missing_put.text
+    assert legacy_owner_put.status_code == 422, legacy_owner_put.text
+    assert ambiguous_put.status_code == 422, ambiguous_put.text
+    assert missing_get.status_code == 422, missing_get.text
+    assert missing_delete.status_code == 422, missing_delete.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "provider_id",
+    [
+        "clawdi-v2-deployment-0",
+        "clawdi-v2-deployment-not-a-number",
+        f"{V2_DEPLOYMENT_MANAGED_AI_PROVIDER_PREFIX}{'9' * 43}",
+    ],
+)
+async def test_admin_upsert_rejects_invalid_deployment_managed_provider_id(
+    admin_client,
+    seed_user,
+    provider_id,
+):
+    response = await admin_client.put(
+        f"/v1/admin/ai-providers/{provider_id}",
+        headers=_AUTH,
+        json={
+            "owner": {"kind": "clerk", "ref": seed_user.clerk_id},
+            "base_url": "https://ai-gateway.clawdi.ai/v1",
+            "api_key": "sk-invalid-deployment-provider-id",
+        },
+    )
+
+    assert response.status_code == 404, response.text
+
+
+@pytest.mark.asyncio
+async def test_admin_upsert_managed_ai_provider_rejects_unknown_id(admin_client, seed_user):
+    response = await admin_client.put(
+        "/v1/admin/ai-providers/not-clawdi-managed",
+        headers=_AUTH,
+        json={
+            "target_clerk_id": seed_user.clerk_id,
+            "base_url": "https://ai-gateway.clawdi.ai/v1",
+            "api_key": "sk-unsupported-provider",
+        },
+    )
+
+    assert response.status_code == 404, response.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "model",
+    [
+        {"id": "gpt-test", "context_window": 0},
+        {"id": "gpt-test", "max_tokens": 0},
+        {"id": "gpt-test", "label": ""},
+        {"id": "gpt-test", "alias": ""},
+        {"id": "gpt-test", "max_tokens": None},
+        {"id": "gpt-test", "unknown": True},
+        {"id": "gpt-test", "capabilities": {"audio": True}},
+        {"id": "gpt-test", "capabilities": {"chat": 1}},
+        {"id": "gpt-test", "capabilities": {"chat": None}},
+        {"id": "gpt-test", "cost": {"input": 1, "output": 2, "currency": "USD"}},
+        {"id": "gpt-test", "cost": {"input": 1, "output": 2, "cache_write": None}},
+    ],
+    ids=[
+        "zero-context-window",
+        "zero-max-tokens",
+        "empty-label",
+        "empty-alias",
+        "null-model-field",
+        "unknown-model-field",
+        "unknown-capability",
+        "non-bool-capability",
+        "null-capability",
+        "unknown-cost-field",
+        "null-cost-field",
+    ],
+)
+async def test_admin_managed_ai_provider_rejects_models_outside_hosted_wire_contract(
+    admin_client,
+    seed_user,
+    model: dict,
+):
+    response = await admin_client.put(
+        f"/v1/admin/ai-providers/{V2_MANAGED_AI_PROVIDER_ID}",
+        headers=_AUTH,
+        json={
+            "target_clerk_id": seed_user.clerk_id,
+            "base_url": "https://ai-gateway.clawdi.ai/v1",
+            "api_key": "sk-strict-model-test",
+            "models": [model],
+        },
+    )
+
+    assert response.status_code == 422, response.text
+
+
+@pytest.mark.asyncio
+async def test_admin_upsert_managed_ai_provider_rotates_existing_payload(
+    admin_client, db_session, seed_user
+):
+    from sqlalchemy import select
+
+    from app.models.ai_provider import AiProvider, AiProviderAuthPayload
+    from app.services.managed_ai_provider import MANAGED_AI_PROVIDER_ID
+    from app.services.vault_crypto import decrypt
+
+    first = await admin_client.put(
+        f"/v1/admin/ai-providers/{MANAGED_AI_PROVIDER_ID}",
+        headers=_AUTH,
+        json={
+            "target_clerk_id": seed_user.clerk_id,
+            "base_url": "https://ai-gateway.clawdi.ai/v1",
+            "api_key": "sk-first-admin-managed-secret",
+        },
+    )
+    assert first.status_code == 200, first.text
+    second_key = "sk-second-admin-managed-secret"
+    second = await admin_client.put(
+        f"/v1/admin/ai-providers/{MANAGED_AI_PROVIDER_ID}",
+        headers=_AUTH,
+        json={
+            "target_clerk_id": seed_user.clerk_id,
+            "base_url": "https://ai-gateway.clawdi.ai/v1",
+            "api_key": second_key,
+            "default_model": "gpt-5.4",
+        },
+    )
+    assert second.status_code == 200, second.text
+    assert second_key not in second.text
+
+    providers = (
+        (
+            await db_session.execute(
+                select(AiProvider).where(
+                    AiProvider.owner_user_id == seed_user.id,
+                    AiProvider.provider_id == MANAGED_AI_PROVIDER_ID,
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(providers) == 1
+    assert providers[0].models == [{"id": "gpt-5.4"}]
+
+    payloads = (
+        (
+            await db_session.execute(
+                select(AiProviderAuthPayload).where(
+                    AiProviderAuthPayload.owner_user_id == seed_user.id,
+                    AiProviderAuthPayload.provider_id == MANAGED_AI_PROVIDER_ID,
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(payloads) == 1
+    assert decrypt(payloads[0].encrypted_payload, payloads[0].nonce) == second_key
+
+
+@pytest.mark.asyncio
+async def test_admin_upsert_managed_ai_provider_rejects_invalid_base_url(admin_client, seed_user):
+    raw_key = "sk-invalid-url-secret"
+    r = await admin_client.put(
+        f"/v1/admin/ai-providers/{V2_MANAGED_AI_PROVIDER_ID}",
+        headers=_AUTH,
+        json={
+            "target_clerk_id": seed_user.clerk_id,
+            "base_url": "not-a-url",
+            "api_key": raw_key,
+        },
+    )
+    assert r.status_code == 422
+    assert raw_key not in r.text
+
+
+@pytest.mark.asyncio
+async def test_admin_channel_lifecycle_manages_public_bot(
+    admin_client,
+    client,
+    db_session,
+    seed_user,
+    channel_agent,
+    monkeypatch,
+):
+    from sqlalchemy import select
+
+    from app.models.channel import ChannelAccount, ChannelSecret
+    from app.services.channels import (
+        decrypt_provider_token,
+        get_channel_secret,
+        verify_hashed_token,
+    )
+
+    async def fake_configure_telegram_provider_webhook(**_kwargs):
+        return "ClawdiPublicBot"
+
+    rotated_identity = {"username": "ClawdiPublicBot"}
+
+    async def fake_get_telegram_bot_username(_provider_token: str):
+        return rotated_identity["username"]
+
+    queued_runtime_targets: list[tuple[UUID, UUID]] = []
+
+    async def capture_runtime_targets(_db, targets):
+        queued_runtime_targets.extend(targets)
+
+    monkeypatch.setattr(
+        "app.routes.admin.configure_telegram_provider_webhook",
+        fake_configure_telegram_provider_webhook,
+    )
+    monkeypatch.setattr(
+        "app.routes.admin.get_telegram_bot_username",
+        fake_get_telegram_bot_username,
+    )
+    monkeypatch.setattr(
+        "app.routes.admin.queue_runtime_manifests_changed",
+        capture_runtime_targets,
+    )
+
+    created = await admin_client.post(
+        "/v1/admin/channels",
+        headers=_AUTH,
+        json={
+            "provider": "telegram",
+            "name": f"admin-public-{uuid.uuid4().hex}",
+            "visibility": "public",
+            "provider_token": "123456:admin-token",
+            "config": {"commands": "managed"},
+            "secrets": {"app_secret": "secret-v1"},
+        },
+    )
+    assert created.status_code == 201, created.text
+    body = created.json()
+    assert body["owner_user_id"] is None
+    assert body["owner_clerk_id"] is None
+    assert body["visibility"] == "public"
+    assert body["has_provider_token"] is True
+    assert body["webhook_secret"]
+    assert "admin-token" not in created.text
+    assert "secret-v1" not in created.text
+
+    account = (
+        await db_session.execute(select(ChannelAccount).where(ChannelAccount.id == body["id"]))
+    ).scalar_one()
+    assert account.user_id is None
+    assert account.visibility == "public"
+    assert decrypt_provider_token(account) == "123456:admin-token"
+    assert account.config == {"commands": "managed", "bot_username": "ClawdiPublicBot"}
+    assert await get_channel_secret(db_session, account=account, name="app_secret") == "secret-v1"
+    secret = (
+        await db_session.execute(
+            select(ChannelSecret).where(
+                ChannelSecret.account_id == account.id,
+                ChannelSecret.name == "app_secret",
+            )
+        )
+    ).scalar_one()
+    assert secret.user_id is None
+
+    visibility_flip = await admin_client.patch(
+        f"/v1/admin/channels/{body['id']}",
+        headers=_AUTH,
+        json={"visibility": "private"},
+    )
+    assert visibility_flip.status_code == 409
+    assert visibility_flip.json()["detail"] == (
+        "Channel visibility cannot be changed in place; recreate the channel."
+    )
+
+    linked = await client.post(
+        f"/v1/channels/{body['id']}/agent-links",
+        json={"agent_id": str(channel_agent.id)},
+    )
+    assert linked.status_code == 201, linked.text
+
+    async def sync_commands(**_kwargs):
+        return []
+
+    monkeypatch.setattr("app.routes.channel_routers.public.sync_channel_commands", sync_commands)
+    pair = await client.post(
+        f"/v1/channels/{body['id']}/pair-codes",
+        json={"agent_link_id": linked.json()["id"], "ttl_seconds": 900},
+    )
+    assert pair.status_code == 201, pair.text
+    assert pair.json()["bot_username"] == "ClawdiPublicBot"
+    assert pair.json()["deep_link"] == (f"https://t.me/ClawdiPublicBot?start={pair.json()['code']}")
+
+    listed = await admin_client.get(
+        "/v1/admin/channels",
+        headers=_AUTH,
+        params={"visibility": "public", "provider": "telegram"},
+    )
+    assert listed.status_code == 200
+    assert body["id"] in {item["id"] for item in listed.json()}
+
+    rotated_token = await admin_client.patch(
+        f"/v1/admin/channels/{body['id']}",
+        headers=_AUTH,
+        json={"provider_token": "123456:rotated-admin-token"},
+    )
+    assert rotated_token.status_code == 200, rotated_token.text
+    assert rotated_token.json()["config"]["bot_username"] == "ClawdiPublicBot"
+    await db_session.refresh(account)
+    assert decrypt_provider_token(account) == "123456:rotated-admin-token"
+
+    config_only = await admin_client.patch(
+        f"/v1/admin/channels/{body['id']}",
+        headers=_AUTH,
+        json={"config": {"commands": "updated-without-token"}},
+    )
+    assert config_only.status_code == 200, config_only.text
+    assert config_only.json()["config"] == {
+        "commands": "updated-without-token",
+        "bot_username": "ClawdiPublicBot",
+    }
+
+    rotated_identity["username"] = "DifferentPublicBot"
+    wrong_bot = await admin_client.patch(
+        f"/v1/admin/channels/{body['id']}",
+        headers=_AUTH,
+        json={"provider_token": "654321:different-bot-token"},
+    )
+    assert wrong_bot.status_code == 409
+    assert wrong_bot.json()["detail"] == "Telegram provider token belongs to a different bot."
+    await db_session.refresh(account)
+    assert decrypt_provider_token(account) == "123456:rotated-admin-token"
+
+    patched = await admin_client.patch(
+        f"/v1/admin/channels/{body['id']}",
+        headers=_AUTH,
+        json={
+            "name": "admin-public-renamed",
+            "provider_token": None,
+            "config": {"commands": "rotated"},
+            "secrets": {"app_secret": "secret-v2"},
+        },
+    )
+    assert patched.status_code == 200, patched.text
+    assert patched.json()["name"] == "admin-public-renamed"
+    assert patched.json()["has_provider_token"] is False
+    assert patched.json()["config"] == {"commands": "rotated"}
+
+    await db_session.refresh(account)
+    assert account.encrypted_provider_token is None
+    assert account.provider_token_nonce is None
+    assert await get_channel_secret(db_session, account=account, name="app_secret") == "secret-v2"
+
+    rotated = await admin_client.post(
+        f"/v1/admin/channels/{body['id']}/webhook-secret/rotate",
+        headers=_AUTH,
+    )
+    assert rotated.status_code == 200
+    await db_session.refresh(account)
+    assert verify_hashed_token(rotated.json()["webhook_secret"], account.webhook_secret_hash)
+
+    disabled = await admin_client.patch(
+        f"/v1/admin/channels/{body['id']}",
+        headers=_AUTH,
+        json={"status": "disabled"},
+    )
+    assert disabled.status_code == 200, disabled.text
+    assert queued_runtime_targets == [(seed_user.id, channel_agent.id)]
+
+    deleted = await admin_client.delete(f"/v1/admin/channels/{body['id']}", headers=_AUTH)
+    assert deleted.status_code == 204
+    await db_session.refresh(account)
+    assert account.archived_at is not None
+
+    archived = await admin_client.get(f"/v1/admin/channels/{body['id']}", headers=_AUTH)
+    assert archived.status_code == 200
+    assert archived.json()["archived_at"] is not None
+
+
+@pytest.mark.asyncio
+async def test_admin_channel_create_requires_admin_key(admin_client, seed_user):
+    r = await admin_client.post(
+        "/v1/admin/channels",
+        json={
+            "target_clerk_id": seed_user.clerk_id,
+            "provider": "telegram",
+            "name": "admin-channel-no-key",
+        },
+    )
+    assert r.status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_admin_private_channel_requires_owner(admin_client, seed_user):
+    private_without_owner = await admin_client.post(
+        "/v1/admin/channels",
+        headers=_AUTH,
+        json={
+            "provider": "telegram",
+            "name": f"missing-private-owner-{uuid.uuid4().hex}",
+            "visibility": "private",
+        },
+    )
+    assert private_without_owner.status_code == 422
+
+    private = await admin_client.post(
+        "/v1/admin/channels",
+        headers=_AUTH,
+        json={
+            "target_clerk_id": seed_user.clerk_id,
+            "provider": "telegram",
+            "name": f"private-owner-{uuid.uuid4().hex}",
+            "visibility": "private",
+        },
+    )
+    assert private.status_code == 201, private.text
+    assert private.json()["owner_user_id"] == str(seed_user.id)
+    assert private.json()["owner_clerk_id"] == seed_user.clerk_id
+
+
+@pytest.mark.asyncio
+async def test_admin_register_env_creates_with_project(admin_client, client, db_session, seed_user):
+    """Admin env registration creates an AgentEnvironment AND a
+    default project, matching the user-facing register_environment
+    contract. Migration tooling depends on default_project_id being
+    set so the daemon can upload."""
+    from sqlalchemy import select
+
+    from app.models.session import AgentEnvironment
+
+    r = await admin_client.post(
+        "/v1/admin/environments",
+        headers=_AUTH,
+        json={
+            "target_clerk_id": seed_user.clerk_id,
+            "machine_id": "migrate-machine-1",
+            "machine_name": "migrated-pod",
+            "agent_type": "openclaw",
+        },
+    )
+    assert r.status_code == 200, r.text
+    env_id = r.json()["id"]
+
+    env = (
+        await db_session.execute(select(AgentEnvironment).where(AgentEnvironment.id == env_id))
+    ).scalar_one()
+    assert env.user_id == seed_user.id
+    assert env.machine_id == "migrate-machine-1"
+    assert env.registration_key == "machine:migrate-machine-1:agent:openclaw"
+    assert env.default_project_id is not None  # heal logic ran
+
+    detail = await client.get(f"/v1/environments/{env_id}")
+    assert detail.status_code == 200, detail.text
+    body = detail.json()
+    assert body["explicit_identity"] is False
+    assert "registration_key" not in body
+
+
+@pytest.mark.asyncio
+async def test_admin_register_env_accepts_explicit_agent_id(
+    admin_client, client, db_session, seed_user
+):
+    """Hosted registration owns the stable agent id. Machine fields are metadata."""
+
+    from sqlalchemy import select
+
+    from app.models.session import AgentEnvironment
+
+    machine_key = await admin_client.post(
+        "/v1/admin/environments",
+        headers=_AUTH,
+        json={
+            "target_clerk_id": seed_user.clerk_id,
+            "machine_id": "machine-key-before-explicit",
+            "machine_name": "machine-key-pod",
+            "agent_type": "openclaw",
+        },
+    )
+    assert machine_key.status_code == 200, machine_key.text
+    machine_key_env_id = machine_key.json()["id"]
+
+    agent_id = uuid.uuid4()
+    r = await admin_client.post(
+        "/v1/admin/environments",
+        headers=_AUTH,
+        json={
+            "target_clerk_id": seed_user.clerk_id,
+            "environment_id": str(agent_id),
+            "machine_id": "hosted-machine-explicit",
+            "machine_name": "hosted-pod",
+            "agent_type": "codex",
+        },
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["id"] == str(agent_id)
+
+    env = (
+        await db_session.execute(select(AgentEnvironment).where(AgentEnvironment.id == agent_id))
+    ).scalar_one()
+    assert env.user_id == seed_user.id
+    assert env.machine_id == "hosted-machine-explicit"
+    assert env.machine_name == "hosted-pod"
+    assert env.default_name == "Codex"
+    assert env.registration_key is None
+
+    detail = await client.get(f"/v1/environments/{agent_id}")
+    assert detail.status_code == 200, detail.text
+    body = detail.json()
+    assert body["explicit_identity"] is True
+    assert "registration_key" not in body
+
+    agent_detail = await client.get(f"/v1/agents/{agent_id}")
+    assert agent_detail.status_code == 200, agent_detail.text
+    assert agent_detail.json()["explicit_identity"] is True
+
+    listing = await client.get("/v1/environments")
+    assert listing.status_code == 200, listing.text
+    by_id = {item["id"]: item for item in listing.json()}
+    assert {
+        machine_key_env_id: by_id[machine_key_env_id]["explicit_identity"],
+        str(agent_id): by_id[str(agent_id)]["explicit_identity"],
+    } == {machine_key_env_id: False, str(agent_id): True}
+
+
+@pytest.mark.asyncio
+async def test_admin_register_env_auto_assigns_explicit_default_names(
+    admin_client, db_session, seed_user
+):
+    from sqlalchemy import select
+
+    from app.models.session import AgentEnvironment
+
+    self_managed = await admin_client.post(
+        "/v1/admin/environments",
+        headers=_AUTH,
+        json={
+            "target_clerk_id": seed_user.clerk_id,
+            "machine_id": "self-managed-before-explicit",
+            "machine_name": "self-managed-before-explicit",
+            "agent_type": "openclaw",
+        },
+    )
+    assert self_managed.status_code == 200, self_managed.text
+
+    async def register_explicit(agent_type: str) -> uuid.UUID:
+        agent_id = uuid.uuid4()
+        created = await admin_client.post(
+            "/v1/admin/environments",
+            headers=_AUTH,
+            json={
+                "target_clerk_id": seed_user.clerk_id,
+                "environment_id": str(agent_id),
+                "machine_id": f"hosted-{agent_type}-{agent_id.hex[:8]}",
+                "machine_name": f"hosted-{agent_type}",
+                "agent_type": agent_type,
+            },
+        )
+        assert created.status_code == 200, created.text
+        return agent_id
+
+    first_openclaw = await register_explicit("openclaw")
+    second_openclaw = await register_explicit("openclaw")
+    hermes = await register_explicit("hermes")
+    codex = await register_explicit("codex")
+    claude_code = await register_explicit("claude_code")
+
+    deleted = await admin_client.delete(f"/v1/admin/environments/{first_openclaw}", headers=_AUTH)
+    assert deleted.status_code == 204, deleted.text
+
+    third_openclaw = await register_explicit("openclaw")
+
+    rows = (
+        await db_session.execute(
+            select(
+                AgentEnvironment.id,
+                AgentEnvironment.default_name,
+                AgentEnvironment.registration_key,
+            ).where(
+                AgentEnvironment.id.in_(
+                    [
+                        uuid.UUID(self_managed.json()["id"]),
+                        second_openclaw,
+                        third_openclaw,
+                        hermes,
+                        codex,
+                        claude_code,
+                    ]
+                )
+            )
+        )
+    ).all()
+    by_id = {row.id: row for row in rows}
+    assert by_id[uuid.UUID(self_managed.json()["id"])].default_name is None
+    assert by_id[uuid.UUID(self_managed.json()["id"])].registration_key is not None
+    assert by_id[second_openclaw].default_name == "OpenClaw 2"
+    assert by_id[third_openclaw].default_name == "OpenClaw 3"
+    assert by_id[hermes].default_name == "Hermes"
+    assert by_id[codex].default_name == "Codex"
+    assert by_id[claude_code].default_name == "Claude Code"
+
+
+@pytest.mark.asyncio
+async def test_admin_register_env_rejects_default_name_request_field(admin_client, seed_user):
+    response = await admin_client.post(
+        "/v1/admin/environments",
+        headers=_AUTH,
+        json={
+            "target_clerk_id": seed_user.clerk_id,
+            "environment_id": str(uuid.uuid4()),
+            "machine_id": "hosted-default-name-rejected",
+            "machine_name": "hosted-default-name-rejected",
+            "default_name": "Caller Provided",
+            "agent_type": "codex",
+        },
+    )
+
+    assert response.status_code == 422, response.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.committed_db
+async def test_admin_agents_alias_registers_with_agent_id_and_runtime_state(
+    admin_client, db_session, seed_user
+):
+    from sqlalchemy import select
+
+    from app.core.config import settings
+    from app.models.hosted_runtime import HostedRuntimeSecret, HostedRuntimeState
+    from app.models.session import AgentEnvironment
+    from app.services.runtime_source import (
+        expected_runtime_bundle_v2_etag,
+        load_runtime_source_batch,
+        render_runtime_source,
+        vault_key_identity,
+    )
+    from app.services.vault_crypto import decrypt
+    from tests.hosted_runtime_fixtures import (
+        CANONICAL_CODEX_TOOL_PROVIDER_ID,
+        ensure_canonical_codex_tool_provider,
+    )
+
+    agent_id = uuid.uuid4()
+    provider_id = CANONICAL_CODEX_TOOL_PROVIDER_ID
+    created = await admin_client.post(
+        "/v1/admin/agents",
+        headers=_AUTH,
+        json={
+            "target_clerk_id": seed_user.clerk_id,
+            "agent_id": str(agent_id),
+            "machine_id": "admin-agent-alias",
+            "machine_name": "admin-agent-pod",
+            "default_name": "e2e-2",
+            "agent_type": "codex",
+            "agent_version": "1.0.0",
+            "os_name": "linux",
+        },
+    )
+    assert created.status_code == 200, created.text
+    assert created.json()["id"] == str(agent_id)
+
+    env = (
+        await db_session.execute(select(AgentEnvironment).where(AgentEnvironment.id == agent_id))
+    ).scalar_one()
+    assert env.user_id == seed_user.id
+    assert env.default_name == "e2e-2"
+    assert env.display_name is None
+    assert env.registration_key is None
+
+    await ensure_canonical_codex_tool_provider(db_session, seed_user)
+    runtime_body = {
+        "deployment_id": "dep-admin-agent-alias",
+        "instance_id": "iid-admin-agent-alias",
+        "generation": 7,
+        "cli_package_spec": "clawdi@1.2.3-test",
+        "locale": {"language": "en", "timezone": "America/Los_Angeles"},
+        "system": {},
+        "live_sync": {"enabled": False, "agents": []},
+        "recovery": {"cacheManifest": True, "allowOfflineBoot": True},
+        "tools": {
+            "codex": {
+                "enabled": True,
+                "provider_id": provider_id,
+                "primary_model": {
+                    "provider_id": provider_id,
+                    "model": "gpt-5.5",
+                },
+            }
+        },
+        "secretValues": {
+            "secret://clawdi/auth-token": "admin-runtime-auth-token",
+            "secret://runtime/openclaw/gateway-token": "admin-openclaw-gateway-token",
+        },
+        "runtimes": {
+            "openclaw": {
+                "enabled": True,
+                "providerMode": "configured",
+                "provider_ids": [provider_id],
+                "primary_model": {
+                    "provider_id": provider_id,
+                    "model": "gpt-5.5",
+                },
+                "install": {"source": "official"},
+            }
+        },
+    }
+    runtime = await admin_client.put(
+        f"/v1/admin/agents/{agent_id}/runtime-state",
+        headers=_AUTH,
+        json=runtime_body,
+    )
+    assert runtime.status_code == 200, runtime.text
+    assert runtime.json()["environment_id"] == str(agent_id)
+
+    state = (
+        await db_session.execute(
+            select(HostedRuntimeState).where(HostedRuntimeState.environment_id == agent_id)
+        )
+    ).scalar_one_or_none()
+    assert state is not None
+    assert state.deployment_id == "dep-admin-agent-alias"
+    assert state.runtimes["openclaw"]["provider_ids"] == [provider_id]
+    assert state.tools["codex"]["provider_id"] == provider_id
+    secret_rows = list(
+        (
+            await db_session.execute(
+                select(HostedRuntimeSecret)
+                .where(HostedRuntimeSecret.environment_id == agent_id)
+                .order_by(HostedRuntimeSecret.secret_ref)
+            )
+        ).scalars()
+    )
+    expected_secrets = {
+        "secret://clawdi/auth-token": "admin-runtime-auth-token",
+        "secret://runtime/openclaw/gateway-token": "admin-openclaw-gateway-token",
+    }
+    assert [row.secret_ref for row in secret_rows] == sorted(expected_secrets)
+    for row in secret_rows:
+        plaintext = expected_secrets[row.secret_ref]
+        assert row.encrypted_value != plaintext.encode()
+        assert decrypt(row.encrypted_value, row.nonce) == plaintext
+        assert row.key_version == "vault.v1"
+    stored_identity = {
+        row.secret_ref: (row.id, row.encrypted_value, row.nonce, row.key_version)
+        for row in secret_rows
+    }
+    first_batch = await load_runtime_source_batch(db_session, environment_ids=[agent_id])
+    first_source = render_runtime_source(
+        first_batch,
+        environment_id=agent_id,
+        public_api_url="https://cloud.test",
+        vault_key_identity="test-key-version",
+        decrypt_secrets=False,
+    )
+    assert first_source.manifest["runtimes"]["openclaw"]["provider_ids"] == ["clawdi"]
+    assert first_source.manifest["terminalTooling"]["codex"]["provider_id"] == "clawdi"
+
+    authority_source = render_runtime_source(
+        first_batch,
+        environment_id=agent_id,
+        public_api_url=settings.public_api_url,
+        vault_key_identity=vault_key_identity(settings.vault_encryption_key),
+        decrypt_secrets=False,
+    )
+    authority = await admin_client.get(
+        f"/v1/admin/agents/{agent_id}/runtime-state",
+        headers=_AUTH,
+        params={"kind": "clerk", "ref": seed_user.clerk_id},
+    )
+    assert authority.status_code == 200, authority.text
+    assert authority.json() == {
+        "environmentId": str(agent_id),
+        "deploymentId": "dep-admin-agent-alias",
+        "instanceId": "iid-admin-agent-alias",
+        "sourceRevision": authority_source.source_revision,
+        "etag": expected_runtime_bundle_v2_etag(authority_source.source_revision),
+    }
+    cross_owner = await admin_client.get(
+        f"/v1/admin/agents/{agent_id}/runtime-state",
+        headers=_AUTH,
+        params={"kind": "clerk", "ref": "user_another_owner"},
+    )
+    assert cross_owner.status_code == 404, cross_owner.text
+
+    repeated = await admin_client.put(
+        f"/v1/admin/agents/{agent_id}/runtime-state",
+        headers=_AUTH,
+        json=runtime_body,
+    )
+    assert repeated.status_code == 200, repeated.text
+    db_session.expire_all()
+    repeated_rows = list(
+        (
+            await db_session.execute(
+                select(HostedRuntimeSecret)
+                .where(HostedRuntimeSecret.environment_id == agent_id)
+                .order_by(HostedRuntimeSecret.secret_ref)
+            )
+        ).scalars()
+    )
+    assert {
+        row.secret_ref: (row.id, row.encrypted_value, row.nonce, row.key_version)
+        for row in repeated_rows
+    } == stored_identity
+    repeated_batch = await load_runtime_source_batch(db_session, environment_ids=[agent_id])
+    repeated_source = render_runtime_source(
+        repeated_batch,
+        environment_id=agent_id,
+        public_api_url="https://cloud.test",
+        vault_key_identity="test-key-version",
+        decrypt_secrets=False,
+    )
+    assert repeated_source.secret_values == {}
+    assert repeated_source.source_revision == first_source.source_revision
+
+    deleted_state = await admin_client.delete(
+        f"/v1/admin/agents/{agent_id}/runtime-state",
+        headers=_AUTH,
+    )
+    assert deleted_state.status_code == 204, deleted_state.text
+
+    state = (
+        await db_session.execute(
+            select(HostedRuntimeState).where(HostedRuntimeState.environment_id == agent_id)
+        )
+    ).scalar_one_or_none()
+    assert state is None
+
+    deleted_agent = await admin_client.delete(f"/v1/admin/agents/{agent_id}", headers=_AUTH)
+    assert deleted_agent.status_code == 204, deleted_agent.text
+
+    env = (
+        await db_session.execute(select(AgentEnvironment).where(AgentEnvironment.id == agent_id))
+    ).scalar_one_or_none()
+    assert env is not None
+    assert env.archived_at is not None
+
+
+@pytest.mark.asyncio
+async def test_admin_runtime_secret_validation_redacts_plaintext(
+    admin_client,
+    db_session,
+    caplog,
+):
+    from sqlalchemy import func, select
+
+    from app.models.audit import ControlPlaneAuditEvent
+    from app.models.platform_idempotency import PlatformMutationIdempotency
+
+    marker = "admin-secret-must-not-leak\n"
+    caplog.set_level(logging.WARNING, logger="app.main")
+    audit_count = await db_session.scalar(select(func.count(ControlPlaneAuditEvent.id)))
+    idempotency_count = await db_session.scalar(select(func.count(PlatformMutationIdempotency.id)))
+    response = await admin_client.put(
+        f"/v1/admin/agents/{uuid.uuid4()}/runtime-state",
+        headers=_AUTH,
+        json={
+            "deployment_id": "invalid-secret",
+            "instance_id": "invalid-secret",
+            "generation": 1,
+            "cli_package_spec": "clawdi@1.2.3-test",
+            "locale": {"language": "en", "timezone": "UTC"},
+            "system": {},
+            "runtimes": {
+                "openclaw": {
+                    "enabled": True,
+                    "providerMode": "configured",
+                    "provider_ids": ["clawdi-managed"],
+                    "primary_model": {
+                        "provider_id": "clawdi-managed",
+                        "model": "gpt-5.5",
+                    },
+                    "install": {"source": "official"},
+                }
+            },
+            "live_sync": {"enabled": False, "agents": []},
+            "recovery": {"cacheManifest": True, "allowOfflineBoot": True},
+            "tools": {
+                "codex": {
+                    "enabled": True,
+                    "provider_id": "clawdi-managed",
+                    "primary_model": {
+                        "provider_id": "clawdi-managed",
+                        "model": "gpt-5.5",
+                    },
+                }
+            },
+            "secretValues": {"secret://runtime/invalid": marker},
+        },
+    )
+
+    assert response.status_code == 422
+    assert marker.strip() not in response.text
+    assert marker.strip() not in caplog.text
+    assert await db_session.scalar(select(func.count(ControlPlaneAuditEvent.id))) == audit_count
+    assert (
+        await db_session.scalar(select(func.count(PlatformMutationIdempotency.id)))
+        == idempotency_count
+    )
+    audits = list((await db_session.scalars(select(ControlPlaneAuditEvent))).all())
+    assert all(marker.strip() not in str(event.details) for event in audits)
+
+
+@pytest.mark.asyncio
+async def test_admin_register_env_explicit_agent_id_is_idempotent(
+    admin_client, db_session, seed_user
+):
+    """Stable agent ids remain the identity while machine fields refresh."""
+
+    from sqlalchemy import select
+
+    from app.models.session import AgentEnvironment
+
+    agent_id = uuid.uuid4()
+    body = {
+        "target_clerk_id": seed_user.clerk_id,
+        "environment_id": str(agent_id),
+        "machine_id": "hosted-agent-initial",
+        "machine_name": "hosted-pod-initial",
+        "agent_type": "codex",
+        "agent_version": "1.0.0",
+        "os_name": "linux",
+    }
+    first = await admin_client.post("/v1/admin/environments", headers=_AUTH, json=body)
+    second = await admin_client.post(
+        "/v1/admin/environments",
+        headers=_AUTH,
+        json={
+            **body,
+            "machine_id": "hosted-agent-moved",
+            "machine_name": "hosted-pod-moved",
+            "agent_version": "1.1.0",
+            "os_name": "darwin",
+        },
+    )
+
+    assert first.status_code == 200, first.text
+    assert second.status_code == 200, second.text
+    assert first.json()["id"] == str(agent_id)
+    assert second.json()["id"] == str(agent_id)
+
+    envs = (
+        (await db_session.execute(select(AgentEnvironment).where(AgentEnvironment.id == agent_id)))
+        .scalars()
+        .all()
+    )
+    assert len(envs) == 1
+    env = envs[0]
+    assert env.machine_id == "hosted-agent-moved"
+    assert env.machine_name == "hosted-pod-moved"
+    assert env.default_name == "Codex"
+    assert env.agent_version == "1.1.0"
+    assert env.os == "darwin"
+    assert env.registration_key is None
+
+
+@pytest.mark.asyncio
+async def test_admin_register_env_explicit_ids_allow_same_machine_metadata(
+    admin_client, db_session, seed_user
+):
+    """Two hosted agents can share machine metadata without sharing identity."""
+
+    from sqlalchemy import select
+
+    from app.models.session import AgentEnvironment
+
+    machine_id = "same-hosted-machine"
+    first_id = uuid.uuid4()
+    second_id = uuid.uuid4()
+    body = {
+        "target_clerk_id": seed_user.clerk_id,
+        "machine_id": machine_id,
+        "machine_name": "hosted-pod",
+        "agent_type": "codex",
+    }
+    r1 = await admin_client.post(
+        "/v1/admin/environments",
+        headers=_AUTH,
+        json={**body, "environment_id": str(first_id)},
+    )
+    r2 = await admin_client.post(
+        "/v1/admin/environments",
+        headers=_AUTH,
+        json={**body, "environment_id": str(second_id)},
+    )
+    assert r1.status_code == 200, r1.text
+    assert r2.status_code == 200, r2.text
+    assert r1.json()["id"] == str(first_id)
+    assert r2.json()["id"] == str(second_id)
+
+    envs = (
+        (
+            await db_session.execute(
+                select(AgentEnvironment).where(
+                    AgentEnvironment.user_id == seed_user.id,
+                    AgentEnvironment.machine_id == machine_id,
+                    AgentEnvironment.agent_type == "codex",
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert {env.id for env in envs} == {first_id, second_id}
+    assert all(env.registration_key is None for env in envs)
+
+
+@pytest.mark.asyncio
+async def test_admin_register_env_explicit_id_rejects_cross_tenant_id(
+    admin_client, db_session, seed_user
+):
+    from sqlalchemy import select
+
+    from app.models.session import AgentEnvironment
+    from app.models.user import User
+
+    other = User(clerk_id=f"other_env_{uuid.uuid4().hex[:8]}", email="other@x.dev", name="Other")
+    db_session.add(other)
+    await db_session.commit()
+    await db_session.refresh(other)
+    other_id = other.id
+
+    agent_id = uuid.uuid4()
+    try:
+        created = await admin_client.post(
+            "/v1/admin/environments",
+            headers=_AUTH,
+            json={
+                "target_clerk_id": other.clerk_id,
+                "environment_id": str(agent_id),
+                "machine_id": "other-explicit",
+                "machine_name": "other-pod",
+                "agent_type": "codex",
+            },
+        )
+        assert created.status_code == 200, created.text
+
+        rejected = await admin_client.post(
+            "/v1/admin/environments",
+            headers=_AUTH,
+            json={
+                "target_clerk_id": seed_user.clerk_id,
+                "environment_id": str(agent_id),
+                "machine_id": "seed-explicit",
+                "machine_name": "seed-pod",
+                "agent_type": "codex",
+            },
+        )
+        assert rejected.status_code == 409, rejected.text
+
+        env = (
+            await db_session.execute(
+                select(AgentEnvironment).where(AgentEnvironment.id == agent_id)
+            )
+        ).scalar_one()
+        assert env.user_id == other_id
+    finally:
+        await db_session.delete(other)
+        await db_session.commit()
+
+
+@pytest.mark.asyncio
+async def test_admin_register_env_idempotent(admin_client, db_session, seed_user):
+    """Legacy admin registration without an explicit id remains idempotent."""
+    body = {
+        "target_clerk_id": seed_user.clerk_id,
+        "machine_id": "idempotent-machine",
+        "machine_name": "pod-1",
+        "agent_type": "openclaw",
+    }
+    r1 = await admin_client.post(
+        "/v1/admin/environments",
+        headers=_AUTH,
+        json=body,
+    )
+    r2 = await admin_client.post(
+        "/v1/admin/environments",
+        headers=_AUTH,
+        json=body,
+    )
+    assert r1.status_code == 200
+    assert r2.status_code == 200
+    assert r1.json()["id"] == r2.json()["id"]
+
+
+@pytest.mark.asyncio
+async def test_admin_delete_env_archives_identity_and_preserves_relationships(
+    admin_client, db_session, seed_user
+):
+    """Hosted compute delete needs an admin path to remove the
+    cloud-api machine tile while preserving historical sessions."""
+    from datetime import UTC, datetime
+    from uuid import UUID
+
+    from sqlalchemy import select
+
+    from app.models.audit import ControlPlaneAuditEvent
+    from app.models.session import AgentEnvironment, Session
+    from app.models.skill import SKILL_AUTHORITY_AGENT_SYNC, SKILL_AUTHORITY_CLOUD, Skill
+
+    created = await admin_client.post(
+        "/api/admin/environments",
+        headers=_AUTH,
+        json={
+            "target_clerk_id": seed_user.clerk_id,
+            "machine_id": "delete-machine-1",
+            "machine_name": "delete-pod",
+            "agent_type": "codex",
+        },
+    )
+    assert created.status_code == 200, created.text
+    env_id = UUID(created.json()["id"])
+
+    session_row = Session(
+        user_id=seed_user.id,
+        environment_id=env_id,
+        local_session_id="local-delete-env-session",
+        project_path="/tmp/project",
+        started_at=datetime.now(UTC),
+        last_activity_at=datetime.now(UTC),
+    )
+    environment = await db_session.get(AgentEnvironment, env_id)
+    assert environment is not None
+    from app.models.ai_provider import AiProviderAuthPayload
+    from app.services.vault_crypto import encrypt
+
+    encrypted, nonce = encrypt('{"kind":"oauth-test"}')
+    claimed_payload = AiProviderAuthPayload(
+        owner_user_id=seed_user.id,
+        provider_id=f"delete-admin-{uuid.uuid4().hex}",
+        auth_profile="default",
+        kind="agent_profile",
+        source="test",
+        encrypted_payload=encrypted,
+        nonce=nonce,
+        consumer_environment_id=env_id,
+        consumer_runtime="codex",
+    )
+    db_session.add_all(
+        [
+            session_row,
+            claimed_payload,
+            Skill(
+                user_id=seed_user.id,
+                project_id=environment.default_project_id,
+                skill_key="admin-delete-legacy",
+                name="Admin delete legacy",
+                description="Legacy Cloud row",
+                content_hash="7" * 64,
+                authority=SKILL_AUTHORITY_CLOUD,
+            ),
+            Skill(
+                user_id=seed_user.id,
+                project_id=environment.default_project_id,
+                skill_key="admin-delete-claimed",
+                name="Admin delete claimed",
+                description="Agent projection",
+                content_hash="8" * 64,
+                source=SKILL_AUTHORITY_AGENT_SYNC,
+                authority=SKILL_AUTHORITY_AGENT_SYNC,
+                authority_agent_id=env_id,
+            ),
+        ]
+    )
+    await db_session.commit()
+    await db_session.refresh(seed_user)
+    revision_before = seed_user.skills_revision
+
+    deleted = await admin_client.delete(f"/api/admin/environments/{env_id}", headers=_AUTH)
+    assert deleted.status_code == 204, deleted.text
+
+    env = (
+        await db_session.execute(select(AgentEnvironment).where(AgentEnvironment.id == env_id))
+    ).scalar_one_or_none()
+    assert env is not None
+    assert env.archived_at is not None
+    retained_skills = (
+        (
+            await db_session.execute(
+                select(Skill).where(Skill.project_id == environment.default_project_id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(retained_skills) == 2
+    await db_session.refresh(seed_user)
+    assert seed_user.skills_revision == revision_before
+    await db_session.refresh(session_row)
+    assert session_row.environment_id == env_id
+    await db_session.refresh(claimed_payload)
+    assert claimed_payload.consumer_environment_id == env_id
+    assert claimed_payload.consumer_runtime == "codex"
+    event = (
+        await db_session.execute(
+            select(ControlPlaneAuditEvent).where(
+                ControlPlaneAuditEvent.action == "agent_environment.delete",
+                ControlPlaneAuditEvent.resource_id == str(env_id),
+            )
+        )
+    ).scalar_one()
+    assert event.actor_type == "admin"
+    assert event.resource_type == "agent_environment"
+    assert event.target_user_id == seed_user.id
+    assert event.source == "api.admin"
+    assert event.details["agent_type"] == "codex"
+    assert event.details["machine_id"] == "delete-machine-1"
+
+    deleted_again = await admin_client.delete(
+        f"/api/admin/environments/{env_id}",
+        headers=_AUTH,
+    )
+    assert deleted_again.status_code == 404
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "path_template",
+    ["/v1/admin/agents/{env_id}", "/v1/admin/environments/{env_id}"],
+)
+async def test_admin_delete_environment_accepts_matching_optional_owner(
+    admin_client, db_session, seed_user, path_template
+):
+    import uuid as _uuid
+
+    from app.models.session import AgentEnvironment
+    from tests.conftest import create_env_with_project
+
+    env = await create_env_with_project(
+        db_session,
+        user_id=seed_user.id,
+        machine_id=f"delete-owner-match-{_uuid.uuid4().hex[:8]}",
+        machine_name="delete-owner-match-pod",
+        agent_type="codex",
+    )
+
+    response = await admin_client.delete(
+        path_template.format(env_id=env.id),
+        headers=_AUTH,
+        params={"target_clerk_id": seed_user.clerk_id},
+    )
+
+    assert response.status_code == 204, response.text
+    archived = await db_session.get(AgentEnvironment, env.id)
+    assert archived is not None
+    assert archived.archived_at is not None
+
+
+@pytest.mark.asyncio
+async def test_admin_delete_agent_accepts_matching_terminated_owner(
+    admin_client, db_session, seed_user
+):
+    from app.models.principal_lifecycle import PrincipalLifecycle
+    from app.models.session import AgentEnvironment
+    from tests.conftest import create_env_with_project
+
+    env = await create_env_with_project(
+        db_session,
+        user_id=seed_user.id,
+        machine_id=f"delete-terminated-owner-{uuid.uuid4().hex[:8]}",
+        machine_name="delete-terminated-owner",
+        agent_type="codex",
+    )
+    now = datetime.now(UTC)
+    db_session.add(
+        PrincipalLifecycle(
+            issuer=_CLERK_ISSUER,
+            subject=seed_user.clerk_id,
+            user_id=seed_user.id,
+            terminated_at=now,
+            next_cleanup_attempt_at=now,
+        )
+    )
+    await db_session.commit()
+
+    response = await admin_client.delete(
+        f"/api/admin/agents/{env.id}",
+        headers=_AUTH,
+        params={"target_clerk_id": seed_user.clerk_id},
+    )
+
+    assert response.status_code == 204, response.text
+    archived = await db_session.get(AgentEnvironment, env.id)
+    assert archived is not None
+    assert archived.archived_at is not None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "path_template",
+    ["/v1/admin/agents/{env_id}", "/v1/admin/environments/{env_id}"],
+)
+async def test_admin_delete_environment_rejects_mismatched_optional_owner(
+    admin_client, db_session, seed_user, path_template
+):
+    import uuid as _uuid
+
+    from app.models.session import AgentEnvironment
+    from app.models.user import User
+    from tests.conftest import create_env_with_project
+
+    other = User(
+        clerk_id=f"other_delete_{_uuid.uuid4().hex[:8]}",
+        email="other-delete@x.dev",
+        name="Other Delete",
+    )
+    db_session.add(other)
+    await db_session.commit()
+    await db_session.refresh(other)
+    env = await create_env_with_project(
+        db_session,
+        user_id=other.id,
+        machine_id=f"delete-owner-mismatch-{_uuid.uuid4().hex[:8]}",
+        machine_name="delete-owner-mismatch-pod",
+        agent_type="codex",
+    )
+
+    response = await admin_client.delete(
+        path_template.format(env_id=env.id),
+        headers=_AUTH,
+        params={"target_clerk_id": seed_user.clerk_id},
+    )
+
+    assert response.status_code == 403, response.text
+    assert await db_session.get(AgentEnvironment, env.id) is not None
+
+
+@pytest.mark.asyncio
+async def test_admin_register_env_lazy_creates_user(admin_client, db_session):
+    """Same lazy-create contract for env registration: a brand-new
+    user clicking Deploy registers their first env. Without this,
+    SaaS calls admin_register_environment, gets 404, deploy
+    proceeds without sync, and the user has no clue why their pod
+    isn't showing up on cloud.clawdi.ai."""
+
+    from sqlalchemy import select
+
+    from app.models.project import PROJECT_KIND_PERSONAL, Project
+    from app.models.user import User
+
+    novel_clerk_id = f"user_env_register_{uuid.uuid4().hex[:12]}"
+    r = await admin_client.post(
+        "/v1/admin/environments",
+        headers=_AUTH,
+        json={
+            "target_clerk_id": novel_clerk_id,
+            "machine_id": "m-first",
+            "machine_name": "test-pod",
+            "agent_type": "openclaw",
+        },
+    )
+    assert r.status_code == 200, r.text
+
+    user = (
+        await db_session.execute(select(User).where(User.clerk_id == novel_clerk_id))
+    ).scalar_one()
+    # Personal project created alongside (JWT-path parity).
+    personal = (
+        await db_session.execute(
+            select(Project).where(Project.user_id == user.id, Project.kind == PROJECT_KIND_PERSONAL)
+        )
+    ).scalar_one_or_none()
+    assert personal is not None
+
+
+@pytest.mark.asyncio
+async def test_admin_mint_rejects_cross_tenant_environment_id(admin_client, db_session, seed_user):
+    """Admin caller passing user A's `target_clerk_id` together with an
+    `environment_id` owned by user B must get 403 (not silently mint a
+    cross-tenant key, not 500 on the ValueError traceback).
+
+    Defense in depth: `mint_api_key` raises ValueError on the
+    user_id/env_id ownership mismatch and the admin route maps that
+    to 403. The user-self-mint path has the same test
+    (`test_deploy_key_rejects_cross_tenant_environment_id`); without
+    the admin counterpart, a future refactor that inlines the
+    ownership check (or removes the service-layer check) would
+    silently regress the admin path with no safety net.
+    """
+    import uuid as _uuid
+
+    from app.models.user import User
+    from tests.conftest import create_env_with_project
+
+    other = User(clerk_id=f"other_admin_{_uuid.uuid4().hex[:8]}", email="o@x.dev", name="O")
+    db_session.add(other)
+    await db_session.commit()
+    await db_session.refresh(other)
+    other_env = await create_env_with_project(
+        db_session,
+        user_id=other.id,
+        machine_id="m-other-admin",
+        machine_name="other-pod",
+    )
+
+    try:
+        r = await admin_client.post(
+            "/v1/admin/auth/keys",
+            headers=_AUTH,
+            json={
+                "target_clerk_id": seed_user.clerk_id,
+                "label": "cross-tenant-attempt",
+                "environment_id": str(other_env.id),
+            },
+        )
+        assert r.status_code == 403, r.text
+    finally:
+        await db_session.delete(other)
+        await db_session.commit()
+
+
+@pytest.mark.asyncio
+async def test_admin_endpoints_excluded_from_openapi_schema(admin_client, seed_user):
+    """Regression: `/api/admin/*` MUST NOT appear in the public OpenAPI
+    schema. The web/CLI typed-client codegen consumes /openapi.json;
+    the exclusion keeps admin endpoints out of the generated public
+    API contract so `bun run generate-api` never emits bindings for
+    them. This is a codegen/contract invariant, not path secrecy: the
+    operator dashboard (apps/web/src/lib/admin-client.ts) deliberately
+    hand-rolls its admin client, so admin endpoint paths DO ship in
+    the web bundle — the security boundary is `require_admin_api_key`
+    (X-Admin-Key), which gates every admin route.
+
+    Also verifies the endpoints are still REACHABLE — a regression
+    where someone disables the admin router entirely (or comments
+    out `include_router(admin_router)`) would pass the
+    "absent from schema" check trivially. Catching both means the
+    test holds the actual invariant: hidden from schema AND live.
+    """
+    r = await admin_client.get("/openapi.json")
+    assert r.status_code == 200
+    schema = r.json()
+    admin_paths = [p for p in schema.get("paths", {}) if p.startswith("/v1/admin")]
+    assert admin_paths == [], (
+        f"admin endpoints leaked into OpenAPI schema: {admin_paths}. "
+        "Add `include_in_schema=False` to the admin router."
+    )
+
+    # Reachability check: the actual endpoint must respond (200), not
+    # 404 — confirms the router is still wired up under the schema-
+    # excluded prefix.
+    mint = await admin_client.post(
+        "/v1/admin/auth/keys",
+        headers=_AUTH,
+        json={"target_clerk_id": seed_user.clerk_id, "label": "reachability-check"},
+    )
+    assert mint.status_code == 200, (
+        f"admin mint endpoint is not reachable (status={mint.status_code}): {mint.text}. "
+        "include_in_schema=False must hide the route from /openapi.json without "
+        "actually disabling it."
+    )
+
+
+@pytest.mark.asyncio
+async def test_admin_platform_whatsapp_qr_promotes_only_after_connected_and_logout_is_fail_closed(
+    admin_client, db_session, seed_user, channel_agent, monkeypatch
+):
+    import app.routes.admin as admin_routes
+    import app.services.whatsapp_device_onboarding as whatsapp_onboarding
+    from app.models.channel import (
+        ChannelAccount,
+        ChannelBotAgentLink,
+        ChannelWhatsAppOnboardingSession,
+    )
+    from app.services import sync_events
+
+    account_id = uuid.uuid4()
+    fake = _ManagedOnboardingSidecar()
+    registry = ConfiguredWhatsAppSidecarRegistry(
+        "fake",
+        base_url="http://127.0.0.1:43192",
+        client_factory=lambda _config: fake,
+    )
+    await registry.start()
+    monkeypatch.setattr(admin_routes, "get_active_whatsapp_sidecar_clients", lambda: registry)
+    payload = {
+        "account_id": str(account_id),
+        "request_id": str(uuid.uuid4()),
+        "name": "Shared WhatsApp",
+    }
+    pairing_url = "/v1/admin/channels/whatsapp/pairing-sessions"
+    queue = None
+    try:
+        assert (await admin_client.post(pairing_url, json=payload)).status_code == 401
+        started = await admin_client.post(pairing_url, json=payload, headers=_AUTH)
+        assert started.status_code == 201, started.text
+        assert started.headers["cache-control"] == "no-store, private"
+        assert started.json()["qr"] == fake.qr
+        assert await db_session.get(ChannelAccount, account_id) is None
+        fake.qr = "sensitive-rotated-qr"
+        repeated = await admin_client.post(pairing_url, json=payload, headers=_AUTH)
+        assert repeated.json()["id"] == started.json()["id"]
+        assert repeated.json()["qr"] == fake.qr
+        fake.connected = fake.registered = True
+        promoted = await admin_client.get(f"{pairing_url}/{started.json()['id']}", headers=_AUTH)
+        assert promoted.status_code == 200, promoted.text
+        assert promoted.headers["cache-control"] == "no-store, private"
+        assert promoted.json()["channel_account_id"] == str(account_id)
+        account = await db_session.get(ChannelAccount, account_id)
+        assert account is not None and account.visibility == "public"
+        assert account.user_id is None
+        assert account.config["connection_mode"] == "baileys_managed"
+        session = await db_session.get(
+            ChannelWhatsAppOnboardingSession, uuid.UUID(started.json()["id"])
+        )
+        assert session.ownership_kind == "platform"
+        assert session.user_id is None
+        await registry.stop()
+        registry = ConfiguredWhatsAppSidecarRegistry(
+            "fake",
+            base_url="http://127.0.0.1:43192",
+            client_factory=lambda _config: fake,
+        )
+        await registry.start()
+        await registry.reconcile_managed_ownership(db_session)
+        assert registry.managed_is_bound(account_id)
+        monkeypatch.setattr(admin_routes, "get_active_whatsapp_sidecar_clients", lambda: registry)
+        db_session.add(
+            ChannelBotAgentLink(
+                account_id=account.id,
+                user_id=seed_user.id,
+                agent_id=channel_agent.id,
+                status="active",
+            )
+        )
+        await db_session.commit()
+        queue = sync_events.subscribe(
+            seed_user.id,
+            frozenset(),
+            environment_id=channel_agent.id,
+        )
+        monkeypatch.setattr(whatsapp_onboarding, "_LOGOUT_RECOVERY_TTL_SECONDS", 0.01)
+        fake.logout_fails = True
+        assert (
+            await admin_client.delete(f"/v1/admin/channels/{account_id}", headers=_AUTH)
+        ).status_code == 503
+        assert fake.logout_calls == 1
+        await db_session.refresh(account)
+        assert account.archived_at is None
+        assert queue.empty()
+        fake.logout_fails = False
+        assert (
+            await admin_client.delete(f"/v1/admin/channels/{account_id}", headers=_AUTH)
+        ).status_code == 204
+        assert queue.get_nowait() == {
+            "type": "runtime_manifest_changed",
+            "environment_id": str(channel_agent.id),
+        }
+        assert queue.empty()
+    finally:
+        if queue is not None:
+            sync_events.unsubscribe(seed_user.id, queue)
+        await registry.stop()
+
+
+@pytest.mark.asyncio
+async def test_admin_platform_whatsapp_errors_are_authenticated_configured_only_and_no_store(
+    admin_client, monkeypatch
+):
+    import app.routes.admin as admin_routes
+
+    monkeypatch.setattr(admin_routes, "get_active_whatsapp_sidecar_clients", lambda: None)
+    payload = {
+        "account_id": str(uuid.uuid4()),
+        "request_id": str(uuid.uuid4()),
+        "name": "Shared WhatsApp",
+    }
+    pairing_url = "/v1/admin/channels/whatsapp/pairing-sessions"
+    responses = [
+        await admin_client.post(pairing_url, json=payload),
+        await admin_client.post(pairing_url, json={}, headers=_AUTH),
+        await admin_client.post(pairing_url, json=payload, headers=_AUTH),
+        await admin_client.get(f"{pairing_url}/{uuid.uuid4()}", headers=_AUTH),
+        await admin_client.delete(f"{pairing_url}/{uuid.uuid4()}", headers=_AUTH),
+    ]
+    assert [response.status_code for response in responses] == [401, 422, 404, 404, 404]
+    for response in responses:
+        assert response.headers["cache-control"] == "no-store, private"
+        assert response.headers["pragma"] == "no-cache"
+
+
+@pytest.mark.asyncio
+async def test_admin_platform_whatsapp_cancel_success_is_no_store(admin_client, monkeypatch):
+    import app.routes.admin as admin_routes
+
+    account_id = uuid.uuid4()
+    fake = _ManagedOnboardingSidecar()
+    registry = ConfiguredWhatsAppSidecarRegistry(
+        "fake",
+        base_url="http://127.0.0.1:43194",
+        client_factory=lambda _config: fake,
+    )
+    await registry.start()
+    monkeypatch.setattr(admin_routes, "get_active_whatsapp_sidecar_clients", lambda: registry)
+    pairing_url = "/v1/admin/channels/whatsapp/pairing-sessions"
+    try:
+        started = await admin_client.post(
+            pairing_url,
+            headers=_AUTH,
+            json={
+                "account_id": str(account_id),
+                "request_id": str(uuid.uuid4()),
+                "name": "Cancelable Shared WhatsApp",
+            },
+        )
+        canceled = await admin_client.delete(f"{pairing_url}/{started.json()['id']}", headers=_AUTH)
+        assert canceled.status_code == 200
+        assert canceled.json()["state"] == "canceled"
+        assert canceled.headers["cache-control"] == "no-store, private"
+        assert canceled.headers["pragma"] == "no-cache"
+    finally:
+        await registry.stop()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider", ["telegram", "discord"])
+async def test_admin_delete_non_whatsapp_provider_regression(
+    admin_client, db_session, seed_user, provider
+):
+    from app.models.channel import ChannelAccount
+
+    account = ChannelAccount(
+        user_id=None,
+        provider=provider,
+        name=f"delete-{provider}-{uuid.uuid4()}",
+        status="active",
+        visibility="public",
+        webhook_secret_hash="0" * 64,
+        config={},
+    )
+    db_session.add(account)
+    await db_session.commit()
+    response = await admin_client.delete(f"/v1/admin/channels/{account.id}", headers=_AUTH)
+    assert response.status_code == 204
+    await db_session.refresh(account)
+    assert account.archived_at is not None
+
+
+@pytest.mark.asyncio
+async def test_admin_key_survives_cors_preflight(admin_client):
+    """The operator console is a browser surface authenticating ONLY with
+    `X-Admin-Key`, so that header has to clear the preflight.
+
+    Leaving it out of `allow_headers` fails the OPTIONS with 400 and the browser
+    then drops the real request before sending it. The console surfaces that as
+    "We couldn't reach the service" — indistinguishable from the backend being
+    down, and invisible in the backend's own log because nothing arrives. It
+    only reproduces cross-origin: a same-origin dashboard never preflights, so
+    this stays hidden until the dashboard and API are on different origins.
+    """
+    origin = settings.cors_origins[0]
+    preflight = await admin_client.options(
+        "/v1/admin/users",
+        headers={
+            "Origin": origin,
+            "Access-Control-Request-Method": "GET",
+            "Access-Control-Request-Headers": "x-admin-key",
+        },
+    )
+    assert preflight.status_code == 200, (
+        "preflight rejected X-Admin-Key; the operator console cannot reach the API "
+        "from any origin other than the API's own"
+    )
+    allowed = {
+        value.strip().lower()
+        for value in preflight.headers.get("access-control-allow-headers", "").split(",")
+    }
+    assert "x-admin-key" in allowed

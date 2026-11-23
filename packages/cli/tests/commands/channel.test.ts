@@ -1,0 +1,558 @@
+import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import {
+	channelAvailableCommand,
+	channelCreateCommand,
+	channelDeleteCommand,
+	channelGetCommand,
+	channelLinkCommand,
+	channelListCommand,
+	channelPairCodeCommand,
+	channelRotateTokenCommand,
+	channelSendCommand,
+	channelSyncCommandsCommand,
+} from "../../src/commands/channel";
+import { stateRootFor } from "../../src/lib/state-root";
+import { jsonResponse, mockFetch } from "./helpers";
+
+let tmpHome: string;
+let origHome: string | undefined;
+let origApiUrl: string | undefined;
+
+beforeEach(() => {
+	origHome = process.env.HOME;
+	origApiUrl = process.env.CLAWDI_API_URL;
+	tmpHome = join(tmpdir(), `clawdi-channel-${Date.now()}-${Math.random().toString(36)}`);
+	mkdirSync(stateRootFor(tmpHome), { recursive: true });
+	writeFileSync(
+		join(stateRootFor(tmpHome), "auth.json"),
+		JSON.stringify({
+			apiKey: "test-key",
+			endpointBinding: { version: 1, cloudApiOrigin: "https://api.test" },
+		}),
+	);
+	process.env.HOME = tmpHome;
+	process.env.CLAWDI_API_URL = "https://api.test";
+	process.exitCode = 0;
+});
+
+afterEach(() => {
+	if (origHome) process.env.HOME = origHome;
+	else delete process.env.HOME;
+	if (origApiUrl) process.env.CLAWDI_API_URL = origApiUrl;
+	else delete process.env.CLAWDI_API_URL;
+	rmSync(tmpHome, { recursive: true, force: true });
+	process.exitCode = 0;
+});
+
+describe("channel commands", () => {
+	it("lists only user-owned channel bots", async () => {
+		const { captured, restore } = mockFetch([
+			{
+				method: "GET",
+				path: "/v1/channels",
+				response: () =>
+					jsonResponse([
+						{
+							id: "channel-private",
+							provider: "telegram",
+							name: "ops-bot",
+							status: "active",
+							visibility: "private",
+							has_provider_token: true,
+							webhook_url: "https://api.test/v1/channels/telegram/channel-private/webhook",
+							created_at: new Date().toISOString(),
+						},
+					]),
+			},
+		]);
+		const out = await captureStdout(() => channelListCommand({ json: true }));
+		restore();
+
+		expect(captured[0]).toMatchObject({ method: "GET", path: "/v1/channels" });
+		expect(JSON.parse(out)).toMatchObject({
+			channels: [{ id: "channel-private", visibility: "private" }],
+		});
+	});
+
+	it("lists available channel bots from the bot pool", async () => {
+		const { captured, restore } = mockFetch([
+			{
+				method: "GET",
+				path: "/v1/channels/bot-pool",
+				response: () =>
+					jsonResponse({
+						providers: {
+							telegram: [
+								{
+									id: "channel-public",
+									provider: "telegram",
+									name: "Clawdi Telegram",
+									status: "active",
+									visibility: "public",
+									has_provider_token: true,
+									webhook_url: "https://api.test/v1/channels/telegram/channel-public/webhook",
+									created_at: new Date().toISOString(),
+									access: "public",
+									capabilities: {
+										link_agent: true,
+										pair_chat: true,
+										send_message: true,
+										manage_account: false,
+										sync_commands: false,
+									},
+								},
+							],
+						},
+					}),
+			},
+		]);
+		const out = await captureStdout(() => channelAvailableCommand({ json: true }));
+		restore();
+
+		expect(captured[0]).toMatchObject({ method: "GET", path: "/v1/channels/bot-pool" });
+		expect(JSON.parse(out)).toMatchObject({
+			bot_pool: {
+				providers: {
+					telegram: [{ id: "channel-public", access: "public" }],
+				},
+			},
+		});
+	});
+
+	it("creates a private channel bot with optional initial agent link", async () => {
+		const { captured, restore } = mockFetch([
+			{
+				method: "POST",
+				path: "/v1/channels",
+				response: () =>
+					jsonResponse(
+						{
+							id: "channel-1",
+							provider: "telegram",
+							name: "ops-bot",
+							status: "active",
+							visibility: "private",
+							has_provider_token: true,
+							webhook_url: "https://api.test/v1/channels/telegram/channel-1/webhook",
+							created_at: new Date().toISOString(),
+							webhook_secret: "secret",
+							agent_link_id: "link-1",
+							agent_id: "agent-1",
+							agent_token: "123:mock",
+						},
+						201,
+					),
+			},
+		]);
+		const out = await captureStdout(() =>
+			channelCreateCommand("telegram", "ops-bot", {
+				agent: "agent-1",
+				providerToken: "provider-token",
+				config: '{"bot_username":"ops"}',
+				secret: ["app_secret=shh"],
+				json: true,
+			}),
+		);
+		restore();
+
+		expect(captured[0]).toMatchObject({
+			method: "POST",
+			path: "/v1/channels",
+			body: {
+				provider: "telegram",
+				name: "ops-bot",
+				agent_id: "agent-1",
+				provider_token: "provider-token",
+				config: { bot_username: "ops" },
+				secrets: { app_secret: "shh" },
+			},
+		});
+		expect(JSON.parse(out)).toMatchObject({
+			channel: { id: "channel-1", agent_link_id: "link-1", agent_token: "123:mock" },
+		});
+	});
+
+	it("creates a private channel bot with provider token and secrets from env", async () => {
+		process.env.CLAWDI_TEST_PROVIDER_TOKEN = "provider-token-from-env";
+		process.env.CLAWDI_TEST_PROVIDER_SECRET = "secret-from-env";
+		const { captured, restore } = mockFetch([
+			{
+				method: "POST",
+				path: "/v1/channels",
+				response: () =>
+					jsonResponse(
+						{
+							id: "channel-1",
+							provider: "telegram",
+							name: "ops-bot",
+							status: "active",
+							visibility: "private",
+							has_provider_token: true,
+							webhook_url: "https://api.test/v1/channels/telegram/channel-1/webhook",
+							created_at: new Date().toISOString(),
+							webhook_secret: "secret",
+						},
+						201,
+					),
+			},
+		]);
+
+		try {
+			await captureStdout(() =>
+				channelCreateCommand("telegram", "ops-bot", {
+					providerTokenEnv: "CLAWDI_TEST_PROVIDER_TOKEN",
+					secretEnv: ["app_secret=CLAWDI_TEST_PROVIDER_SECRET"],
+					json: true,
+				}),
+			);
+		} finally {
+			restore();
+			delete process.env.CLAWDI_TEST_PROVIDER_TOKEN;
+			delete process.env.CLAWDI_TEST_PROVIDER_SECRET;
+		}
+
+		expect(captured[0]).toMatchObject({
+			method: "POST",
+			path: "/v1/channels",
+			body: {
+				provider_token: "provider-token-from-env",
+				secrets: { app_secret: "secret-from-env" },
+			},
+		});
+	});
+
+	it("shows channel details", async () => {
+		const { captured, restore } = mockFetch([
+			{
+				method: "GET",
+				path: "/v1/channels/channel-1",
+				response: () =>
+					jsonResponse({
+						id: "channel-1",
+						provider: "telegram",
+						name: "ops-bot",
+						status: "active",
+						visibility: "private",
+						has_provider_token: true,
+						webhook_url: "https://api.test/v1/channels/telegram/channel-1/webhook",
+						created_at: new Date().toISOString(),
+					}),
+			},
+		]);
+		const out = await captureStdout(() => channelGetCommand("channel-1", { json: true }));
+		restore();
+
+		expect(captured[0]).toMatchObject({ method: "GET", path: "/v1/channels/channel-1" });
+		expect(JSON.parse(out)).toMatchObject({
+			channel: { id: "channel-1", provider: "telegram", visibility: "private" },
+		});
+	});
+
+	it("links an accessible channel to an agent", async () => {
+		const { captured, restore } = mockFetch([
+			{
+				method: "POST",
+				path: "/v1/channels/channel-1/agent-links",
+				response: () =>
+					jsonResponse(
+						{
+							id: "link-1",
+							account_id: "channel-1",
+							agent_id: "agent-1",
+							status: "active",
+							created_at: new Date().toISOString(),
+							agent_token: "mock-token",
+						},
+						201,
+					),
+			},
+		]);
+		const out = await captureStdout(() =>
+			channelLinkCommand("channel-1", { agent: "agent-1", json: true }),
+		);
+		restore();
+
+		expect(captured[0]).toMatchObject({
+			method: "POST",
+			path: "/v1/channels/channel-1/agent-links",
+			body: { agent_id: "agent-1" },
+		});
+		expect(JSON.parse(out)).toMatchObject({
+			link: { id: "link-1", account_id: "channel-1", agent_id: "agent-1" },
+		});
+	});
+
+	it("rotates an agent link token", async () => {
+		const { captured, restore } = mockFetch([
+			{
+				method: "POST",
+				path: "/v1/channels/channel-1/agent-links/link-1/token",
+				response: () =>
+					jsonResponse({
+						id: "link-1",
+						account_id: "channel-1",
+						agent_id: "agent-1",
+						status: "active",
+						created_at: new Date().toISOString(),
+						agent_token: "rotated-token",
+					}),
+			},
+		]);
+		const out = await captureStdout(() =>
+			channelRotateTokenCommand("channel-1", { link: "link-1", json: true }),
+		);
+		restore();
+
+		expect(captured[0]).toMatchObject({
+			method: "POST",
+			path: "/v1/channels/channel-1/agent-links/link-1/token",
+		});
+		expect(JSON.parse(out)).toMatchObject({
+			link: { id: "link-1", agent_token: "rotated-token" },
+		});
+	});
+
+	it("creates a pair code for an existing bot-agent link", async () => {
+		const { captured, restore } = mockFetch([
+			{
+				method: "POST",
+				path: "/v1/channels/channel-1/pair-codes",
+				response: () =>
+					jsonResponse(
+						{
+							id: "pair-1",
+							agent_link_id: "link-1",
+							agent_id: "agent-1",
+							agent_token: null,
+							code: "BCDFGHJKLM",
+							expires_at: new Date().toISOString(),
+							pairing_command: "/clawdi_pair BCDFGHJKLM",
+						},
+						201,
+					),
+			},
+		]);
+		const out = await captureStdout(() =>
+			channelPairCodeCommand("channel-1", { link: "link-1", ttl: "600", json: true }),
+		);
+		restore();
+
+		expect(captured[0]).toMatchObject({
+			method: "POST",
+			path: "/v1/channels/channel-1/pair-codes",
+			body: { agent_id: null, agent_link_id: "link-1", ttl_seconds: 600 },
+		});
+		expect(JSON.parse(out)).toMatchObject({
+			pair_code: { code: "BCDFGHJKLM", agent_link_id: "link-1" },
+		});
+	});
+
+	it("uses the five-minute pair-code TTL by default", async () => {
+		const { captured, restore } = mockFetch([
+			{
+				method: "POST",
+				path: "/v1/channels/channel-1/pair-codes",
+				response: () =>
+					jsonResponse(
+						{
+							id: "pair-default-ttl",
+							agent_link_id: "link-1",
+							agent_id: "agent-1",
+							agent_token: null,
+							code: "BCDFGHJKLM",
+							expires_at: new Date().toISOString(),
+							pairing_command: "/clawdi_pair BCDFGHJKLM",
+						},
+						201,
+					),
+			},
+		]);
+
+		await captureStdout(() => channelPairCodeCommand("channel-1", { link: "link-1", json: true }));
+		restore();
+
+		expect(captured[0]?.body).toMatchObject({
+			agent_id: null,
+			agent_link_id: "link-1",
+			ttl_seconds: 300,
+		});
+	});
+
+	it("prints the provider-specific Discord pairing command", async () => {
+		const { restore } = mockFetch([
+			{
+				method: "POST",
+				path: "/v1/channels/discord-channel/pair-codes",
+				response: () =>
+					jsonResponse(
+						{
+							id: "pair-discord",
+							agent_link_id: "link-discord",
+							agent_id: "agent-1",
+							agent_token: null,
+							code: "NPQRSTVWXY",
+							expires_at: new Date().toISOString(),
+							pairing_command: "/clawdi_pair NPQRSTVWXY",
+							discord_install_url:
+								"https://discord.com/oauth2/authorize?client_id=123456789012345678&integration_type=0&permissions=309237763136&scope=bot%20applications.commands",
+							discord_user_install_url:
+								"https://discord.com/oauth2/authorize?client_id=123456789012345678&integration_type=1&scope=applications.commands",
+						},
+						201,
+					),
+			},
+		]);
+		const out = await captureStdout(() =>
+			channelPairCodeCommand("discord-channel", { link: "link-discord", ttl: "600" }),
+		);
+		restore();
+
+		expect(out).toContain("Send this in the external chat: /clawdi_pair NPQRSTVWXY");
+		expect(out).not.toContain("/bot_pair");
+	});
+
+	it("rejects pair-code requests that pass both agent and link", async () => {
+		const origError = console.error;
+		let err = "";
+		console.error = (...args: unknown[]) => {
+			err = args.map(String).join(" ");
+		};
+		try {
+			await channelPairCodeCommand("channel-1", {
+				agent: "agent-1",
+				link: "link-1",
+			});
+		} finally {
+			console.error = origError;
+		}
+
+		expect(process.exitCode).toBe(1);
+		expect(err).toContain("Pass either --agent or --link, not both.");
+	});
+
+	it("queues an outbound message by binding id", async () => {
+		const { captured, restore } = mockFetch([
+			{
+				method: "POST",
+				path: "/v1/channels/channel-1/messages",
+				response: () =>
+					jsonResponse(
+						{
+							id: "message-1",
+							direction: "outbound",
+							external_chat_id: "chat-1",
+							provider_message_id: null,
+							delivery_id: "delivery-1",
+							delivery_status: "pending",
+							text: "deploy done",
+							created_at: new Date().toISOString(),
+						},
+						201,
+					),
+			},
+		]);
+		const out = await captureStdout(() =>
+			channelSendCommand("channel-1", {
+				binding: "binding-1",
+				text: "deploy done",
+				json: true,
+			}),
+		);
+		restore();
+
+		expect(captured[0]).toMatchObject({
+			method: "POST",
+			path: "/v1/channels/channel-1/messages",
+			body: { binding_id: "binding-1", external_chat_id: null, text: "deploy done" },
+		});
+		expect(JSON.parse(out)).toMatchObject({
+			message: { id: "message-1", delivery_status: "pending" },
+		});
+	});
+
+	it("rejects send requests with both binding and chat", async () => {
+		const origError = console.error;
+		let err = "";
+		console.error = (...args: unknown[]) => {
+			err = args.map(String).join(" ");
+		};
+		try {
+			await channelSendCommand("channel-1", {
+				binding: "binding-1",
+				chat: "chat-1",
+				text: "hello",
+			});
+		} finally {
+			console.error = origError;
+		}
+
+		expect(process.exitCode).toBe(1);
+		expect(err).toContain("Pass either --binding or --chat, not both.");
+	});
+
+	it("syncs provider commands", async () => {
+		const { captured, restore } = mockFetch([
+			{
+				method: "POST",
+				path: "/v1/channels/channel-1/commands/sync",
+				response: () =>
+					jsonResponse({
+						provider: "discord",
+						commands: [{ name: "clawdi_pair", description: "Pair this chat with Clawdi." }],
+					}),
+			},
+		]);
+		const out = await captureStdout(() =>
+			channelSyncCommandsCommand("channel-1", {
+				guild: "guild-1",
+				commands: '[{"name":"clawdi_pair","description":"Pair"}]',
+				json: true,
+			}),
+		);
+		restore();
+
+		expect(captured[0]).toMatchObject({
+			method: "POST",
+			path: "/v1/channels/channel-1/commands/sync",
+			body: {
+				guild_id: "guild-1",
+				commands: [{ name: "clawdi_pair", description: "Pair" }],
+			},
+		});
+		expect(JSON.parse(out)).toMatchObject({ sync: { provider: "discord" } });
+	});
+
+	it("archives a private channel bot with explicit confirmation", async () => {
+		const { captured, restore } = mockFetch([
+			{
+				method: "DELETE",
+				path: "/v1/channels/channel-1",
+				response: () => new Response(null, { status: 204 }),
+			},
+		]);
+		const out = await captureStdout(() =>
+			channelDeleteCommand("channel-1", { yes: true, json: true }),
+		);
+		restore();
+
+		expect(captured[0]).toMatchObject({ method: "DELETE", path: "/v1/channels/channel-1" });
+		expect(JSON.parse(out)).toEqual({ account_id: "channel-1", deleted: true });
+	});
+});
+
+async function captureStdout(fn: () => Promise<void>): Promise<string> {
+	const orig = console.log;
+	let out = "";
+	console.log = (...args: unknown[]) => {
+		out = args.map(String).join(" ");
+	};
+	try {
+		await fn();
+	} finally {
+		console.log = orig;
+	}
+	return out;
+}

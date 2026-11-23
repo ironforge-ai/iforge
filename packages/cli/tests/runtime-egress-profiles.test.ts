@@ -1,0 +1,430 @@
+import { describe, expect, it } from "bun:test";
+import { egressProfileSchema, secretRefSchema } from "../src/runtime/egress-profiles";
+import { hostedManifestEgressProfiles } from "../src/runtime/hosted-egress-profiles";
+
+const providerProfiles = (profiles: ReturnType<typeof hostedManifestEgressProfiles>["profiles"]) =>
+	profiles.filter((profile) => profile.owner === "provider-projection");
+
+describe("runtime egress profile schema", () => {
+	it("shares canonical secretRef semantics with hosted MCP resources", () => {
+		for (const value of ["secret://provider.default.apiKey", "secret://runtime/auth-token"]) {
+			expect(secretRefSchema.safeParse(value).success).toBe(true);
+		}
+		for (const value of [
+			"secret://",
+			"env://CLAWDI_AUTH_TOKEN",
+			"provider.default.apiKey",
+			"secret://provider key",
+			"secret://provider\tkey",
+			"secret://provider\nkey",
+		]) {
+			expect(secretRefSchema.safeParse(value).success).toBe(false);
+		}
+	});
+
+	it("accepts HTTP and websocket upstream base URLs", () => {
+		const base = {
+			id: "discord-rest",
+			enabled: true,
+			kind: "http",
+			match: { scheme: "https", host: "discord.com", pathPrefix: "/api/" },
+			rewrite: { upstreamBaseUrl: "https://router.test/discord" },
+		};
+
+		expect(egressProfileSchema.safeParse(base).success).toBe(true);
+		expect(
+			egressProfileSchema.safeParse({
+				...base,
+				id: "discord-gateway",
+				kind: "websocket",
+				match: { scheme: "wss", host: "gateway.discord.gg", pathPrefix: "/" },
+				rewrite: { upstreamBaseUrl: "wss://router.test/discord/gateway" },
+			}).success,
+		).toBe(true);
+	});
+
+	it("accepts secretRef-backed rewrite headers", () => {
+		expect(
+			egressProfileSchema.safeParse({
+				id: "codex-chatgpt-backend-responses",
+				enabled: true,
+				kind: "provider",
+				match: {
+					scheme: "https",
+					host: "chatgpt.com",
+					path: { type: "equals", value: "/backend-api/codex/responses" },
+					headers: { authorization: { type: "exists" } },
+				},
+				rewrite: {
+					preservePath: true,
+					setHeaders: {
+						authorization: {
+							type: "secretRef",
+							secretRef: "secret://provider.default.apiKey",
+							prefix: "Bearer ",
+						},
+					},
+				},
+			}).success,
+		).toBe(true);
+	});
+
+	it("accepts generic secretRef prefix matchers for headers and query values", () => {
+		expect(
+			egressProfileSchema.safeParse({
+				id: "managed-upgrade-identity",
+				enabled: true,
+				kind: "websocket",
+				match: {
+					scheme: "wss",
+					host: "socket.example.test",
+					headers: {
+						"x-managed-identity": {
+							type: "secretRefPrefix",
+							secretRef: "secret://runtime/placeholder",
+							prefix: "Managed ",
+						},
+					},
+					query: {
+						identity: {
+							type: "secretRefPrefix",
+							secretRef: "secret://runtime/placeholder",
+							suffix: ".",
+						},
+					},
+				},
+				rewrite: { upstreamBaseUrl: "wss://relay.example.test/session" },
+			}).success,
+		).toBe(true);
+	});
+
+	it("accepts narrowly scoped removal of internal routing headers", () => {
+		expect(
+			egressProfileSchema.safeParse({
+				id: "whatsapp-managed-upgrade",
+				enabled: true,
+				kind: "websocket",
+				match: {
+					scheme: "wss",
+					host: "web.whatsapp.com",
+					path: { type: "equals", value: "/ws/chat" },
+					headers: { "x-clawdi-whatsapp-link-capability": { type: "exists" } },
+				},
+				rewrite: {
+					upstreamBaseUrl: "wss://cloud-api.test/v1/channels/whatsapp/baileys",
+					preservePath: false,
+					removeHeaders: ["x-clawdi-whatsapp-link-capability"],
+				},
+			}).success,
+		).toBe(true);
+	});
+
+	it("requires upstream base URLs for HTTP and websocket rewrite profiles", () => {
+		for (const kind of ["http", "websocket"] as const) {
+			expect(
+				egressProfileSchema.safeParse({
+					id: `missing-upstream-${kind}`,
+					enabled: true,
+					kind,
+					match: { scheme: kind === "websocket" ? "wss" : "https", host: "example.com" },
+					rewrite: {
+						setHeaders: {
+							authorization: "Bearer public-test-token",
+						},
+					},
+				}).success,
+			).toBe(false);
+		}
+	});
+
+	it("rejects upstream base URLs with unsupported schemes, credentials, or unsafe hosts", () => {
+		const base = {
+			id: "bad-upstream",
+			enabled: true,
+			kind: "http",
+			match: { scheme: "https", host: "discord.com", pathPrefix: "/api/" },
+		};
+
+		for (const upstreamBaseUrl of [
+			"secret://runtime/channels/url",
+			"https://user:pass@router.test/discord",
+			"https://.router.test/discord",
+		]) {
+			expect(
+				egressProfileSchema.safeParse({
+					...base,
+					rewrite: { upstreamBaseUrl },
+				}).success,
+			).toBe(false);
+		}
+	});
+
+	it("accepts passthrough profiles without rewrite rules", () => {
+		expect(
+			egressProfileSchema.safeParse({
+				id: "direct-egress",
+				enabled: true,
+				kind: "passthrough",
+				match: { scheme: "https", host: "example.com", pathPrefix: "/" },
+			}).success,
+		).toBe(true);
+		expect(
+			egressProfileSchema.safeParse({
+				id: "direct-egress",
+				enabled: true,
+				kind: "passthrough",
+				match: { scheme: "https", host: "example.com", pathPrefix: "/" },
+				rewrite: { upstreamBaseUrl: "https://router.test" },
+			}).success,
+		).toBe(false);
+	});
+
+	it("rejects path prefixes that the native sidecar would reject", () => {
+		expect(
+			egressProfileSchema.safeParse({
+				id: "bad-prefix",
+				enabled: true,
+				kind: "http",
+				match: { scheme: "https", host: "example.com", pathPrefix: "api/" },
+				rewrite: { upstreamBaseUrl: "https://router.test" },
+			}).success,
+		).toBe(false);
+	});
+
+	it("derives managed provider rewrite profiles from hosted provider projection", () => {
+		const bundle = hostedManifestEgressProfiles({
+			controlPlane: { cloudApiUrl: "https://cloud-api.test" },
+			providers: {
+				default: {
+					baseUrl: "https://ai-gateway.example.test/v1",
+					apiMode: "openai_chat",
+					managed_by: "clawdi",
+					apiKeySecretRef: "secret://provider.default.apiKey",
+				},
+			},
+		});
+
+		expect(providerProfiles(bundle.profiles)).toEqual([
+			{
+				id: "managed-provider",
+				enabled: true,
+				kind: "provider",
+				match: {
+					scheme: "https",
+					host: "ai-gateway.example.test",
+					pathPrefix: "/v1/",
+					headers: {
+						authorization: {
+							type: "equals",
+							value: "clawdi-egress-placeholder",
+							prefix: "Bearer ",
+						},
+					},
+					query: {},
+				},
+				rewrite: {
+					preservePath: true,
+					setHeaders: {
+						authorization: {
+							type: "secretRef",
+							secretRef: "secret://provider.default.apiKey",
+							prefix: "Bearer ",
+						},
+					},
+				},
+				logging: { redactHeaders: ["authorization"], redactUrlPatterns: [] },
+				priority: 80,
+				owner: "provider-projection",
+			},
+		]);
+	});
+
+	it("uses the stable managed id for deployment-scoped rewrite profile names", () => {
+		const bundle = hostedManifestEgressProfiles({
+			providers: {
+				"clawdi-v2-deployment-42": {
+					baseUrl: "https://ai-gateway.example.test/v1",
+					apiMode: "openai_chat",
+					managed_by: "clawdi",
+					apiKeySecretRef: "secret://provider.clawdi-v2-deployment-42.apiKey",
+				},
+			},
+		});
+
+		expect(providerProfiles(bundle.profiles).map((profile) => profile.id)).toEqual([
+			"managed-provider-clawdi",
+		]);
+		expect(JSON.stringify(bundle.profiles)).not.toContain(
+			"managed-provider-clawdi-v2-deployment-42",
+		);
+	});
+
+	it("does not generate egress profiles without managed inputs", () => {
+		expect(hostedManifestEgressProfiles({}).profiles).toEqual([]);
+	});
+
+	it("builds managed provider profiles for runtime-scoped providers", () => {
+		const bundle = hostedManifestEgressProfiles({
+			providers: {
+				openclaw: {
+					baseUrl: "https://openclaw-provider.example.test/v1",
+					apiMode: "openai_chat",
+					managed_by: "clawdi",
+					apiKeySecretRef: "secret://provider.openclaw.apiKey",
+				},
+				hermes: {
+					baseUrl: "https://hermes-provider.example.test/v1",
+					apiMode: "openai_responses",
+					managed_by: "clawdi",
+					apiKeySecretRef: "secret://provider.hermes.apiKey",
+				},
+			},
+		});
+
+		expect(providerProfiles(bundle.profiles).map((profile) => profile.id)).toEqual([
+			"managed-provider-hermes",
+			"managed-provider-openclaw",
+		]);
+		expect(providerProfiles(bundle.profiles).map((profile) => profile.match.host)).toEqual([
+			"hermes-provider.example.test",
+			"openclaw-provider.example.test",
+		]);
+		expect(providerProfiles(bundle.profiles).map((profile) => profile.match.pathPrefix)).toEqual([
+			"/v1/",
+			"/v1/",
+		]);
+	});
+
+	it("builds the Codex tool provider profile without runtime providers", () => {
+		const bundle = hostedManifestEgressProfiles({
+			providers: {},
+			terminalTooling: {
+				codex: {
+					enabled: true,
+					provider_id: "codex-managed",
+					provider: {
+						baseUrl: "https://ai-gateway.example.test/v1",
+						apiMode: "openai_responses",
+						managed_by: "clawdi",
+						apiKeySecretRef: "secret://tool.codex.apiKey",
+					},
+				},
+			},
+		});
+
+		expect(providerProfiles(bundle.profiles)).toHaveLength(1);
+		expect(providerProfiles(bundle.profiles)[0]).toMatchObject({
+			id: "managed-provider-codex-managed",
+			match: {
+				scheme: "https",
+				host: "ai-gateway.example.test",
+				pathPrefix: "/v1/",
+				headers: {
+					authorization: {
+						type: "equals",
+						value: "clawdi-egress-placeholder",
+						prefix: "Bearer ",
+					},
+				},
+			},
+			rewrite: {
+				setHeaders: {
+					authorization: {
+						secretRef: "secret://tool.codex.apiKey",
+					},
+				},
+			},
+		});
+	});
+
+	it("dedupes a shared managed runtime and Codex provider host and ref", () => {
+		const sharedProvider = {
+			baseUrl: "https://ai-gateway.example.test/v1",
+			apiMode: "openai_responses",
+			managed_by: "clawdi",
+			apiKeySecretRef: "secret://tool.codex.apiKey",
+		};
+		const bundle = hostedManifestEgressProfiles({
+			providers: { shared: sharedProvider },
+			terminalTooling: {
+				codex: {
+					enabled: true,
+					provider_id: "shared",
+					provider: sharedProvider,
+				},
+			},
+		});
+
+		expect(providerProfiles(bundle.profiles)).toHaveLength(1);
+		expect(providerProfiles(bundle.profiles)[0]?.id).toBe("managed-provider-shared");
+	});
+
+	it("keeps separate managed provider profiles for distinct paths on one origin", () => {
+		const bundle = hostedManifestEgressProfiles({
+			providers: {
+				chat: {
+					baseUrl: "https://ai-gateway.example.test/chat/v1",
+					apiMode: "openai_chat",
+					managed_by: "clawdi",
+					apiKeySecretRef: "secret://provider.shared.apiKey",
+				},
+				responses: {
+					baseUrl: "https://ai-gateway.example.test/responses/v1",
+					apiMode: "openai_responses",
+					managed_by: "clawdi",
+					apiKeySecretRef: "secret://provider.shared.apiKey",
+				},
+			},
+		});
+
+		expect(providerProfiles(bundle.profiles).map((profile) => profile.match.pathPrefix)).toEqual([
+			"/chat/v1/",
+			"/responses/v1/",
+		]);
+	});
+
+	it("does not derive provider egress profiles without a managed provider secret ref", () => {
+		const bundle = hostedManifestEgressProfiles({
+			controlPlane: { cloudApiUrl: "https://cloud-api.test" },
+			providers: {
+				default: {
+					baseUrl: "https://sub2api.test/v1",
+					apiMode: "openai_chat",
+					managed_by: "clawdi",
+				},
+			},
+		});
+
+		expect(bundle.profiles).toEqual([]);
+	});
+
+	it("does not derive provider egress profiles for BYOK providers", () => {
+		const bundle = hostedManifestEgressProfiles({
+			providers: {
+				default: {
+					baseUrl: "https://byok-provider.example.test/v1",
+					apiMode: "openai_chat",
+					managed_by: "user",
+					apiKeySecretRef: "secret://provider.default.apiKey",
+				},
+			},
+		});
+
+		expect(bundle.profiles).toEqual([]);
+	});
+
+	it("does not derive provider egress profiles for unsupported provider API modes", () => {
+		const bundle = hostedManifestEgressProfiles({
+			providers: {
+				default: {
+					baseUrl: "https://anthropic.example.test/v1",
+					apiMode: "anthropic_messages",
+					managed_by: "clawdi",
+					apiKeySecretRef: "secret://provider.default.apiKey",
+				},
+			},
+		});
+
+		expect(bundle.profiles).toEqual([]);
+	});
+});

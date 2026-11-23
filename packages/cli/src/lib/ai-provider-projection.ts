@@ -1,0 +1,743 @@
+import type {
+	AiProvider,
+	AiProviderApiMode,
+	AiProviderAuth,
+	AiProviderCatalog,
+	AiProviderModel,
+} from "@clawdi/shared";
+import {
+	aiProviderRuntimeCompatibility,
+	CLAWDI_MANAGED_PROVIDER_ID,
+	defaultAiProviderApiMode,
+	defaultAiProviderBaseUrl,
+	isClawdiManagedV2ProviderId,
+	validateAiProviderCatalog,
+} from "@clawdi/shared";
+
+export type AgentTarget = "openclaw" | "hermes" | "codex";
+
+export const CODEX_PROFILE_NAME = "clawdi-ai-provider";
+
+export const AGENT_TARGET_CONTRACTS: Record<
+	AgentTarget,
+	{
+		settingMethod: string;
+		verifiedContractBaseline: string;
+		status: "enabled" | "blocked";
+	}
+> = {
+	codex: {
+		settingMethod: "$CODEX_HOME/clawdi-ai-provider.config.toml selected with codex --profile",
+		verifiedContractBaseline:
+			"Codex profile config with model_providers and responses wire_api capabilities",
+		status: "enabled",
+	},
+	hermes: {
+		settingMethod:
+			"native resolved reads, unsets, and scalar writes plus atomic structured updates at the path reported by hermes config path",
+		verifiedContractBaseline:
+			"Hermes providers-dict compatibility reader with codex_responses transport support",
+		status: "enabled",
+	},
+	openclaw: {
+		settingMethod:
+			"public openclaw/plugin-sdk/config-mutation for provider projection; openclaw config patch --stdin for other native patches",
+		verifiedContractBaseline:
+			"OpenClaw public config-mutation/provider-auth SDK contracts and namespaced profiles (2026.7.1-2 audit sample; runtime capability-gated)",
+		status: "enabled",
+	},
+};
+
+export interface ProjectionFile {
+	path: string;
+	content: string;
+}
+
+export interface AgentTargetProjection {
+	target: AgentTarget;
+	files: ProjectionFile[];
+	warnings: string[];
+	contract: (typeof AGENT_TARGET_CONTRACTS)[AgentTarget];
+	provider_ids: string[];
+	default_provider_id: string | null;
+	primary_model: AgentPrimaryModel | null;
+}
+
+export interface AgentPrimaryModel {
+	provider_id: string;
+	model: string;
+}
+
+interface ProjectionProvider {
+	id: string;
+	type: AiProvider["type"];
+	label?: string;
+	base_url: string;
+	api_mode: AiProviderApiMode;
+	managed_by?: AiProvider["managed_by"];
+	models?: AiProvider["models"];
+	env_name?: string;
+	auth: AiProviderAuth;
+}
+
+const OPENCLAW_API_LABELS: Partial<Record<AiProviderApiMode, string>> = {
+	openai_chat: "openai-completions",
+	openai_responses: "openai-responses",
+	anthropic_messages: "anthropic-messages",
+	google_generate_content: "google-generative-ai",
+};
+
+const HERMES_TRANSPORT_LABELS: Partial<Record<AiProviderApiMode, string>> = {
+	openai_chat: "chat_completions",
+	// Hermes' current target-native label for the OpenAI Responses API.
+	// This is not a iforge provider api_mode and must not appear in provider input.
+	openai_responses: "codex_responses",
+	anthropic_messages: "anthropic_messages",
+};
+
+export function buildAgentTargetProjection(
+	target: AgentTarget,
+	catalog: AiProviderCatalog,
+	primaryModel: AgentPrimaryModel | null,
+	options: { freezeManagedModelCatalog?: boolean } = {},
+): AgentTargetProjection {
+	if (catalog.providers.some((provider) => provider.configuration_mode === "native"))
+		throw new Error("Native credentials must use a native runtime adapter");
+	const validation = validateAiProviderCatalog(catalog);
+	if (!validation.valid) {
+		throw new Error(`AI Provider catalog is invalid:\n${validation.errors.join("\n")}`);
+	}
+	const selection = selectProjectionProviders(target, catalog, primaryModel);
+	const providers = selection.providers;
+	const primaryProvider = selection.primaryProvider;
+	const selectedPrimaryModel = selection.primaryModel;
+	const warnings = [...validation.warnings, ...selection.warnings];
+	const embeddingModel = selectCatalogEmbeddingModel(catalog, providers);
+	let projection: string;
+	if (target === "openclaw") {
+		projection = buildOpenClawProjection(
+			providers,
+			primaryProvider,
+			selectedPrimaryModel,
+			embeddingModel,
+		);
+	} else if (target === "hermes") {
+		projection = buildHermesProjection(
+			providers,
+			primaryProvider,
+			selectedPrimaryModel,
+			options.freezeManagedModelCatalog === true,
+		);
+	} else {
+		if (!primaryProvider || !selectedPrimaryModel)
+			throw new Error("Codex catalog projection requires a primary model");
+		projection = buildCodexProjection(providers, primaryProvider, selectedPrimaryModel);
+	}
+	const extension = target === "openclaw" ? "json" : target === "hermes" ? "yaml" : "toml";
+	return {
+		target,
+		files: [
+			{
+				path: `ai-providers.${target}.${extension}`,
+				content: projection,
+			},
+		],
+		warnings,
+		contract: AGENT_TARGET_CONTRACTS[target],
+		provider_ids: providers.map((provider) => provider.id),
+		default_provider_id: primaryProvider?.id ?? null,
+		primary_model: selectedPrimaryModel,
+	};
+}
+
+function selectProjectionProviders(
+	target: AgentTarget,
+	catalog: AiProviderCatalog,
+	primaryModel: AgentPrimaryModel | null,
+): {
+	providers: ProjectionProvider[];
+	primaryProvider: ProjectionProvider | null;
+	primaryModel: AgentPrimaryModel | null;
+	warnings: string[];
+} {
+	const warnings: string[] = [];
+	const providers: ProjectionProvider[] = [];
+	for (const provider of catalog.providers) {
+		const result = normalizeProjectionProvider(target, provider);
+		if (typeof result === "string") warnings.push(result);
+		else providers.push(result);
+	}
+	if (providers.length === 0) {
+		throw new Error(
+			`No AI Providers can be applied to ${target}:\n${warnings.map((warning) => `- ${warning}`).join("\n")}`,
+		);
+	}
+	if (
+		!primaryModel &&
+		providers.every(
+			(provider) =>
+				provider.managed_by === "clawdi" &&
+				provider.models?.length &&
+				provider.models.every((model) => model.capabilities?.embeddings === true),
+		)
+	) {
+		return { providers, primaryProvider: null, primaryModel: null, warnings };
+	}
+	if (!primaryModel) {
+		throw new Error(
+			`No primary model is configured for ${target}; pass agent primary_model {provider_id, model} before agent config apply.`,
+		);
+	}
+	const selectedPrimaryModel = {
+		...primaryModel,
+		provider_id: agentFacingProviderId(primaryModel.provider_id),
+	};
+	if (hasLegacyOpenAiCodexModelPrefix(selectedPrimaryModel.model)) {
+		throw new Error(
+			`Primary model for ${selectedPrimaryModel.provider_id} must use the OpenAI model id without the legacy openai-codex prefix.`,
+		);
+	}
+	const primaryProvider = providers.find(
+		(provider) => provider.id === selectedPrimaryModel.provider_id,
+	);
+	if (!primaryProvider) {
+		throw new Error(
+			`Primary model provider ${selectedPrimaryModel.provider_id} cannot be applied to ${target}.`,
+		);
+	}
+	return { providers, primaryProvider, primaryModel: selectedPrimaryModel, warnings };
+}
+
+function normalizeProjectionProvider(
+	target: AgentTarget,
+	provider: AiProvider,
+): ProjectionProvider | string {
+	const providerId = agentFacingProviderId(provider.id);
+	const legacyDefaultModel = legacyProviderDefaultModel(provider);
+	if (legacyDefaultModel && hasLegacyOpenAiCodexModelPrefix(legacyDefaultModel)) {
+		return `Provider ${providerId} skipped for ${target}: legacy default_model must use the OpenAI model id without the legacy openai-codex prefix.`;
+	}
+	const legacyModel = provider.models?.find((model) => hasLegacyOpenAiCodexModelPrefix(model.id));
+	if (legacyModel) {
+		return `Provider ${providerId} skipped for ${target}: model ${legacyModel.id} must use the OpenAI model id without the legacy openai-codex prefix.`;
+	}
+	if (provider.auth.type === "oauth_profile") {
+		return `Provider ${providerId} skipped for ${target}: uses oauth_profile auth, which does not have a verified agent config apply path yet.`;
+	}
+	if (provider.auth.type === "agent_profile" && !usesCodexNativeAuth(provider)) {
+		return `Provider ${providerId} skipped for ${target}: uses agent_profile auth for ${provider.auth.tool}; AI Provider apply only supports agent:codex/<profile> profiles.`;
+	}
+	const envName = authEnvName(provider);
+	if (provider.auth.type !== "none" && !envName && !usesCodexNativeAuth(provider)) {
+		return `Provider ${providerId} skipped for ${target}: auth requires an agent env name (catalog runtime_env_name) or an env:<NAME> ref before agent config apply.`;
+	}
+	const apiMode = provider.api_mode ?? defaultAiProviderApiMode(provider.type);
+	if (!apiMode) {
+		return `Provider ${providerId} skipped for ${target}: requires api_mode before agent config apply.`;
+	}
+	const projectionProvider = {
+		id: providerId,
+		type: provider.type,
+		label: provider.label,
+		base_url: provider.base_url,
+		api_mode: apiMode,
+		managed_by: provider.managed_by,
+		models: provider.models,
+		env_name: envName,
+		auth: provider.auth,
+	};
+	if (target === "codex") {
+		const reason = codexProjectionSkipReason(projectionProvider);
+		if (reason) return reason;
+	}
+	if (target === "hermes") {
+		const reason = hermesProjectionSkipReason(projectionProvider);
+		if (reason) return reason;
+	}
+	if (target === "openclaw") {
+		const reason = openClawProjectionSkipReason(projectionProvider);
+		if (reason) return reason;
+	}
+	if (!aiProviderRuntimeCompatibility(provider)[target]) {
+		return `Provider ${providerId} skipped for ${target}: the provider protocol and auth shape are not runtime-compatible.`;
+	}
+	return projectionProvider;
+}
+
+function agentFacingProviderId(providerId: string): string {
+	return isClawdiManagedV2ProviderId(providerId) ? CLAWDI_MANAGED_PROVIDER_ID : providerId;
+}
+
+function selectCatalogEmbeddingModel(
+	catalog: AiProviderCatalog,
+	providers: ProjectionProvider[],
+): AgentPrimaryModel | undefined {
+	const configuredProviderId = catalog.defaults?.embedding_provider_id;
+	if (!configuredProviderId) return undefined;
+	const providerId = agentFacingProviderId(configuredProviderId);
+	if (!providers.some((provider) => provider.id === providerId)) return undefined;
+	const sourceProvider = catalog.providers.find((provider) => provider.id === configuredProviderId);
+	const model = sourceProvider?.models?.find(
+		(candidate) => candidate.capabilities?.embeddings === true,
+	);
+	return model ? { provider_id: providerId, model: model.id } : undefined;
+}
+
+function legacyProviderDefaultModel(provider: AiProvider): string | undefined {
+	const value = (provider as AiProvider & { default_model?: string }).default_model;
+	return typeof value === "string" && value.trim() ? value.trim() : undefined;
+}
+
+function authEnvName(provider: AiProvider): string | undefined {
+	const auth = provider.auth;
+	if (auth.type === "none") return undefined;
+	if (auth.type === "secret_ref" && auth.ref.startsWith("env:")) {
+		return auth.ref.slice("env:".length);
+	}
+	if (auth.type === "api_key" && auth.source === "env" && auth.ref?.startsWith("env:")) {
+		return auth.ref.slice("env:".length);
+	}
+	return provider.runtime_env_name;
+}
+
+function buildOpenClawProjection(
+	providers: ProjectionProvider[],
+	primaryProvider: ProjectionProvider | null,
+	primaryModel: AgentPrimaryModel | null,
+	embeddingModel: AgentPrimaryModel | undefined,
+): string {
+	const projectedProviders = Object.fromEntries(
+		providers
+			.filter((provider) => !usesNativeCodexOpenAiProvider(provider))
+			.map((provider) => {
+				const apiKeyEnv = openClawApiKeyEnvForProvider(provider);
+				return [
+					openClawProjectedProviderId(provider),
+					compactObject({
+						baseUrl: openClawBaseUrlForProvider(provider),
+						api: openClawProviderApiLabel(provider.api_mode),
+						auth: apiKeyEnv ? "api-key" : undefined,
+						apiKey: apiKeyEnv ? { source: "env", provider: "default", id: apiKeyEnv } : undefined,
+						models: openClawModels(
+							provider,
+							provider.id === primaryProvider?.id ? primaryModel?.model : undefined,
+						),
+					}),
+				];
+			}),
+	);
+	const usesNativeCodex = providers.some(usesNativeCodexOpenAiProvider);
+	const usesEnvSecrets = providers
+		.filter((provider) => !usesNativeCodexOpenAiProvider(provider))
+		.some((provider) => Boolean(openClawApiKeyEnvForProvider(provider)));
+	const body = compactObject({
+		plugins: usesNativeCodex ? { entries: { codex: { enabled: true } } } : undefined,
+		secrets: usesEnvSecrets
+			? {
+					providers: { default: { source: "env" } },
+					defaults: { env: "default" },
+				}
+			: undefined,
+		agents: {
+			defaults: {
+				model:
+					primaryProvider && primaryModel
+						? {
+								primary: openClawDefaultModelRef(primaryProvider, primaryModel.model),
+							}
+						: undefined,
+				memorySearch: embeddingModel ? null : undefined,
+			},
+		},
+		memory: embeddingModel
+			? {
+					search: {
+						provider: embeddingModel.provider_id,
+						model: embeddingModel.model,
+					},
+				}
+			: undefined,
+		models:
+			Object.keys(projectedProviders).length > 0
+				? {
+						mode: "merge",
+						providers: projectedProviders,
+					}
+				: undefined,
+	});
+	return `${JSON.stringify(body, null, 2)}\n`;
+}
+
+function openClawModels(
+	provider: ProjectionProvider,
+	primaryModel?: string,
+): Array<Record<string, unknown>> {
+	const models = (provider.models ?? [])
+		.filter((model) => model.capabilities?.chat !== false)
+		.map((model) => {
+			return compactObject({
+				id: model.id,
+				name: model.alias ?? model.label ?? model.id,
+				api: openClawModelApiLabel(model.api_mode, provider.api_mode),
+				input: openClawInputModalities(model),
+				reasoning: model.supports_reasoning,
+				compat: openClawModelCompat(model),
+				contextWindow: positiveNumber(model.context_window),
+				maxTokens: positiveNumber(model.max_tokens),
+				cost: openClawModelCost(model.cost),
+			});
+		})
+		.filter((model) => typeof model.id === "string" && model.id.length > 0)
+		.filter(
+			(model, index, entries) => entries.findIndex((entry) => entry.id === model.id) === index,
+		);
+	const defaultModelId = primaryModel;
+	if (defaultModelId && !models.some((model) => model.id === defaultModelId)) {
+		models.unshift(
+			compactObject({
+				id: defaultModelId,
+				name: defaultModelId,
+			}),
+		);
+	}
+	return models;
+}
+
+function openClawModelCompat(model: AiProviderModel): Record<string, unknown> | undefined {
+	if (model.supports_tools === undefined) return model.compat;
+	return { supportsTools: model.supports_tools, ...model.compat };
+}
+
+function openClawInputModalities(model: AiProviderModel): AiProviderModel["input_modalities"] {
+	if (model.input_modalities && model.input_modalities.length > 0) return model.input_modalities;
+	if (model.supports_vision === true) return ["text", "image"];
+	if (model.supports_vision === false) return ["text"];
+	return undefined;
+}
+
+function openClawProviderApiLabel(apiMode: AiProviderApiMode): string | undefined {
+	const label = OPENCLAW_API_LABELS[apiMode];
+	return label === "openai-completions" ? undefined : label;
+}
+
+function openClawModelApiLabel(
+	modelApiMode: AiProviderApiMode | undefined,
+	providerApiMode: AiProviderApiMode,
+): string | undefined {
+	return modelApiMode && modelApiMode !== providerApiMode
+		? OPENCLAW_API_LABELS[modelApiMode]
+		: undefined;
+}
+
+function openClawProjectionSkipReason(provider: ProjectionProvider): string | undefined {
+	if (!usesCodexNativeAuth(provider)) return undefined;
+	if (provider.api_mode !== "openai_responses") {
+		return `Provider ${provider.id} skipped for openclaw: Codex OAuth native apply requires api_mode openai_responses.`;
+	}
+	if (!usesNativeCodexOpenAiProvider(provider)) {
+		return `Provider ${provider.id} skipped for openclaw: Codex OAuth native apply requires an openai provider with the default OpenAI base_url.`;
+	}
+	return undefined;
+}
+
+function openClawDefaultModelRef(provider: ProjectionProvider, model: string): string {
+	if (usesNativeCodexOpenAiProvider(provider)) {
+		return `openai/${codexNativeModelId(model)}`;
+	}
+	return `${openClawProjectedProviderId(provider)}/${model}`;
+}
+
+function openClawProjectedProviderId(provider: ProjectionProvider): string {
+	return provider.id;
+}
+
+function openClawBaseUrlForProvider(provider: ProjectionProvider): string {
+	return provider.base_url;
+}
+
+function openClawApiKeyEnvForProvider(provider: ProjectionProvider): string | undefined {
+	return provider.env_name;
+}
+
+function positiveNumber(input: number | undefined): number | undefined {
+	return typeof input === "number" && Number.isFinite(input) && input > 0 ? input : undefined;
+}
+
+function nonNegativeNumber(input: number | undefined): number | undefined {
+	return typeof input === "number" && Number.isFinite(input) && input >= 0 ? input : undefined;
+}
+
+function openClawModelCost(
+	cost: AiProviderModel["cost"] | undefined,
+): Record<string, number> | undefined {
+	if (!cost) return undefined;
+	const input = nonNegativeNumber(cost.input);
+	const output = nonNegativeNumber(cost.output);
+	if (input === undefined || output === undefined) return undefined;
+	return {
+		input,
+		output,
+		cacheRead: nonNegativeNumber(cost.cache_read) ?? 0,
+		cacheWrite: nonNegativeNumber(cost.cache_write) ?? 0,
+	};
+}
+
+function buildHermesProjection(
+	providers: ProjectionProvider[],
+	primaryProvider: ProjectionProvider | null,
+	primaryModel: AgentPrimaryModel | null,
+	freezeManagedModelCatalog: boolean,
+): string {
+	const nativeCodexDefault = primaryProvider && usesNativeCodexOpenAiProvider(primaryProvider);
+	const customProviders = providers.filter((provider) => !usesNativeCodexOpenAiProvider(provider));
+	const lines: string[] = [
+		"# Generated by Clawdi. Reconcile this projection into Hermes config.",
+		`# Verified contract baseline: ${AGENT_TARGET_CONTRACTS.hermes.verifiedContractBaseline}; ${AGENT_TARGET_CONTRACTS.hermes.settingMethod}.`,
+	];
+	if (primaryProvider && primaryModel) {
+		lines.push("model:");
+		if (nativeCodexDefault) {
+			lines.push('  provider: "openai-codex"');
+			lines.push(`  default: ${quoteYaml(codexNativeModelId(primaryModel.model))}`);
+		} else {
+			lines.push(`  provider: ${quoteYaml(hermesProviderSelector(primaryProvider.id))}`);
+			lines.push(`  default: ${quoteYaml(primaryModel.model)}`);
+		}
+	}
+	if (customProviders.length > 0) lines.push("providers:");
+	for (const provider of customProviders) {
+		const transport = hermesTransportLabel(provider.api_mode);
+		if (!transport) {
+			throw new Error(
+				`Provider ${provider.id} cannot be projected to Hermes because its api_mode is not supported.`,
+			);
+		}
+		lines.push(`  ${quoteYaml(provider.id)}:`);
+		if (provider.label) lines.push(`    name: ${quoteYaml(provider.label)}`);
+		lines.push(`    api: ${quoteYaml(hermesBaseUrlForProvider(provider))}`);
+		lines.push(`    transport: ${quoteYaml(transport)}`);
+		const envName = hermesKeyEnvForProvider(provider);
+		if (envName) lines.push(`    key_env: ${quoteYaml(envName)}`);
+		if (freezeManagedModelCatalog && provider.managed_by === "clawdi") {
+			lines.push("    discover_models: false");
+		}
+		lines.push(...hermesModelLines(provider));
+	}
+	if (customProviders.length === 0 && !primaryModel) lines.push("{}");
+	return `${lines.join("\n")}\n`;
+}
+
+function hermesModelLines(provider: ProjectionProvider): string[] {
+	const models = hermesModels(provider);
+	if (models.length === 0) return [];
+	const lines = ["    models:"];
+	for (const model of models) {
+		lines.push(`      ${quoteYaml(model.id)}:${Object.keys(model).length === 1 ? " {}" : ""}`);
+		if (model.context_length !== undefined) {
+			lines.push(`        context_length: ${model.context_length}`);
+		}
+		if (model.max_tokens !== undefined) {
+			lines.push(`        max_tokens: ${model.max_tokens}`);
+		}
+		if (model.supports_vision !== undefined) {
+			lines.push(`        supports_vision: ${model.supports_vision}`);
+		}
+		if (model.input_cost_per_million !== undefined) {
+			lines.push(`        input_cost_per_million: ${model.input_cost_per_million}`);
+		}
+		if (model.output_cost_per_million !== undefined) {
+			lines.push(`        output_cost_per_million: ${model.output_cost_per_million}`);
+		}
+		if (model.cache_read_cost_per_million !== undefined) {
+			lines.push(`        cache_read_cost_per_million: ${model.cache_read_cost_per_million}`);
+		}
+		if (model.cache_write_cost_per_million !== undefined) {
+			lines.push(`        cache_write_cost_per_million: ${model.cache_write_cost_per_million}`);
+		}
+	}
+	return lines;
+}
+
+interface HermesProjectedModel {
+	id: string;
+	context_length?: number;
+	max_tokens?: number;
+	supports_vision?: boolean;
+	input_cost_per_million?: number;
+	output_cost_per_million?: number;
+	cache_read_cost_per_million?: number;
+	cache_write_cost_per_million?: number;
+}
+
+function hermesModels(provider: ProjectionProvider): HermesProjectedModel[] {
+	const seen = new Set<string>();
+	const entries: HermesProjectedModel[] = [];
+	for (const model of provider.models ?? []) {
+		if (model.capabilities?.chat === false) continue;
+		if (!model.id || seen.has(model.id)) continue;
+		seen.add(model.id);
+		const entry: HermesProjectedModel = { id: model.id };
+		const contextLength = positiveNumber(model.context_window);
+		if (contextLength !== undefined) entry.context_length = contextLength;
+		const maxTokens = positiveNumber(model.max_tokens);
+		if (maxTokens !== undefined) entry.max_tokens = maxTokens;
+		const supportsVision = hermesSupportsVision(model);
+		if (supportsVision !== undefined) entry.supports_vision = supportsVision;
+		const cost = hermesModelCost(model.cost);
+		if (cost) Object.assign(entry, cost);
+		entries.push(entry);
+	}
+	return entries;
+}
+
+function hermesModelCost(
+	cost: AiProviderModel["cost"] | undefined,
+): Omit<HermesProjectedModel, "id"> | undefined {
+	if (!cost) return undefined;
+	const input = nonNegativeNumber(cost.input);
+	const output = nonNegativeNumber(cost.output);
+	if (input === undefined || output === undefined) return undefined;
+	return {
+		input_cost_per_million: input,
+		output_cost_per_million: output,
+		...(nonNegativeNumber(cost.cache_read) !== undefined
+			? { cache_read_cost_per_million: nonNegativeNumber(cost.cache_read) }
+			: {}),
+		...(nonNegativeNumber(cost.cache_write) !== undefined
+			? { cache_write_cost_per_million: nonNegativeNumber(cost.cache_write) }
+			: {}),
+	};
+}
+
+function hermesSupportsVision(model: AiProviderModel): boolean | undefined {
+	if (typeof model.supports_vision === "boolean") return model.supports_vision;
+	return model.input_modalities?.includes("image") ? true : undefined;
+}
+
+function hermesBaseUrlForProvider(provider: ProjectionProvider): string {
+	return provider.base_url;
+}
+
+function hermesKeyEnvForProvider(provider: ProjectionProvider): string | undefined {
+	return provider.env_name;
+}
+
+function hermesProjectionSkipReason(provider: ProjectionProvider): string | undefined {
+	if (usesCodexNativeAuth(provider)) {
+		if (provider.api_mode !== "openai_responses") {
+			return `Provider ${provider.id} skipped for hermes: Codex OAuth native apply requires api_mode openai_responses.`;
+		}
+		if (!usesNativeCodexOpenAiProvider(provider)) {
+			return `Provider ${provider.id} skipped for hermes: Codex OAuth native apply requires an openai provider with the default OpenAI base_url.`;
+		}
+		return undefined;
+	}
+	if (!hermesTransportLabel(provider.api_mode)) {
+		return `Provider ${provider.id} skipped for hermes: api_mode ${provider.api_mode} does not map to a verified Hermes custom-provider transport.`;
+	}
+	return undefined;
+}
+
+function hermesTransportLabel(apiMode: AiProviderApiMode): string | undefined {
+	return HERMES_TRANSPORT_LABELS[apiMode];
+}
+
+function hermesProviderSelector(providerId: string): string {
+	return `custom:${providerId}`;
+}
+
+function buildCodexProjection(
+	providers: ProjectionProvider[],
+	primaryProvider: ProjectionProvider,
+	primaryModel: AgentPrimaryModel,
+): string {
+	for (const provider of providers) validateCodexProjectionProvider(provider);
+	const lines: string[] = [
+		"# Generated by Clawdi. Do not put API keys in this file.",
+		`# Verified contract baseline: ${AGENT_TARGET_CONTRACTS.codex.verifiedContractBaseline}; ${AGENT_TARGET_CONTRACTS.codex.settingMethod}.`,
+	];
+	lines.push(`model = ${quoteTomlString(codexNativeModelId(primaryModel.model))}`);
+	lines.push(`model_provider = ${quoteTomlString(codexModelProviderId(primaryProvider))}`, "");
+	for (const provider of providers) {
+		if (usesBuiltInCodexOpenAiProvider(provider)) continue;
+		lines.push(`[model_providers.${quoteTomlKey(provider.id)}]`);
+		lines.push(`name = ${quoteTomlString(provider.label ?? provider.id)}`);
+		lines.push(`base_url = ${quoteTomlString(provider.base_url)}`);
+		lines.push('wire_api = "responses"');
+		if (usesCodexNativeAuth(provider)) {
+			lines.push("requires_openai_auth = true");
+		} else if (provider.env_name) {
+			lines.push(`env_key = ${quoteTomlString(provider.env_name)}`);
+		}
+		lines.push("");
+	}
+	return `${lines.join("\n").replace(/\n+$/, "")}\n`;
+}
+
+function validateCodexProjectionProvider(provider: ProjectionProvider): void {
+	const reason = codexProjectionSkipReason(provider);
+	if (reason) throw new Error(reason);
+}
+
+function codexProjectionSkipReason(provider: ProjectionProvider): string | undefined {
+	if (provider.api_mode !== "openai_responses") {
+		return `Provider ${provider.id} skipped for codex: Codex provider config supports Responses-compatible providers only; got api_mode ${provider.api_mode}.`;
+	}
+	if (provider.auth.type === "oauth_profile") {
+		return `Provider ${provider.id} skipped for codex: uses oauth_profile auth, which does not have a verified Codex config projection.`;
+	}
+	if (provider.auth.type === "agent_profile" && !usesCodexNativeAuth(provider)) {
+		return `Provider ${provider.id} skipped for codex: uses agent_profile auth for ${provider.auth.tool}; Codex projection only supports agent:codex/<profile>.`;
+	}
+	return undefined;
+}
+
+function codexModelProviderId(provider: ProjectionProvider): string {
+	return usesBuiltInCodexOpenAiProvider(provider) ? "openai" : provider.id;
+}
+
+function usesBuiltInCodexOpenAiProvider(provider: ProjectionProvider): boolean {
+	return usesNativeCodexOpenAiProvider(provider);
+}
+
+function usesNativeCodexOpenAiProvider(provider: ProjectionProvider): boolean {
+	return (
+		provider.type === "openai" &&
+		usesCodexNativeAuth(provider) &&
+		normalizeUrl(provider.base_url) === normalizeUrl(defaultAiProviderBaseUrl("openai") ?? "")
+	);
+}
+
+function usesCodexNativeAuth(provider: Pick<ProjectionProvider, "auth">): boolean {
+	return provider.auth.type === "agent_profile" && provider.auth.tool === "codex";
+}
+
+function codexNativeModelId(model: string): string {
+	const prefix = "openai/";
+	if (model.startsWith(prefix)) return model.slice(prefix.length);
+	return model;
+}
+
+function hasLegacyOpenAiCodexModelPrefix(model: string): boolean {
+	return model.startsWith("openai-codex/");
+}
+
+function normalizeUrl(input: string): string {
+	return input.replace(/\/+$/, "");
+}
+
+function quoteYaml(value: string): string {
+	return JSON.stringify(value);
+}
+
+function quoteTomlString(value: string): string {
+	return JSON.stringify(value);
+}
+
+function quoteTomlKey(value: string): string {
+	return JSON.stringify(value);
+}
+
+function compactObject(input: Record<string, unknown>): Record<string, unknown> {
+	return Object.fromEntries(Object.entries(input).filter(([, value]) => value !== undefined));
+}
