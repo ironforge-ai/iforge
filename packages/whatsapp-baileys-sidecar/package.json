@@ -12,11 +12,11 @@
 	},
 	"dependencies": {
 		"baileys": "npm:@whiskeysockets/baileys@7.0.0-rc14",
-		"pino": "^10.3.1"
+		"pino": "^10.4.0"
 	},
 	"devDependencies": {
-		"@types/node": "^24.13.3",
+		"@types/node": "^26.6.6",
 		"typescript": "catalog:",
-		"vitest": "4.1.11"
+		"vitest": "4.1.12"
 	}
 }
