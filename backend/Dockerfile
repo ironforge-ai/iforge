@@ -39,7 +39,7 @@ RUN mkdir -p /data/files /home/app/.cache/fastembed /run/iforge-embedding \
 USER app
 
 # Kamal requires images to carry the service identity label.
-LABEL service="clawdi"
+LABEL service="iforge"
 
 EXPOSE 8000
 
