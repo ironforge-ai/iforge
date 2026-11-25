@@ -273,6 +273,9 @@ accessories:
           PGBACKREST_STANZA: iforge
           PGBACKREST_PG1_PATH: /var/lib/postgresql/18/docker
           PGBACKREST_PG1_SOCKET_PATH: /var/run/postgresql
+          # The official image's initdb creates only POSTGRES_USER as superuser; there is no
+          # `postgres` role, so pgBackRest must connect as that user (keep the two equal).
+          PGBACKREST_PG1_USER: iforge
           PGBACKREST_REPO1_TYPE: s3
           PGBACKREST_REPO1_S3_REGION: auto
           PGBACKREST_REPO1_S3_URI_STYLE: path
