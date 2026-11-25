@@ -108,8 +108,29 @@ def test_config_mismatch_fails_closed(tmp_path: Path, monkeypatch: pytest.Monkey
         type_governance.validate_config()
 
 
+def test_the_committed_basedpyright_config_validates() -> None:
+    type_governance.validate_config()
+
+
 def test_typing_exception_sets_accept_live_disjoint_paths() -> None:
-    assert type_governance.STANDARD_ONLY == frozenset({"app/services/memory_provider_mem0.py"})
+    assert type_governance.STANDARD_ONLY == frozenset(
+        {
+            "app/core/companion_registry.py",
+            "app/schemas/companions.py",
+            "app/services/billing_gate.py",
+            "app/services/companion_arguments.py",
+            "app/services/companion_billing.py",
+            "app/services/companion_dispatch.py",
+            "app/services/companion_dryrun.py",
+            "app/services/companion_facade.py",
+            "app/services/companion_lifecycle_worker.py",
+            "app/services/companion_provenance.py",
+            "app/services/companion_settings.py",
+            "app/services/memory_provider_mem0.py",
+            "app/services/tenant_purge.py",
+            "app/services/user_prov/clerk.py",
+        }
+    )
     assert type_governance.RUNTIME_OBSERVATION_COMPATIBILITY_ONLY == frozenset(
         {"app/routes/sessions.py"}
     )
@@ -192,10 +213,12 @@ def install_analyzer(
     *,
     payload: str,
     exit_code: int,
+    argv_log: Path | None = None,
 ) -> None:
     executable = tmp_path / "basedpyright"
+    record = f"printf '%s\\n' \"$@\" > '{argv_log}'\n" if argv_log is not None else ""
     executable.write_text(
-        f"#!/bin/sh\nprintf '%s' '{payload}'\nexit {exit_code}\n",
+        f"#!/bin/sh\n{record}printf '%s' '{payload}'\nexit {exit_code}\n",
         encoding="utf-8",
     )
     executable.chmod(0o755)
@@ -526,3 +549,90 @@ def test_strict_exception_audit_rejects_compatibility_rule_drift(
         match="runtime-observation compatibility diagnostic inventory mismatch",
     ):
         type_governance.strict_exception_audit()
+
+
+def git_repo_with_one_commit(repo: Path) -> str:
+    source = repo / "backend/app/core/query_utils.py"
+    source.parent.mkdir(parents=True, exist_ok=True)
+    source.write_text("INITIAL = True\n", encoding="utf-8")
+    run_git(repo, "init")
+    run_git(repo, "config", "user.email", "type-governance@example.invalid")
+    run_git(repo, "config", "user.name", "Type Governance")
+    run_git(repo, "add", ".")
+    run_git(repo, "commit", "-m", "initial")
+    return run_git(repo, "rev-parse", "HEAD")
+
+
+def analyzed_paths(argv_log: Path) -> list[str]:
+    arguments = argv_log.read_text(encoding="utf-8").splitlines()
+    project = arguments.index("--project")
+    return arguments[project + 2 :]
+
+
+def test_an_all_zero_base_is_not_usable(tmp_path: Path) -> None:
+    held = git_repo_with_one_commit(tmp_path)
+
+    assert not type_governance.base_is_usable("0" * 40, repo_root=tmp_path)
+    assert type_governance.base_is_usable(held, repo_root=tmp_path)
+
+
+def test_an_unknown_base_is_not_usable(tmp_path: Path) -> None:
+    held = git_repo_with_one_commit(tmp_path)
+    unknown = "1" * 40 if held != "1" * 40 else "2" * 40
+
+    assert not type_governance.base_is_usable(unknown, repo_root=tmp_path)
+    assert type_governance.base_is_usable(held, repo_root=tmp_path)
+
+
+@pytest.mark.parametrize(("errors", "expected_exit"), [(0, 0), (1, 1)])
+def test_changed_from_without_a_usable_base_analyzes_the_owned_set(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    errors: int,
+    expected_exit: int,
+) -> None:
+    argv_log = tmp_path / "argv.txt"
+    owned = list(type_governance.OWNED_PRODUCTION_FILES)
+    install_analyzer(
+        tmp_path,
+        monkeypatch,
+        payload=analysis(
+            files=len(owned),
+            errors=errors,
+            diagnostics=[{"severity": "error"}] * errors,
+        ),
+        exit_code=errors,
+        argv_log=argv_log,
+    )
+
+    exit_code = type_governance.main(["changed-from", "0" * 40, "HEAD"])
+
+    assert exit_code == expected_exit
+    assert analyzed_paths(argv_log) == owned
+    if expected_exit == 0:
+        result = json.loads(capsys.readouterr().out)
+        assert result["base"].startswith("unavailable")
+        assert result["filesAnalyzed"] == len(owned)
+
+
+def test_changed_from_with_a_usable_base_analyzes_only_the_diff(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    base = git_repo_with_one_commit(repo)
+    (repo / "backend/app/core/query_utils.py").write_text("CHANGED = True\n", encoding="utf-8")
+    run_git(repo, "commit", "-am", "change one production file")
+    head = run_git(repo, "rev-parse", "HEAD")
+    monkeypatch.setattr(type_governance, "REPO_ROOT", repo)
+    argv_log = tmp_path / "argv.txt"
+    install_analyzer(
+        tmp_path, monkeypatch, payload=analysis(files=1), exit_code=0, argv_log=argv_log
+    )
+
+    assert type_governance.main(["changed-from", base, head]) == 0
+    assert analyzed_paths(argv_log) == ["app/core/query_utils.py"]
+    assert "base" not in json.loads(capsys.readouterr().out)

@@ -58,7 +58,7 @@ from app.core.companion_registry import COMPANION_VERBS, derive_annotations
 from app.models.companion_tool_policy import CompanionDestroyEnablement
 from app.services import companion_facade
 from app.services.companion_facade import list_companion_tools, reset_companion_tools_cache
-from tests.doc_contract import REPO_ROOT
+from tests.doc_contract import REPO_ROOT, requires_planning
 from tests.hosted_runtime_fixtures import deploy_companion_state
 
 # One decision record per companion kind. Each file's FIRST `| capability | decision | reason |`
@@ -471,6 +471,7 @@ def test_every_kind_with_verb_rows_has_its_own_coverage_matrix() -> None:
     )
 
 
+@requires_planning
 @_PER_KIND
 def test_the_coverage_decision_table_and_the_derived_table_are_readable(
     kind: str, coverage_path: Path
@@ -481,6 +482,7 @@ def test_the_coverage_decision_table_and_the_derived_table_are_readable(
     assert len(_derived_verb_rows(coverage_path)) == len(_verbs_of_kinds({kind}))
 
 
+@requires_planning
 @_PER_KIND
 def test_toolset_matches_coverage_matrix(kind: str, coverage_path: Path) -> None:
     """Every INTEGRATE capability maps to exactly one verb row of THIS kind, and every row back.
@@ -520,6 +522,7 @@ def test_toolset_matches_coverage_matrix(kind: str, coverage_path: Path) -> None
     )
 
 
+@requires_planning
 @_PER_KIND
 def test_the_derived_coverage_table_agrees_with_the_registry_cell_for_cell(
     kind: str, coverage_path: Path
@@ -536,6 +539,7 @@ def test_the_derived_coverage_table_agrees_with_the_registry_cell_for_cell(
         assert documented_probe == entry.read_probe, tool_name
 
 
+@requires_planning
 @_PER_KIND
 def test_every_opt_out_row_carries_a_reason(kind: str, coverage_path: Path) -> None:
     """An opt-out with an empty reason is capability removal nobody can disagree with.

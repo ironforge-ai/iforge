@@ -46,10 +46,11 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from typing import cast
 from uuid import UUID
 
 from pydantic import JsonValue
-from sqlalchemy import and_, case, or_
+from sqlalchemy import Table, and_, case, or_
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -304,7 +305,7 @@ async def check_repeated_call(
     )
     window_cutoff = moment - timedelta(seconds=REPEATED_CALL_WINDOW_SECONDS)
     cooldown_until = moment + timedelta(seconds=REPEATED_CALL_COOLDOWN_SECONDS)
-    table = CompanionRepeatBreaker.__table__
+    table = cast(Table, CompanionRepeatBreaker.__table__)
     existing = table.c
 
     resets = and_(

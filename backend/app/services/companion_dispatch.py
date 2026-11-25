@@ -52,7 +52,7 @@ import secrets
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from typing import Any, cast
 from uuid import UUID
 
 import jwt
@@ -741,7 +741,7 @@ async def upsert_approval(
         row.decided_by_user_id = None
         row.resolved_target_count = target_count
         row.environment_id = environment_id
-        row.arguments = _sanitize_audit_details(canonical)
+        row.arguments = cast(dict[str, JsonValue], _sanitize_audit_details(canonical))
         db.add(row)
         await db.flush()
     return row

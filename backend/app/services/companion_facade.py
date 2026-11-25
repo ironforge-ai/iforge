@@ -88,7 +88,7 @@ import time
 import uuid as uuid_module
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from typing import Any, cast
 from uuid import UUID
 
 from fastapi import HTTPException
@@ -2263,13 +2263,13 @@ def _tool_definition(name: str, entry: CompanionVerbEntry) -> JsonObject:
         "inputSchema": argument_contract_for(companion_key).input_schema(verb, entry),
         # Advisory client-side UX derived mechanically from the class (D-07). NEVER the gate:
         # the class check above is.
-        "annotations": derive_annotations(entry.tool_class),
+        "annotations": cast(JsonObject, derive_annotations(entry.tool_class)),
     }
     if entry.tool_class in MUTATING_TOOL_CLASSES:
         # Declared on the same verbs that accept `dry_run`, and on no others. Attaching it is what
         # makes preview accuracy a schema-checkable property rather than a claim: the façade
         # validates the diff against this before returning it.
-        definition["outputSchema"] = DRY_RUN_OUTPUT_SCHEMA
+        definition["outputSchema"] = cast(JsonObject, DRY_RUN_OUTPUT_SCHEMA)
     return definition
 
 

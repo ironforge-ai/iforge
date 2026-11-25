@@ -54,6 +54,25 @@ OWNED_INCLUDE = [
     "app/tasks",
     "app/workers",
 ]
+# These files are new since the September strict audit and do not yet read clean in strict mode.
+# Each stays in the zero-diagnostic owned gate, and its strict debt is pinned per file here. A fix
+# lowers its pin in the same commit, and a file at 0 moves to strict: the exception audit fails a
+# stale (strict-clean) exception, so a file cannot keep an exception it no longer needs.
+NEW_SINCE_STRICT_AUDIT_STRICT_DIAGNOSTICS = {
+    "app/core/companion_registry.py": 1,
+    "app/schemas/companions.py": 14,
+    "app/services/billing_gate.py": 4,
+    "app/services/companion_arguments.py": 40,
+    "app/services/companion_billing.py": 32,
+    "app/services/companion_dispatch.py": 1,
+    "app/services/companion_dryrun.py": 1,
+    "app/services/companion_facade.py": 5,
+    "app/services/companion_lifecycle_worker.py": 3,
+    "app/services/companion_provenance.py": 1,
+    "app/services/companion_settings.py": 2,
+    "app/services/tenant_purge.py": 9,
+    "app/services/user_prov/clerk.py": 1,
+}
 STANDARD_ONLY = frozenset(
     {
         # This adapter remains in the zero-diagnostic owned gate. Its strict
@@ -61,6 +80,7 @@ STANDARD_ONLY = frozenset(
         # a complete typed import boundary.
         "app/services/memory_provider_mem0.py",
     }
+    | NEW_SINCE_STRICT_AUDIT_STRICT_DIAGNOSTICS.keys()
 )
 RUNTIME_OBSERVATION_COMPATIBILITY_ONLY = frozenset(
     {
@@ -93,6 +113,7 @@ EXPECTED_RUNTIME_OBSERVATION_COMPATIBILITY_DIAGNOSTICS = {
 }
 EXPECTED_STRICT_EXCEPTION_DIAGNOSTICS = {
     "app/services/memory_provider_mem0.py": 23,
+    **NEW_SINCE_STRICT_AUDIT_STRICT_DIAGNOSTICS,
     **{
         path: sum(
             count
@@ -122,6 +143,9 @@ EXPECTED_CONFIG = {
 EXPECTED_VERSION = "1.39.10"
 INVENTORY_AREAS = ("app", "tests", "scripts", "alembic")
 PRODUCTION_PATHSPEC = ":(top,glob)backend/app/**/*.py"
+# GitHub sends 40 zeros as a push's `before` when the branch is new.
+NULL_COMMIT = "0" * 40
+UNAVAILABLE_BASE = "unavailable; analyzed the owned set"
 
 
 class Summary(TypedDict):
@@ -228,6 +252,24 @@ def production_paths(raw_paths: Sequence[str]) -> list[str]:
     if not paths:
         raise ValueError("changed-production analysis requires at least one Python file")
     return paths
+
+
+def base_is_usable(base: str, *, repo_root: Path = REPO_ROOT) -> bool:
+    """Whether ``base`` names a commit this clone holds.
+
+    It does not on a branch's first push (an all-zero base), after a force-push, or in a shallow
+    clone. A changed-path diff against such a base cannot be computed.
+    """
+    if not base or base == NULL_COMMIT or base.startswith("-"):
+        return False
+    completed = subprocess.run(
+        ["git", "cat-file", "-e", f"{base}^{{commit}}"],
+        cwd=repo_root,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    return completed.returncode == 0
 
 
 def discover_changed_production_paths(
@@ -519,8 +561,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         elif args.command == "changed":
             result = analyze(production_paths(args.paths), gating=True)["summary"]
         elif args.command == "changed-from":
-            paths = discover_changed_production_paths(args.base, args.head)
-            if paths:
+            if not base_is_usable(args.base, repo_root=REPO_ROOT):
+                # The owned set covers any diff, so the gate stays fail-closed without a base.
+                result = {
+                    **analyze(OWNED_PRODUCTION_FILES, gating=True)["summary"],
+                    "base": UNAVAILABLE_BASE,
+                }
+            elif paths := discover_changed_production_paths(
+                args.base, args.head, repo_root=REPO_ROOT
+            ):
                 result = analyze(production_paths(paths), gating=True)["summary"]
             else:
                 result = {"filesAnalyzed": 0, "message": "no changed production Python files"}

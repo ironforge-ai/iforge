@@ -32,6 +32,7 @@ from types import ModuleType
 import pytest
 
 from tests.doc_contract import REPO_ROOT as _REPO_ROOT
+from tests.doc_contract import planning_present
 
 _SCRIPTS = _REPO_ROOT / "scripts"
 
@@ -1134,8 +1135,18 @@ def test_the_real_tree_spells_the_product_name_in_lower_case_everywhere() -> Non
 
 
 def test_out_of_scope_entries_all_still_exist_and_carry_a_reason() -> None:
-    """A stale exclusion is a fence around nothing, and reads as coverage that is not there."""
-    missing = [path for path in residual.OUT_OF_SCOPE if not (residual.ROOT / path).exists()]
+    """A stale exclusion is a fence around nothing, and reads as coverage that is not there.
+
+    The public mirror drops the ``.planning/`` record, so only there are entries under it left
+    out of the existence check. Every reason is still checked.
+    """
+    planning = planning_present(residual.ROOT)
+    missing = [
+        path
+        for path in residual.OUT_OF_SCOPE
+        if (planning or Path(path).parts[:1] != (".planning",))
+        and not (residual.ROOT / path).exists()
+    ]
 
     assert missing == []
     assert all(reason.strip() for reason in residual.OUT_OF_SCOPE.values())

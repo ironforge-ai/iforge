@@ -1,6 +1,6 @@
 import re
 from collections.abc import Mapping
-from typing import Annotated, Literal, TypeGuard
+from typing import Annotated, Literal, LiteralString, TypeGuard, cast
 from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -259,29 +259,31 @@ def _require_postiz_secret_ref(value: str) -> str:
     return value
 
 
-class HostedPostizImage(BaseModel):
+class HostedPostizImage[ImageT: str](BaseModel):
     """A digest-pinned image slot; each subclass narrows ``image`` to one upstream repository."""
 
     model_config = ConfigDict(extra="forbid")
 
-    image: str
+    image: ImageT
     sha256: str = Field(pattern=_LOWERCASE_SHA256_PATTERN)
 
 
-class HostedPostizAppImage(HostedPostizImage):
-    image: Literal["ghcr.io/gitroomhq/postiz-app"]
+class HostedPostizAppImage(HostedPostizImage[Literal["ghcr.io/gitroomhq/postiz-app"]]):
+    pass
 
 
-class HostedPostizPostgresImage(HostedPostizImage):
-    image: Literal["ghcr.io/clawdi-ai/postgres-pgbackrest"]
+class HostedPostizPostgresImage(
+    HostedPostizImage[Literal["ghcr.io/clawdi-ai/postgres-pgbackrest"]]
+):
+    pass
 
 
-class HostedPostizRedisImage(HostedPostizImage):
-    image: Literal["docker.io/library/redis"]
+class HostedPostizRedisImage(HostedPostizImage[Literal["docker.io/library/redis"]]):
+    pass
 
 
-class HostedPostizCloudflaredImage(HostedPostizImage):
-    image: Literal["docker.io/cloudflare/cloudflared"]
+class HostedPostizCloudflaredImage(HostedPostizImage[Literal["docker.io/cloudflare/cloudflared"]]):
+    pass
 
 
 # CK-A (2026-09-23, recorded in 06-05-SUMMARY.md, amending D-05): standard = per-installation
@@ -476,7 +478,9 @@ class HostedRuntimeCompanions(BaseModel):
             except ValidationError as exc:
                 errors.extend(
                     InitErrorDetails(
-                        type=PydanticCustomError(detail["type"], detail["msg"]),
+                        type=PydanticCustomError(
+                            cast(LiteralString, detail["type"]), cast(LiteralString, detail["msg"])
+                        ),
                         loc=(key, *detail["loc"]),
                         input=detail.get("input"),
                     )

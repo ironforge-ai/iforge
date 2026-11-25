@@ -25,6 +25,7 @@ from fastapi import (
 from pydantic import BaseModel, Field, JsonValue, TypeAdapter, ValidationError, field_validator
 from sqlalchemy import case, delete, exists, func, insert, or_, select, text, true, tuple_, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.engine import CursorResult
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
@@ -2779,7 +2780,10 @@ async def ingest_session_usage_events(
         return UsageEventBatchResponse(inserted=0, deleted=0, unchanged=True)
 
     deleted = (
-        await db.execute(delete(UsageEvent).where(UsageEvent.session_id == session_row.id))
+        cast(
+            CursorResult[Any],
+            await db.execute(delete(UsageEvent).where(UsageEvent.session_id == session_row.id)),
+        )
     ).rowcount or 0
 
     rows = [

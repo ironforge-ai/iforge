@@ -36,8 +36,7 @@ ssh:
 <% if ENV["DEPLOY_SSH_PROXY_COMMAND"].to_s.strip != "" %>
   proxy_command: <%= ENV["DEPLOY_SSH_PROXY_COMMAND"] %>
 <% end %>
-  keys:
-    - ~/.ssh/clawdi_access_ed25519
+  # No key file is named: Kamal offers the ssh-agent's identities and reads ~/.ssh/config.
 
 registry:
   server: ghcr.io
@@ -270,8 +269,8 @@ accessories:
     env:
       clear:
         <<: &pgbackrest-env
-          STANZA: clawdi
-          PGBACKREST_STANZA: clawdi
+          STANZA: iforge
+          PGBACKREST_STANZA: iforge
           PGBACKREST_PG1_PATH: /var/lib/postgresql/18/docker
           PGBACKREST_PG1_SOCKET_PATH: /var/run/postgresql
           PGBACKREST_REPO1_TYPE: s3
@@ -338,7 +337,7 @@ env:
     DB_POOL_SIZE: 20
     DB_MAX_OVERFLOW: 20
     DB_POOL_TIMEOUT: 45
-    FILE_STORE_S3_BUCKET: clawdi
+    FILE_STORE_S3_BUCKET: iforge-cloud-api-files
     FILE_STORE_S3_REGION: auto
     FILE_STORE_S3_FORCE_PATH_STYLE: true
     LLM_BASE_URL: 'https://api.redpill.ai/v1'

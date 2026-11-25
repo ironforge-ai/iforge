@@ -30,10 +30,14 @@ hosted operator runbooks (iforge-hosted), not here.
   two full backups retained (`PGBACKREST_REPO1_RETENTION_FULL: "2"`),
   `aes-256-cbc` encryption and `zst` compression. Bucket, endpoint, path, keys
   and the cipher pass are secrets (`PGBACKREST_REPO1_*` in `.kamal/secrets`).
-  Any S3-compatible vendor works; the endpoint decides which.
-- **Stanza.** `STANZA` and `PGBACKREST_STANZA` are both `clawdi`. That name is a
-  carry-over. Renaming it is a backup-continuity event: it needs a new stanza
-  and a fresh full backup, so it is not changed in passing.
+  Any S3-compatible vendor works; the endpoint decides which. Region `auto` is
+  what Cloudflare R2 expects. A vendor whose endpoint names a region may need
+  that region in the request signature instead; if `check` fails with an
+  authorization or region error, set `PGBACKREST_REPO1_S3_REGION` to the region
+  the endpoint names.
+- **Stanza.** `STANZA` and `PGBACKREST_STANZA` are both `iforge`. Changing the
+  name is a backup-continuity event: it needs a new stanza and a fresh full
+  backup. See [Renaming the stanza](#renaming-the-stanza).
 
 **The cipher pass cannot be recovered.** Losing `PGBACKREST_REPO1_CIPHER_PASS`
 abandons every backup in the repository. Keep it in the operator's secret store,
@@ -62,6 +66,79 @@ now rather than waiting for Sunday:
 gosu postgres pgbackrest --stanza="$PGBACKREST_STANZA" \
   --type=full backup
 ```
+
+## Renaming the stanza
+
+`archive_command` reads `STANZA` and every other pgBackRest command reads
+`PGBACKREST_STANZA`, both from the accessory's env. An accessory reads its env
+only when it boots, so a new name in `config/deploy.yml` changes nothing until
+`kamal accessory reboot postgres`. From that reboot on, `archive-push` targets
+the new stanza and fails until the stanza exists, and WAL accumulates in
+`pg_wal` meanwhile. The reboot also stops PostgreSQL, so cloud-api loses its
+database until the accessory is back. Run every step in one window, from this
+checkout, with no destination (`-d`):
+
+1. Reboot the server so it reads the new name:
+
+   ```bash
+   kamal accessory reboot postgres
+   ```
+
+2. Create the new stanza right away, then check it:
+
+   ```bash
+   kamal accessory exec postgres -i "bash"
+   # inside the container:
+   gosu postgres pgbackrest --stanza="$PGBACKREST_STANZA" stanza-create
+   gosu postgres pgbackrest --stanza="$PGBACKREST_STANZA" check
+   exit
+   ```
+
+   `check` waits for a WAL segment to reach the repository, and the archiver
+   pushes the backlog in order first. If `check` times out while it does,
+   rerun it once `pg_stat_archiver.last_archived_time` is current.
+
+3. Reboot the backup scheduler so its schedule uses the new name:
+
+   ```bash
+   kamal accessory reboot postgres-backup
+   ```
+
+4. Take a full backup now, then read the repository:
+
+   ```bash
+   kamal accessory exec postgres -i "bash"
+   # inside the container:
+   gosu postgres pgbackrest --stanza="$PGBACKREST_STANZA" --type=full backup
+   gosu postgres pgbackrest --stanza="$PGBACKREST_STANZA" info
+   ```
+
+   Done: `info` shows a full backup in the new stanza.
+
+5. Retire the previous stanza, in the same shell. Its name is the other stanza
+   the repository holds. pgBackRest reads `PGBACKREST_STANZA` as its `stanza`
+   option, so `info` lists every stanza only with that variable unset:
+
+   ```bash
+   OLD_STANZA="$(env -u PGBACKREST_STANZA gosu postgres pgbackrest info | sed -n 's/^stanza: //p' | grep -vx "$PGBACKREST_STANZA")"
+   echo "previous stanza: ${OLD_STANZA:-none}"
+   # only when it printed a name:
+   gosu postgres pgbackrest --stanza="$OLD_STANZA" stop
+   gosu postgres pgbackrest --stanza="$OLD_STANZA" --force stanza-delete
+   exit
+   ```
+
+   `stanza-delete` needs `stop` for that stanza first, and `--force` because
+   PostgreSQL is still running at `pg1-path` (pgBackRest command reference).
+   It removes the previous stanza's backups and archive, so run it only after
+   step 4 shows a full backup in the new one.
+
+**When the previous stanza was never created.** A deployment that booted but
+never ran `stanza-create` has failed `archive-push` since its first boot:
+`pg_stat_archiver.failed_count` is rising and WAL is already accumulating in
+`pg_wal`. Run steps 1 to 4 now. Step 5 prints `previous stanza: none`, and
+there is nothing to stop or delete, so skip its last two commands. Done when
+`failed_count` stops rising and `last_archived_time` is minutes old.
 
 ## Health checks
 

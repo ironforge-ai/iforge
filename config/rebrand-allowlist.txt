@@ -175,7 +175,7 @@ re:(?i)x-clawdi-[a-z-]+
 # ---------------------------------------------------------------------------
 # API_KEY_PREFIX "clawdi_" (every issued key), clawdi_system (JSONB dedup marker),
 # clawdi_discord_gateway (JWT sub/aud in issued tokens), plus clawdi_egress_addon,
-# clawdi_dev, clawdi_test, clawdi_access_ed25519 and clawdi_cli.
+# clawdi_dev, clawdi_test and clawdi_cli.
 # `*` not `+`: API_KEY_PREFIX is the bare literal "clawdi_", so a one-or-more quantifier
 # would not cover the very C-6 constant this entry names.
 # CLASS: PERMANENT
@@ -475,9 +475,6 @@ clawdi-test
 clawdi-preview
 POSTGRES_DB: clawdi
 POSTGRES_USER: clawdi
-STANZA: clawdi
-PGBACKREST_STANZA: clawdi
-FILE_STORE_S3_BUCKET: clawdi
 clawdi-test-runner
 COMPOSE_PROJECT_NAME
 # The same X-3 identity as it is actually written across the deploy stacks. Research

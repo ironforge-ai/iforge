@@ -21,6 +21,7 @@ import pytest
 
 from tests.doc_contract import REPO_ROOT as _REPO_ROOT
 from tests.doc_contract import normalized_text as _normalized_text
+from tests.doc_contract import requires_planning
 
 _ADR_NAME = "0005-clawdi-owns-tenancy-billing-and-vault-the-provisioner-owns-compute.md"
 _ADR_PATH = _REPO_ROOT / "docs" / "adr" / _ADR_NAME
@@ -230,6 +231,7 @@ def test_ownership_adr_is_mirrored_byte_for_byte() -> None:
     )
 
 
+@requires_planning
 def test_core_value_claim_is_consistent_across_planning_docs() -> None:
     """One shared substring across three files: a partial edit fails, a paraphrase fails."""
     for doc in _CORE_VALUE_DOCS:
@@ -303,6 +305,7 @@ def test_cross_document_links_resolve() -> None:
         )
 
 
+@requires_planning
 def test_project_md_records_the_ownership_verdict() -> None:
     project = _normalized_text(_PROJECT_MD)
 

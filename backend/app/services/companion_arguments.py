@@ -43,7 +43,7 @@ import json
 import re
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
-from typing import Any, Protocol
+from typing import Any, Protocol, cast
 
 from pydantic import JsonValue
 
@@ -1060,7 +1060,7 @@ class PostizArgumentContract:
         for index, item in enumerate(posts):
             if not isinstance(item, dict):
                 continue
-            channel = str(item["integration"]["id"])
+            channel = str(cast(JsonObject, item["integration"])["id"])
             content = strip_active_markup(_first_content(item))
             proposed.append(
                 {

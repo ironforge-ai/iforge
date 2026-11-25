@@ -20,12 +20,16 @@ from __future__ import annotations
 
 import importlib.util
 import re
+import subprocess
 import sys
+from pathlib import Path
 from types import ModuleType
 
 import pytest
 
+from tests import doc_contract
 from tests.doc_contract import REPO_ROOT as _REPO_ROOT
+from tests.doc_contract import requires_planning
 
 _SCRIPTS = _REPO_ROOT / "scripts"
 
@@ -170,6 +174,48 @@ def _automated_blocks() -> dict[str, list[str]]:
     return blocks
 
 
+def test_planning_presence_is_the_directory_alone(tmp_path: Path) -> None:
+    """The mirror skip keys on the whole directory, so a file missing under it still fails."""
+    assert "public mirror" in doc_contract.PLANNING_ABSENT_REASON
+    assert doc_contract.planning_present(tmp_path) is False
+
+    (tmp_path / ".planning").mkdir()
+    assert doc_contract.planning_present(tmp_path) is True
+
+    regular = tmp_path / "regular"
+    regular.mkdir()
+    (regular / ".planning").write_text("not a directory\n", encoding="utf-8")
+    assert doc_contract.planning_present(regular) is False
+
+
+def test_planning_is_never_missing_where_git_tracks_it() -> None:
+    """A tracked .planning/ that went missing must fail, not skip as if this were the mirror."""
+    planning_root = doc_contract.PLANNING_ROOT
+    try:
+        toplevel = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            cwd=_REPO_ROOT,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except FileNotFoundError:
+        pytest.skip("git is unavailable, so whether .planning/ is tracked cannot be read")
+    if toplevel.returncode != 0 or Path(toplevel.stdout.strip()).resolve() != _REPO_ROOT.resolve():
+        pytest.skip("the repository root is not a git work tree (the clean runner drops .git)")
+    tracked = subprocess.run(
+        ["git", "ls-files", "--", ".planning"],
+        cwd=_REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+
+    if tracked.strip():
+        assert planning_root.is_dir(), "git tracks .planning/ but the directory is missing"
+
+
+@requires_planning
 def test_the_automated_block_scan_is_not_vacuous() -> None:
     """A ratchet that reads nothing reports a clean result it did not establish.
 
@@ -184,6 +230,7 @@ def test_the_automated_block_scan_is_not_vacuous() -> None:
     )
 
 
+@requires_planning
 def test_no_new_automated_block_reads_frontmatter_by_splitting_on_the_delimiter() -> None:
     """The ratchet. `scripts/planning_frontmatter.py` exists so this idiom is not re-invented.
 

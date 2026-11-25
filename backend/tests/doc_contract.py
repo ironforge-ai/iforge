@@ -8,11 +8,32 @@ silently keep the old meaning -- so the definitions live here and are imported e
 
 ``normalized_text`` is the single definition of what "the same claim" means for every prose
 assertion in this repository. Change it here and all four suites change together.
+
+``requires_planning`` is the one skip for assertions over the ``.planning/`` record. The public
+mirror excludes that directory, so those assertions can only run in the private checkout. The
+skip is safe because it is keyed on the whole directory being absent, which happens only in the
+mirror: a file missing under an existing ``.planning/`` still fails, and a work tree whose git
+index tracks ``.planning/`` must hold it (``test_planning_frontmatter.py``).
 """
 
 from pathlib import Path
 
+import pytest
+
 REPO_ROOT = Path(__file__).parents[2]
+PLANNING_ROOT = REPO_ROOT / ".planning"
+PLANNING_ABSENT_REASON = (
+    ".planning/ is absent, because this tree is the public mirror, which excludes the planning "
+    "record; these assertions run in the private checkout"
+)
+
+
+def planning_present(root: Path = REPO_ROOT) -> bool:
+    """Whether ``root`` holds a ``.planning`` directory. Its contents are never consulted."""
+    return (root / ".planning").is_dir()
+
+
+requires_planning = pytest.mark.skipif(not planning_present(), reason=PLANNING_ABSENT_REASON)
 
 # A claim about Hetzner's published terms that cannot be supported by quotation. It belongs to
 # ``docs/hetzner-terms-position.md`` -- the document that owns the vendor-terms question -- and is
